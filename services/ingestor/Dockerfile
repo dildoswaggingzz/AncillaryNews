@@ -23,6 +23,9 @@ ENV PATH=/root/.local/bin:$PATH
 ENV PYTHONPATH=/app
 
 # Opret bruger af sikkerhedshensyn
+COPY shared ./shared
+COPY services/ingestor ./services/ingestor
+
 RUN useradd -m agentuser
 USER agentuser
 

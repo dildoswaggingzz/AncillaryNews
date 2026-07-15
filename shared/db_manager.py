@@ -11,7 +11,7 @@ class DatabaseManager:
         if not self.conn_str:
             raise ValueError("DATABASE_URL environment variable is not set")
 
-    def save_market_data(self, records):
+    def save_market_data(self, records, product):
         """
         Gemmer en liste af records i TimescaleDB.
         Bruger execute_values for performance ved bulk-indsætning.
@@ -19,21 +19,24 @@ class DatabaseManager:
         query = """
             INSERT INTO market_data (time, market, zone, product, value, source, is_provisional)
             VALUES %s
-            ON CONFLICT (time, market, zone, product, ingested_at) 
+            ON CONFLICT (time, market, zone, product)
             DO UPDATE SET value = EXCLUDED.value, is_provisional = EXCLUDED.is_provisional;
         """
-        
-        # Konverter records til tupler (tilpasses Energinets specifikke JSON-felter)
-        values = [
-            (r['HourUTC'], 'mFRR_EAM', r['PriceArea'], 'up', r['PriceDKK'], 'Energinet', True)
-            for r in records
-        ]
 
         try:
-            with psycopg2.connect(self.conn_str) as conn:
+            # Konverter records til tupler (tilpasses Energinets specifikke JSON-felter)
+            values = [
+                (r['HourUTC'], 'mFRR_EAM', r['PriceArea'], product, r['PriceDKK'], 'Energinet', True)
+                for r in records
+            ]
+
+            conn = psycopg2.connect(self.conn_str)
+            try:
                 with conn.cursor() as cur:
                     execute_values(cur, query, values)
                 conn.commit()
+            finally:
+                conn.close()
         except Exception as e:
             logger.error(f"Database insertion failed: {e}")
             raise

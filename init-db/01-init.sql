@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS market_data (
     value DOUBLE PRECISION,             
     source TEXT NOT NULL,               
     is_provisional BOOLEAN DEFAULT true, 
-    PRIMARY KEY (time, market, zone, product, ingested_at)
+    PRIMARY KEY (time, market, zone, product)
 );
 
 SELECT create_hypertable('market_data', 'time', if_not_exists => TRUE);

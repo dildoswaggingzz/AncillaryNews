@@ -23,6 +23,7 @@ services:
     build:
       context: .
       dockerfile: services/ingestor/Dockerfile
+    restart: unless-stopped
     depends_on:
       - db
     environment:
