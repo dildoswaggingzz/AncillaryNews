@@ -2,7 +2,7 @@
 name = "ancillary-news"
 version = "0.1.0"
 description = "Autonomous agent for Danish ancillary services monitoring"
-authors = ["Magni Englesson magnienglesson@me.com"]
+authors = ["Magni Englesson <magnienglesson@me.com>"]
 
 [tool.poetry.dependencies]
 python = "^3.12"

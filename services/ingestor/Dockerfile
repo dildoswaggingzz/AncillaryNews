@@ -7,10 +7,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential libpq-dev && \
     rm -rf /var/lib/apt/lists/*
 
-RUN pip install poetry
+RUN pip install poetry poetry-plugin-export
 COPY pyproject.toml poetry.lock* ./
+RUN poetry lock
 RUN poetry export -f requirements.txt --output requirements.txt --without-hashes
-RUN pip install --user --no-cache-dir -r requirements.txt
+
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Stage 2: Runtime
 FROM python:3.12-slim
@@ -18,15 +22,15 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends libpq5 && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /root/.local /root/.local
-ENV PATH=/root/.local/bin:$PATH
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 ENV PYTHONPATH=/app
 
-# Opret bruger af sikkerhedshensyn
 COPY shared ./shared
 COPY services/ingestor ./services/ingestor
 
-RUN useradd -m agentuser
+# Opret bruger af sikkerhedshensyn
+RUN useradd -m agentuser && chown -R agentuser:agentuser /opt/venv /app
 USER agentuser
 
 CMD ["python", "services/ingestor/main.py"]
