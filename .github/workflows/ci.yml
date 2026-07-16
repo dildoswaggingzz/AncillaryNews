@@ -38,5 +38,11 @@ jobs:
       - name: Build ingestor image
         run: docker build -f services/ingestor/Dockerfile .
 
+      - name: Build crawler image
+        run: docker build -f services/crawler/Dockerfile .
+
+      - name: Build orchestrator image
+        run: docker build -f services/orchestrator/Dockerfile .
+
       - name: Build api image
         run: docker build -f services/api/Dockerfile .
