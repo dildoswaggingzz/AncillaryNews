@@ -5,6 +5,7 @@ from datetime import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from shared.base_ingestor import BaseIngestor
+from shared.datasets import DATASETS
 from shared.db_manager import DatabaseManager
 
 # Konfigurer logger
@@ -12,31 +13,50 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 INGESTION_INTERVAL_MINUTES = 15
+# The dataset catalogue (docs/dataset-catalogue.md) observed a rate limit of
+# ~1 request/second on api.energidataservice.dk during bulk discovery; pace
+# sequential fetches within a cycle accordingly.
+RATE_LIMIT_SECONDS = 1.0
 
 
 async def run_ingestion_cycle():
     """
-    Henter data fra Energinet og gemmer det i TimescaleDB.
+    Polls every dataset declared in shared/datasets.py and saves the results.
+
+    A failure fetching or saving one dataset is logged and skipped rather
+    than aborting the whole cycle, so a single misbehaving dataset doesn't
+    take down polling for the rest (README §3A KPI: 100% polling uptime).
     """
     ingestor = BaseIngestor("https://api.energidataservice.dk")
     db = DatabaseManager()
 
     try:
-        logger.info("Starter ingestion cycle...")
-        # Eksempel: Hent data
-        data = await ingestor.fetch_data("dataset/mfrrRequest", params={"limit": 100})
+        logger.info("Starting ingestion cycle for %d dataset(s)...", len(DATASETS))
+        for i, dataset in enumerate(DATASETS):
+            if i > 0:
+                await asyncio.sleep(RATE_LIMIT_SECONDS)
 
-        if "records" in data and data["records"]:
-            db.save_market_data(data["records"], product="up")
-            logger.info(f"Succesfuldt gemt {len(data['records'])} records i databasen.")
-        else:
-            logger.warning("Ingen data modtaget fra API.")
+            try:
+                data = await ingestor.fetch_data(
+                    f"dataset/{dataset.dataset_id}", params=dataset.params
+                )
+            except Exception:
+                logger.exception("Fetch failed for dataset %s", dataset.name)
+                continue
 
-    except Exception:
-        logger.exception("Fejl under ingestion cycle")
-        raise
+            records = data.get("records") if data else None
+            if not records:
+                logger.warning("No records received for dataset %s", dataset.name)
+                continue
+
+            try:
+                saved = db.save_market_data(records, dataset)
+                logger.info("Saved %d row(s) for dataset %s", saved, dataset.name)
+            except Exception:
+                logger.exception("Save failed for dataset %s", dataset.name)
     finally:
         await ingestor.close()
+        db.close()
 
 
 async def main():
