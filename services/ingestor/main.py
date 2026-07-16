@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 INGESTION_INTERVAL_MINUTES = 15
 
+
 async def run_ingestion_cycle():
     """
     Henter data fra Energinet og gemmer det i TimescaleDB.
@@ -37,6 +38,7 @@ async def run_ingestion_cycle():
     finally:
         await ingestor.close()
 
+
 async def main():
     scheduler = AsyncIOScheduler()
     scheduler.add_job(
@@ -47,6 +49,7 @@ async def main():
     )
     scheduler.start()
     await asyncio.Event().wait()
+
 
 if __name__ == "__main__":
     asyncio.run(main())

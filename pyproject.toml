@@ -11,6 +11,24 @@ tenacity = "^9.0.0"
 psycopg2-binary = "^2.9.9"
 apscheduler = "^3.10.4"
 
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3.0"
+pytest-asyncio = "^0.24.0"
+respx = "^0.21.0"
+ruff = "^0.8.0"
+pre-commit = "^4.0.0"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"

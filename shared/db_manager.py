@@ -1,9 +1,11 @@
+import logging
+import os
+
 import psycopg2
 from psycopg2.extras import execute_values
-import os
-import logging
 
 logger = logging.getLogger(__name__)
+
 
 class DatabaseManager:
     def __init__(self):
@@ -26,7 +28,15 @@ class DatabaseManager:
         try:
             # Konverter records til tupler (tilpasses Energinets specifikke JSON-felter)
             values = [
-                (r['HourUTC'], 'mFRR_EAM', r['PriceArea'], product, r['PriceDKK'], 'Energinet', True)
+                (
+                    r["HourUTC"],
+                    "mFRR_EAM",
+                    r["PriceArea"],
+                    product,
+                    r["PriceDKK"],
+                    "Energinet",
+                    True,
+                )
                 for r in records
             ]
 

@@ -8,9 +8,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     rm -rf /var/lib/apt/lists/*
 
 RUN pip install poetry poetry-plugin-export
-COPY pyproject.toml poetry.lock* ./
-RUN poetry lock
-RUN poetry export -f requirements.txt --output requirements.txt --without-hashes
+COPY pyproject.toml poetry.lock ./
+RUN poetry export -f requirements.txt --output requirements.txt --without-hashes --only main
 
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
