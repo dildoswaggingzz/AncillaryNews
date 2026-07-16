@@ -17,18 +17,23 @@ correction events (README §5) instead of new independent reports.
 
 import asyncio
 import logging
+import os
+import time
 from datetime import datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from prometheus_client import Histogram
 from qdrant_client import AsyncQdrantClient
 
 from shared.db_manager import DatabaseManager
 from shared.event_synthesizer import infer_direction, synthesize_event_report
+from shared.logging_config import configure_logging
+from shared.metrics import start_metrics_server
 from shared.rule_engine import Trigger, run_rule_engine
 from shared.slack_notifier import send_event_report_alert
 from shared.vector_store import QdrantStore
 
-logging.basicConfig(level=logging.INFO)
+configure_logging()
 logger = logging.getLogger(__name__)
 
 # Runs at the same cadence as the ingestor's own poll cycle (README §8's
@@ -37,6 +42,18 @@ logger = logging.getLogger(__name__)
 TRIGGER_EVALUATION_INTERVAL_MINUTES = 15
 
 QDRANT_URL = "http://vector-db:6333"
+
+# Port for this service's standalone Prometheus exposition endpoint.
+# Trigger-fired-by-type counters live in shared/rule_engine.py (where
+# triggers are canonically fired); LLM call/latency and citation-rejection
+# counters live in shared/event_synthesizer.py (where the Claude call and
+# citation validation actually happen) -- both registered at import time
+# below, alongside this service's own cycle-duration histogram.
+METRICS_PORT = int(os.getenv("METRICS_PORT", "9102"))
+
+SYNTHESIS_CYCLE_DURATION = Histogram(
+    "orchestrator_cycle_duration_seconds", "Duration of one full trigger-evaluation/synthesis cycle"
+)
 
 # README §3C step 2: "hard-data context window ... ±N hours".
 CONTEXT_WINDOW_HOURS_BEFORE = 6.0
@@ -166,6 +183,7 @@ async def run_synthesis_cycle() -> None:
     db = DatabaseManager()
     qdrant_client = AsyncQdrantClient(url=QDRANT_URL)
     store = QdrantStore(qdrant_client)
+    cycle_start = time.monotonic()
 
     try:
         await store.ensure_collection()
@@ -191,9 +209,11 @@ async def run_synthesis_cycle() -> None:
     finally:
         await qdrant_client.close()
         db.close()
+        SYNTHESIS_CYCLE_DURATION.observe(time.monotonic() - cycle_start)
 
 
 async def main():
+    start_metrics_server(METRICS_PORT)
     scheduler = AsyncIOScheduler()
     scheduler.add_job(
         run_synthesis_cycle,

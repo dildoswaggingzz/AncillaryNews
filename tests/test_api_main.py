@@ -81,6 +81,83 @@ def test_health(client):
     assert resp.json() == {"status": "ok"}
 
 
+# --- metrics (Phase 6 production readiness) ---------------------------------
+
+
+def test_metrics_endpoint_returns_prometheus_text_format(client):
+    resp = client.get("/metrics")
+
+    assert resp.status_code == 200
+    assert "text/plain" in resp.headers["content-type"]
+    assert "api_requests_total" in resp.text
+
+
+def test_metrics_endpoint_is_unauthenticated_even_with_api_key_set(client, monkeypatch):
+    monkeypatch.setenv("API_KEY", "s3cret")
+
+    resp = client.get("/metrics")
+
+    assert resp.status_code == 200
+
+
+# --- API-key auth (Phase 6 production readiness) -----------------------------
+
+
+def test_json_api_open_when_api_key_unset(client, db, monkeypatch):
+    monkeypatch.delenv("API_KEY", raising=False)
+    db.fetch_distinct_series.return_value = []
+
+    resp = client.get("/series")
+
+    assert resp.status_code == 200
+
+
+def test_json_api_rejects_missing_key_when_api_key_set(client, db, monkeypatch):
+    monkeypatch.setenv("API_KEY", "s3cret")
+    db.fetch_distinct_series.return_value = []
+
+    resp = client.get("/series")
+
+    assert resp.status_code == 401
+
+
+def test_json_api_rejects_wrong_key_when_api_key_set(client, db, monkeypatch):
+    monkeypatch.setenv("API_KEY", "s3cret")
+    db.fetch_distinct_series.return_value = []
+
+    resp = client.get("/series", headers={"X-API-Key": "wrong"})
+
+    assert resp.status_code == 401
+
+
+def test_json_api_accepts_correct_key_when_api_key_set(client, db, monkeypatch):
+    monkeypatch.setenv("API_KEY", "s3cret")
+    db.fetch_distinct_series.return_value = []
+
+    resp = client.get("/series", headers={"X-API-Key": "s3cret"})
+
+    assert resp.status_code == 200
+
+
+def test_dashboard_stays_open_regardless_of_api_key(client, db, monkeypatch):
+    """Dashboard HTML routes are a deliberate exception -- see services/api/main.py
+    module docstring."""
+    monkeypatch.setenv("API_KEY", "s3cret")
+    db.fetch_event_reports.return_value = []
+
+    resp = client.get("/")
+
+    assert resp.status_code == 200
+
+
+def test_health_stays_open_regardless_of_api_key(client, monkeypatch):
+    monkeypatch.setenv("API_KEY", "s3cret")
+
+    resp = client.get("/health")
+
+    assert resp.status_code == 200
+
+
 # --- /series -------------------------------------------------------------
 
 

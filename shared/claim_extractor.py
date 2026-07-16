@@ -22,14 +22,24 @@ article text.
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Literal
 
 from anthropic import AsyncAnthropic
+from prometheus_client import Counter, Histogram
 
 from shared.rss_reader import ArticleRef
 
 logger = logging.getLogger(__name__)
+
+# README §7: "LLM latency/cost" for the crawler's bulk Haiku extraction.
+CLAIM_EXTRACTION_LLM_CALL_TOTAL = Counter(
+    "crawler_llm_calls_total", "Claude Haiku claim-extraction calls, by outcome", ["status"]
+)
+CLAIM_EXTRACTION_LLM_CALL_DURATION = Histogram(
+    "crawler_llm_call_duration_seconds", "Claude Haiku claim-extraction call latency"
+)
 
 MODEL = "claude-haiku-4-5"
 MAX_TOKENS = 1024
@@ -140,6 +150,7 @@ async def extract_claims(
     if anthropic_client is None:
         return None
 
+    call_start = time.monotonic()
     try:
         response = await anthropic_client.messages.create(
             model=MODEL,
@@ -154,7 +165,12 @@ async def extract_claims(
         )
     except Exception:
         logger.exception("Claude claim extraction call failed for %s", article.url)
+        CLAIM_EXTRACTION_LLM_CALL_TOTAL.labels(status="error").inc()
+        CLAIM_EXTRACTION_LLM_CALL_DURATION.observe(time.monotonic() - call_start)
         return None
+
+    CLAIM_EXTRACTION_LLM_CALL_TOTAL.labels(status="success").inc()
+    CLAIM_EXTRACTION_LLM_CALL_DURATION.observe(time.monotonic() - call_start)
 
     raw_text = "".join(block.text for block in response.content if block.type == "text")
     return _parse_response(raw_text, article)

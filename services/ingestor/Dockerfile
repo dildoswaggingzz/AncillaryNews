@@ -2,7 +2,7 @@
 FROM python:3.12-slim AS builder
 WORKDIR /app
 
-# Installer dependencies nødvendige for at bygge hjul (som psycopg2)
+# Install dependencies needed to build wheels (like psycopg2)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential libpq-dev && \
     rm -rf /var/lib/apt/lists/*
@@ -28,8 +28,10 @@ ENV PYTHONPATH=/app
 COPY shared ./shared
 COPY services/ingestor ./services/ingestor
 
-# Opret bruger af sikkerhedshensyn
+# Create a non-root user for security
 RUN useradd -m agentuser && chown -R agentuser:agentuser /opt/venv /app
 USER agentuser
+
+EXPOSE 9100
 
 CMD ["python", "services/ingestor/main.py"]

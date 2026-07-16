@@ -19,12 +19,29 @@ import json
 import logging
 import os
 import re
+import time
 
 from anthropic import AsyncAnthropic
+from prometheus_client import Counter, Histogram
 
 from shared.rule_engine import Trigger
 
 logger = logging.getLogger(__name__)
+
+# README §7: "LLM latency/cost" for the orchestrator's synthesis calls.
+# `status` distinguishes a failed API call from a successful one; citation
+# rejections (README §6) are counted separately since a rejected report is a
+# *successful* API call that failed post-hoc validation, not an API error.
+LLM_CALL_TOTAL = Counter(
+    "orchestrator_llm_calls_total", "Claude Opus synthesis calls, by outcome", ["status"]
+)
+LLM_CALL_DURATION = Histogram(
+    "orchestrator_llm_call_duration_seconds", "Claude Opus synthesis call latency"
+)
+CITATION_REJECTED_TOTAL = Counter(
+    "orchestrator_citation_rejected_total",
+    "Synthesized Event Reports rejected by programmatic citation validation (README §6)",
+)
 
 MODEL = "claude-opus-4-8"
 MAX_TOKENS = 2048
@@ -298,6 +315,7 @@ async def synthesize_event_report(
     event_id = build_event_id(trigger, direction)
     user_prompt = _build_user_prompt(trigger, event_id, direction, context_window, retrieved_claims)
 
+    call_start = time.monotonic()
     try:
         response = await anthropic_client.messages.create(
             model=MODEL,
@@ -313,7 +331,12 @@ async def synthesize_event_report(
             trigger.zone,
             trigger.product,
         )
+        LLM_CALL_TOTAL.labels(status="error").inc()
+        LLM_CALL_DURATION.observe(time.monotonic() - call_start)
         return None
+
+    LLM_CALL_TOTAL.labels(status="success").inc()
+    LLM_CALL_DURATION.observe(time.monotonic() - call_start)
 
     raw_text = "".join(block.text for block in response.content if block.type == "text")
     report = _parse_response(raw_text)
@@ -336,6 +359,7 @@ async def synthesize_event_report(
             event_id,
             rejection_reason,
         )
+        CITATION_REJECTED_TOTAL.inc()
         return None
 
     return report

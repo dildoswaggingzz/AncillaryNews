@@ -267,3 +267,62 @@ async def test_synthesize_allows_empty_market_theories_and_correlates():
     assert report is not None
     assert report["market_theories"] == []
     assert report["hard_data_correlates"] == []
+
+
+# --- metrics (Phase 6 production readiness) ---------------------------------
+
+
+def test_metrics_are_registered_and_exposition_includes_expected_names():
+    from prometheus_client import generate_latest
+
+    output = generate_latest().decode()
+
+    assert "orchestrator_llm_calls_total" in output
+    assert "orchestrator_llm_call_duration_seconds" in output
+    assert "orchestrator_citation_rejected_total" in output
+
+
+async def test_synthesize_success_increments_llm_call_success_counter():
+    from shared.event_synthesizer import LLM_CALL_TOTAL
+
+    before = LLM_CALL_TOTAL.labels(status="success")._value.get()
+    client = _mock_client(_valid_report_json())
+
+    await synthesize_event_report(
+        PRICE_SPIKE_TRIGGER, CONTEXT_WINDOW, RETRIEVED_CLAIMS, client=client
+    )
+
+    after = LLM_CALL_TOTAL.labels(status="success")._value.get()
+    assert after == before + 1
+
+
+async def test_synthesize_api_failure_increments_llm_call_error_counter():
+    from shared.event_synthesizer import LLM_CALL_TOTAL
+
+    before = LLM_CALL_TOTAL.labels(status="error")._value.get()
+    client = SimpleNamespace(
+        messages=SimpleNamespace(create=AsyncMock(side_effect=RuntimeError("API down")))
+    )
+
+    await synthesize_event_report(
+        PRICE_SPIKE_TRIGGER, CONTEXT_WINDOW, RETRIEVED_CLAIMS, client=client
+    )
+
+    after = LLM_CALL_TOTAL.labels(status="error")._value.get()
+    assert after == before + 1
+
+
+async def test_synthesize_rejection_increments_citation_rejected_counter():
+    from shared.event_synthesizer import CITATION_REJECTED_TOTAL
+
+    before = CITATION_REJECTED_TOTAL._value.get()
+    payload = json.loads(_valid_report_json())
+    del payload["confidence"]
+    client = _mock_client(json.dumps(payload))
+
+    await synthesize_event_report(
+        PRICE_SPIKE_TRIGGER, CONTEXT_WINDOW, RETRIEVED_CLAIMS, client=client
+    )
+
+    after = CITATION_REJECTED_TOTAL._value.get()
+    assert after == before + 1

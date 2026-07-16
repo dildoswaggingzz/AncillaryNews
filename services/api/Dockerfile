@@ -28,7 +28,7 @@ ENV PYTHONPATH=/app
 COPY shared ./shared
 COPY services/api ./services/api
 
-# Opret bruger af sikkerhedshensyn
+# Create a non-root user for security
 RUN useradd -m agentuser && chown -R agentuser:agentuser /opt/venv /app
 USER agentuser
 

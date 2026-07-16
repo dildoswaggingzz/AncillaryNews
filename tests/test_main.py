@@ -143,3 +143,41 @@ def test_ingestor_no_longer_owns_rule_engine_evaluation():
     it.
     """
     assert not hasattr(ingestor_main, "run_rule_engine")
+
+
+# --- metrics (Phase 6 production readiness) ---------------------------------
+
+
+def test_metrics_are_registered_and_exposition_includes_expected_names():
+    from prometheus_client import generate_latest
+
+    output = generate_latest().decode()
+
+    assert "ingestor_cycle_duration_seconds" in output
+    assert "ingestor_dataset_poll_total" in output
+
+
+async def test_cycle_records_dataset_poll_outcomes(db_manager_cls):
+    """A successful fetch+save increments the success counter for that dataset."""
+    _, db_instance = db_manager_cls
+    dataset = DATASETS[0]
+
+    before = ingestor_main.DATASET_POLL_TOTAL.labels(
+        dataset=dataset.name, status="success"
+    )._value.get()
+
+    async def fake_fetch(endpoint, params=None):
+        return {"records": [{"fake": "record"}]}
+
+    with (
+        patch.object(
+            ingestor_main.BaseIngestor, "fetch_data", new=AsyncMock(side_effect=fake_fetch)
+        ),
+        patch.object(ingestor_main.BaseIngestor, "close", new=AsyncMock()),
+    ):
+        await ingestor_main.run_ingestion_cycle()
+
+    after = ingestor_main.DATASET_POLL_TOTAL.labels(
+        dataset=dataset.name, status="success"
+    )._value.get()
+    assert after == before + 1

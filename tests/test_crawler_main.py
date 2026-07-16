@@ -147,3 +147,35 @@ async def test_run_crawl_cycle_continues_after_one_article_fails():
 
     assert mock_process.await_count == 2
     mock_qdrant_instance.close.assert_awaited_once()
+
+
+# --- metrics (Phase 6 production readiness) ---------------------------------
+
+
+def test_metrics_are_registered_and_exposition_includes_expected_names():
+    from prometheus_client import generate_latest
+
+    output = generate_latest().decode()
+
+    assert "crawler_cycle_duration_seconds" in output
+    assert "crawler_article_processed_total" in output
+
+
+async def test_process_article_records_stored_claims_metric(store):
+    extraction = ExtractionResult(
+        summary="summary",
+        claims=[ExtractedClaim(claim="claim text", claim_type="fact")],
+    )
+    before = crawler_main.ARTICLE_PROCESSED_TOTAL.labels(status="stored_claims")._value.get()
+
+    with (
+        patch.object(
+            crawler_main, "fetch_article_html", new=AsyncMock(return_value="<html>body</html>")
+        ),
+        patch.object(crawler_main, "extract_markdown", return_value="clean article text"),
+        patch.object(crawler_main, "extract_claims", new=AsyncMock(return_value=extraction)),
+    ):
+        await crawler_main.process_article(ARTICLE, http_client=MagicMock(), store=store)
+
+    after = crawler_main.ARTICLE_PROCESSED_TOTAL.labels(status="stored_claims")._value.get()
+    assert after == before + 1

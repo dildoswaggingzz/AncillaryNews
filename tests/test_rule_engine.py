@@ -298,3 +298,23 @@ async def test_run_rule_engine_continues_when_trigger_persistence_fails():
 @pytest.fixture(autouse=True)
 def _no_real_slack_webhook(monkeypatch):
     monkeypatch.delenv("SLACK_WEBHOOK_URL", raising=False)
+
+
+# --- metrics (Phase 6 production readiness) ---------------------------------
+
+
+async def test_run_rule_engine_increments_trigger_fired_counter():
+    from shared.rule_engine import TRIGGER_FIRED_TOTAL
+
+    before = TRIGGER_FIRED_TOTAL.labels(trigger_type="price_spike")._value.get()
+
+    db = MagicMock()
+    db.fetch_distinct_series.return_value = [("mFRR_capacity", "DK1", "up")]
+    normal = [100.0 + (i % 5) for i in range(MIN_HISTORY_POINTS)]
+    db.fetch_history.return_value = _rows([*normal, 5000.0])
+
+    with patch("shared.rule_engine.send_slack_alert", new=AsyncMock()):
+        await run_rule_engine(db)
+
+    after = TRIGGER_FIRED_TOTAL.labels(trigger_type="price_spike")._value.get()
+    assert after == before + 1

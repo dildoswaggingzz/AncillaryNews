@@ -356,3 +356,21 @@ async def test_run_synthesis_cycle_continues_after_one_trigger_synthesis_fails()
     assert mock_process.await_count == 2
     mock_qdrant_instance.close.assert_awaited_once()
     mock_db_instance.close.assert_called_once()
+
+
+# --- metrics (Phase 6 production readiness) ---------------------------------
+
+
+def test_metrics_are_registered_and_exposition_includes_expected_names():
+    from prometheus_client import generate_latest
+
+    output = generate_latest().decode()
+
+    assert "orchestrator_cycle_duration_seconds" in output
+    # Trigger-fired counters live in shared/rule_engine.py; LLM call/latency
+    # and citation-rejection counters live in shared/event_synthesizer.py --
+    # both imported transitively by this module, so registered in the same
+    # process-wide registry `generate_latest()` reads from.
+    assert "rule_engine_trigger_fired_total" in output
+    assert "orchestrator_llm_calls_total" in output
+    assert "orchestrator_citation_rejected_total" in output

@@ -43,10 +43,21 @@ import statistics
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 
+from prometheus_client import Counter
+
 from shared.db_manager import DatabaseManager
 from shared.slack_notifier import send_slack_alert
 
 logger = logging.getLogger(__name__)
+
+# README §7: "trigger rates". Labelled by trigger_type so Grafana can break
+# down price_spike vs. negative_or_zero_price vs. zone_divergence vs.
+# revision_alert rates independently.
+TRIGGER_FIRED_TOTAL = Counter(
+    "rule_engine_trigger_fired_total",
+    "Rule-engine triggers fired, by trigger_type",
+    ["trigger_type"],
+)
 
 # Minimum number of historical (baseline) data points required before any
 # threshold-based check will fire. Below this, we don't have enough signal
@@ -352,6 +363,8 @@ async def run_rule_engine(db: DatabaseManager) -> list[Trigger]:
             triggers.append(divergence)
 
     for trigger in triggers:
+        TRIGGER_FIRED_TOTAL.labels(trigger_type=trigger.trigger_type).inc()
+
         try:
             db.save_trigger(trigger.to_dict())
         except Exception:

@@ -46,6 +46,9 @@ services:
         condition: service_healthy
     environment:
       - DATABASE_URL=postgresql://postgres:${DB_PASSWORD:-secret}@db:5432/energy
+      - METRICS_PORT=9100
+    ports:
+      - "9100:9100"
     volumes:
       - ./shared:/app/shared
       - ./services/ingestor:/app/services/ingestor
@@ -60,6 +63,9 @@ services:
         condition: service_healthy
     environment:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - METRICS_PORT=9101
+    ports:
+      - "9101:9101"
     volumes:
       - ./shared:/app/shared
       - ./services/crawler:/app/services/crawler
@@ -78,6 +84,9 @@ services:
       - DATABASE_URL=postgresql://postgres:${DB_PASSWORD:-secret}@db:5432/energy
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
+      - METRICS_PORT=9102
+    ports:
+      - "9102:9102"
     volumes:
       - ./shared:/app/shared
       - ./services/orchestrator:/app/services/orchestrator
@@ -92,12 +101,45 @@ services:
         condition: service_healthy
     environment:
       - DATABASE_URL=postgresql://postgres:${DB_PASSWORD:-secret}@db:5432/energy
+      - API_KEY=${API_KEY:-}
     ports:
       - "8000:8000"
     volumes:
       - ./shared:/app/shared
       - ./services/api:/app/services/api
 
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - ingestor
+      - crawler
+      - orchestrator
+      - api
+
+  grafana:
+    image: grafana/grafana:latest
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
 volumes:
   pgdata:
   qdrant_data:
+  prometheus_data:
+  grafana_data:

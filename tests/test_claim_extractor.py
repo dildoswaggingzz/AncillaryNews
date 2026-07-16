@@ -139,3 +139,41 @@ async def test_extract_claims_returns_none_when_api_call_raises():
     result = await extract_claims("article text", TIER1_ARTICLE, client=client)
 
     assert result is None
+
+
+# --- metrics (Phase 6 production readiness) ---------------------------------
+
+
+def test_metrics_are_registered_and_exposition_includes_expected_names():
+    from prometheus_client import generate_latest
+
+    output = generate_latest().decode()
+
+    assert "crawler_llm_calls_total" in output
+    assert "crawler_llm_call_duration_seconds" in output
+
+
+async def test_extract_claims_success_increments_llm_call_success_counter():
+    from shared.claim_extractor import CLAIM_EXTRACTION_LLM_CALL_TOTAL
+
+    before = CLAIM_EXTRACTION_LLM_CALL_TOTAL.labels(status="success")._value.get()
+    client = _mock_client(json.dumps({"summary": "s", "claims": []}))
+
+    await extract_claims("article text", TIER1_ARTICLE, client=client)
+
+    after = CLAIM_EXTRACTION_LLM_CALL_TOTAL.labels(status="success")._value.get()
+    assert after == before + 1
+
+
+async def test_extract_claims_api_failure_increments_llm_call_error_counter():
+    from shared.claim_extractor import CLAIM_EXTRACTION_LLM_CALL_TOTAL
+
+    before = CLAIM_EXTRACTION_LLM_CALL_TOTAL.labels(status="error")._value.get()
+    client = SimpleNamespace(
+        messages=SimpleNamespace(create=AsyncMock(side_effect=RuntimeError("API down")))
+    )
+
+    await extract_claims("article text", TIER1_ARTICLE, client=client)
+
+    after = CLAIM_EXTRACTION_LLM_CALL_TOTAL.labels(status="error")._value.get()
+    assert after == before + 1

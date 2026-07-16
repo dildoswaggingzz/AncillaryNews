@@ -29,8 +29,10 @@ ENV PYTHONPATH=/app
 COPY shared ./shared
 COPY services/orchestrator ./services/orchestrator
 
-# Opret bruger af sikkerhedshensyn
+# Create a non-root user for security
 RUN useradd -m agentuser && chown -R agentuser:agentuser /opt/venv /app
 USER agentuser
+
+EXPOSE 9102
 
 CMD ["python", "services/orchestrator/main.py"]
