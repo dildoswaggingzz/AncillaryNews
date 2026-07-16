@@ -182,6 +182,42 @@ def test_dataset_config_series_are_declarative():
     }
 
 
+def test_fetch_distinct_series_queries_and_returns_rows(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [("mFRR_capacity", "DK1", "up")]
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    result = db.fetch_distinct_series()
+
+    assert result == [("mFRR_capacity", "DK1", "up")]
+    cursor.execute.assert_called_once()
+    assert "DISTINCT market, zone, product" in cursor.execute.call_args.args[0]
+    mock_pool.putconn.assert_called_once_with(conn)
+
+
+def test_fetch_history_maps_rows_to_dicts(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [
+        ("2026-07-16T10:00:00", 450.5, "2026-07-16T10:05:00"),
+        ("2026-07-16T09:00:00", 440.0, "2026-07-16T09:05:00"),
+    ]
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    result = db.fetch_history("mFRR_capacity", "DK1", "up", limit=500)
+
+    assert result == [
+        {"time": "2026-07-16T10:00:00", "value": 450.5, "fetched_at": "2026-07-16T10:05:00"},
+        {"time": "2026-07-16T09:00:00", "value": 440.0, "fetched_at": "2026-07-16T09:05:00"},
+    ]
+    cursor.execute.assert_called_once()
+    query, params = cursor.execute.call_args.args
+    assert "market_data_history" in query
+    assert params == ("mFRR_capacity", "DK1", "up", 500)
+    mock_pool.putconn.assert_called_once_with(conn)
+
+
 def test_dataset_config_defaults():
     cfg = DatasetConfig(
         name="test",

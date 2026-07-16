@@ -89,6 +89,50 @@ class DatabaseManager:
 
         return len(values)
 
+    def fetch_distinct_series(self) -> list[tuple[str, str, str]]:
+        """
+        Returns every distinct (market, zone, product) key currently present
+        in market_data_history — the set of series the rule engine (see
+        shared/rule_engine.py) should evaluate on a given cycle.
+        """
+        conn = self._pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT DISTINCT market, zone, product FROM market_data_history;")
+                return cur.fetchall()
+        finally:
+            self._pool.putconn(conn)
+
+    def fetch_history(self, market: str, zone: str, product: str, limit: int = 1000) -> list[dict]:
+        """
+        Returns raw market_data_history rows for one (market, zone, product)
+        key, ordered most-recent-time-first (ties broken by most-recent-
+        fetched_at-first).
+
+        Every revision is included — nothing is deduped here — since some
+        callers (revision-alert detection) need every fetched_at, while
+        others (baseline/spike detection) need only the latest revision per
+        time. Deduping is the caller's job (see
+        shared/rule_engine.py:_dedupe_latest_per_time).
+        """
+        conn = self._pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT time, value, fetched_at
+                    FROM market_data_history
+                    WHERE market = %s AND zone = %s AND product = %s
+                    ORDER BY time DESC, fetched_at DESC
+                    LIMIT %s;
+                    """,
+                    (market, zone, product, limit),
+                )
+                rows = cur.fetchall()
+        finally:
+            self._pool.putconn(conn)
+        return [{"time": r[0], "value": r[1], "fetched_at": r[2]} for r in rows]
+
     def close(self):
         """Releases all pooled connections. Call once per process lifecycle."""
         self._pool.closeall()

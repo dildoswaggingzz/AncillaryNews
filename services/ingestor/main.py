@@ -7,6 +7,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from shared.base_ingestor import BaseIngestor
 from shared.datasets import DATASETS
 from shared.db_manager import DatabaseManager
+from shared.rule_engine import run_rule_engine
 
 # Konfigurer logger
 logging.basicConfig(level=logging.INFO)
@@ -54,6 +55,16 @@ async def run_ingestion_cycle():
                 logger.info("Saved %d row(s) for dataset %s", saved, dataset.name)
             except Exception:
                 logger.exception("Save failed for dataset %s", dataset.name)
+
+        # M2 rule engine (README §9): evaluated right after this cycle's data
+        # is saved. A failure here shouldn't invalidate an otherwise-successful
+        # ingestion cycle. This should move into a dedicated orchestrator
+        # service once README §9 M4 exists — see shared/rule_engine.py.
+        try:
+            triggers = await run_rule_engine(db)
+            logger.info("Rule engine evaluated cycle: %d trigger(s) fired", len(triggers))
+        except Exception:
+            logger.exception("Rule engine evaluation failed")
     finally:
         await ingestor.close()
         db.close()
