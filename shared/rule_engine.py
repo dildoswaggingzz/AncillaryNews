@@ -298,10 +298,13 @@ async def run_rule_engine(db: DatabaseManager) -> list[Trigger]:
     series currently in `market_data_history`, and posts each fired trigger
     to Slack.
 
-    Intended to be called as a step at the end of each ingestion cycle (see
-    `services/ingestor/main.py`) — not yet its own service. Once README §9
-    M4's "Intelligence Orchestrator" exists, this should move there so
-    trigger evaluation isn't coupled to the ingestion poll cadence.
+    Called on its own schedule by `services/orchestrator/main.py`'s
+    `run_synthesis_cycle` (README §9 M4) — no longer coupled to the
+    ingestion poll cadence, and no longer called from
+    `services/ingestor/main.py`. Every fired Trigger returned here also
+    feeds the orchestrator's RAG + LLM synthesis pipeline on top of the
+    Slack post below, which this function's own behavior is unaware of and
+    unaffected by.
     """
     series_keys = db.fetch_distinct_series()
     if not series_keys:

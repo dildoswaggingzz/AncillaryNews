@@ -117,47 +117,6 @@ async def test_cycle_continues_after_one_dataset_save_fails(db_manager_cls):
     db_instance.close.assert_called_once()
 
 
-async def test_cycle_runs_rule_engine_after_saving_all_datasets(db_manager_cls):
-    """The M2 rule engine runs as a step at the end of each ingestion cycle."""
-    _, db_instance = db_manager_cls
-
-    with (
-        patch.object(
-            ingestor_main.BaseIngestor,
-            "fetch_data",
-            new=AsyncMock(return_value={"records": [{"fake": "record"}]}),
-        ),
-        patch.object(ingestor_main.BaseIngestor, "close", new=AsyncMock()),
-        patch.object(
-            ingestor_main, "run_rule_engine", new=AsyncMock(return_value=[])
-        ) as mock_rule_engine,
-    ):
-        await ingestor_main.run_ingestion_cycle()
-
-    mock_rule_engine.assert_awaited_once_with(db_instance)
-
-
-async def test_cycle_survives_rule_engine_failure(db_manager_cls):
-    """A rule-engine failure shouldn't be raised out of an otherwise-successful cycle."""
-    _, db_instance = db_manager_cls
-
-    with (
-        patch.object(
-            ingestor_main.BaseIngestor,
-            "fetch_data",
-            new=AsyncMock(return_value={"records": [{"fake": "record"}]}),
-        ),
-        patch.object(ingestor_main.BaseIngestor, "close", new=AsyncMock()) as mock_close,
-        patch.object(
-            ingestor_main, "run_rule_engine", new=AsyncMock(side_effect=RuntimeError("boom"))
-        ),
-    ):
-        await ingestor_main.run_ingestion_cycle()
-
-    mock_close.assert_awaited_once()
-    db_instance.close.assert_called_once()
-
-
 async def test_cycle_closes_client_and_db_even_if_all_fetches_fail(db_manager_cls):
     _, db_instance = db_manager_cls
 
@@ -174,3 +133,13 @@ async def test_cycle_closes_client_and_db_even_if_all_fetches_fail(db_manager_cl
     db_instance.save_market_data.assert_not_called()
     mock_close.assert_awaited_once()
     db_instance.close.assert_called_once()
+
+
+def test_ingestor_no_longer_owns_rule_engine_evaluation():
+    """
+    M4 relocated trigger evaluation into services/orchestrator/main.py (see
+    its module docstring) so it isn't coupled to the ingestion poll cadence
+    or evaluated twice. The ingestor module should no longer import or call
+    it.
+    """
+    assert not hasattr(ingestor_main, "run_rule_engine")

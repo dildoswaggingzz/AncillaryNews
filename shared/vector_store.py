@@ -149,6 +149,50 @@ class QdrantStore:
         await self._client.upsert(collection_name=COLLECTION_NAME, points=points)
         return len(points)
 
+    async def search_claims(
+        self,
+        query: str,
+        time_from: datetime | None = None,
+        time_to: datetime | None = None,
+        limit: int = 5,
+    ) -> list[dict]:
+        """
+        RAG retrieval (README §3C step 3): semantic search over the claims
+        collection for `query`, embedded with the same fastembed model used
+        for storage, optionally restricted to points whose `retrieved_at`
+        falls within `[time_from, time_to]`.
+
+        Claim payloads carry no explicit `market`/`zone` field (see
+        `ClaimPayload`) — relevance to a market/zone is therefore driven
+        entirely by the semantic content of `query` (e.g. "DK1 mFRR EAM
+        balancing price"), not a payload filter; only the time window is
+        filtered structurally. `retrieved_at` is when *we* stored the claim,
+        not when the underlying article claim was published, so this window
+        should be generous around the trigger's time, not exact.
+
+        Returns a list of `ClaimPayload.to_dict()`-shaped dicts, most
+        semantically similar first.
+        """
+        query_filter = None
+        if time_from is not None or time_to is not None:
+            query_filter = models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="retrieved_at",
+                        range=models.DatetimeRange(gte=time_from, lte=time_to),
+                    )
+                ]
+            )
+
+        response = await self._client.query_points(
+            collection_name=COLLECTION_NAME,
+            query=self._embed(query),
+            query_filter=query_filter,
+            limit=limit,
+            with_payload=True,
+        )
+        return [point.payload for point in response.points]
+
     async def upsert_raw_article(self, article: ArticleRef, article_text: str) -> None:
         """
         Stores the raw article text as a single point with `claim_type="raw"`

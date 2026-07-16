@@ -64,6 +64,24 @@ services:
       - ./shared:/app/shared
       - ./services/crawler:/app/services/crawler
 
+  orchestrator:
+    build:
+      context: .
+      dockerfile: services/orchestrator/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      vector-db:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://postgres:${DB_PASSWORD:-secret}@db:5432/energy
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
+    volumes:
+      - ./shared:/app/shared
+      - ./services/orchestrator:/app/services/orchestrator
+
 volumes:
   pgdata:
   qdrant_data:

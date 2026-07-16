@@ -1,4 +1,5 @@
 import uuid
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import numpy as np
@@ -31,6 +32,7 @@ def qdrant_client():
     client.create_collection = AsyncMock()
     client.upsert = AsyncMock()
     client.scroll = AsyncMock(return_value=([], None))
+    client.query_points = AsyncMock()
     return client
 
 
@@ -135,6 +137,56 @@ async def test_upsert_raw_article_payload_shape(store, qdrant_client):
     assert point.payload["claim"] == "full raw article text"
     assert point.payload["article_url"] == ARTICLE.url
     uuid.UUID(point.id)
+
+
+def _scored_point(payload: dict):
+    point = MagicMock()
+    point.payload = payload
+    return point
+
+
+async def test_search_claims_embeds_query_and_returns_payloads(store, qdrant_client):
+    payload = {
+        "source": "EnergyWatch",
+        "claim": "Wind shortfall drove DK1 prices up.",
+        "claim_type": "theory",
+        "retrieved_at": "2026-07-16T09:00:00+00:00",
+    }
+    qdrant_client.query_points.return_value = MagicMock(points=[_scored_point(payload)])
+
+    results = await store.search_claims("DK1 mFRR price up")
+
+    assert results == [payload]
+    qdrant_client.query_points.assert_awaited_once()
+    _, kwargs = qdrant_client.query_points.call_args
+    assert kwargs["collection_name"] == COLLECTION_NAME
+    assert kwargs["limit"] == 5
+    assert kwargs["query_filter"] is None
+
+
+async def test_search_claims_applies_time_filter_when_window_given(store, qdrant_client):
+    qdrant_client.query_points.return_value = MagicMock(points=[])
+    time_from = datetime(2026, 7, 16, 0, 0, tzinfo=UTC)
+    time_to = datetime(2026, 7, 17, 0, 0, tzinfo=UTC)
+
+    await store.search_claims("DK1 mFRR price up", time_from=time_from, time_to=time_to, limit=3)
+
+    _, kwargs = qdrant_client.query_points.call_args
+    assert kwargs["limit"] == 3
+    query_filter = kwargs["query_filter"]
+    assert query_filter is not None
+    condition = query_filter.must[0]
+    assert condition.key == "retrieved_at"
+    assert condition.range.gte == time_from
+    assert condition.range.lte == time_to
+
+
+async def test_search_claims_returns_empty_list_when_no_matches(store, qdrant_client):
+    qdrant_client.query_points.return_value = MagicMock(points=[])
+
+    results = await store.search_claims("no relevant claims exist for this query")
+
+    assert results == []
 
 
 async def test_raw_article_and_claim_ids_are_derived_from_url_deterministically():

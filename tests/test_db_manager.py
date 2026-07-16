@@ -1,3 +1,5 @@
+import json
+from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -216,6 +218,182 @@ def test_fetch_history_maps_rows_to_dicts(db, pooled_conn):
     assert "market_data_history" in query
     assert params == ("mFRR_capacity", "DK1", "up", 500)
     mock_pool.putconn.assert_called_once_with(conn)
+
+
+def test_fetch_context_window_queries_windowed_range(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [
+        (
+            datetime(2026, 7, 16, 9, 0, tzinfo=UTC),
+            440.0,
+            "Energinet",
+            True,
+            datetime(2026, 7, 16, 9, 5, tzinfo=UTC),
+        ),
+        (
+            datetime(2026, 7, 16, 10, 0, tzinfo=UTC),
+            450.5,
+            "Energinet",
+            True,
+            datetime(2026, 7, 16, 10, 5, tzinfo=UTC),
+        ),
+    ]
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    center_time = datetime(2026, 7, 16, 10, 0, tzinfo=UTC)
+    result = db.fetch_context_window(
+        "mFRR_capacity", "DK1", "up", center_time, hours_before=6, hours_after=6
+    )
+
+    assert result == [
+        {
+            "time": datetime(2026, 7, 16, 9, 0, tzinfo=UTC),
+            "value": 440.0,
+            "source": "Energinet",
+            "is_provisional": True,
+            "fetched_at": datetime(2026, 7, 16, 9, 5, tzinfo=UTC),
+        },
+        {
+            "time": datetime(2026, 7, 16, 10, 0, tzinfo=UTC),
+            "value": 450.5,
+            "source": "Energinet",
+            "is_provisional": True,
+            "fetched_at": datetime(2026, 7, 16, 10, 5, tzinfo=UTC),
+        },
+    ]
+    cursor.execute.assert_called_once()
+    query, params = cursor.execute.call_args.args
+    assert "market_data_history" in query
+    assert params[:3] == ("mFRR_capacity", "DK1", "up")
+    window_start, window_end = params[3], params[4]
+    assert window_start == datetime(2026, 7, 16, 4, 0, tzinfo=UTC)
+    assert window_end == datetime(2026, 7, 16, 16, 0, tzinfo=UTC)
+    mock_pool.putconn.assert_called_once_with(conn)
+
+
+def test_fetch_context_window_defaults_to_six_hours_either_side(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.fetchall.return_value = []
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    center_time = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)
+    db.fetch_context_window("mFRR_capacity", "DK1", "up", center_time)
+
+    _, params = cursor.execute.call_args.args
+    assert params[3] == datetime(2026, 7, 16, 6, 0, tzinfo=UTC)
+    assert params[4] == datetime(2026, 7, 16, 18, 0, tzinfo=UTC)
+
+
+def test_save_event_report_inserts_report_json(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    report = {"event_id": "evt-1", "market": "mFRR_capacity", "confidence": "medium"}
+    db.save_event_report(
+        event_id="evt-1",
+        market="mFRR_capacity",
+        zone="DK1",
+        product="up",
+        time=datetime(2026, 7, 16, 10, 0, tzinfo=UTC),
+        report=report,
+    )
+
+    cursor.execute.assert_called_once()
+    query, params = cursor.execute.call_args.args
+    assert "INSERT INTO event_reports" in query
+    assert params[0] == "evt-1"
+    assert params[5].adapted == report  # psycopg2.extras.Json wraps the dict
+    assert params[6] is False
+    assert params[7] is None
+    conn.commit.assert_called_once()
+    mock_pool.putconn.assert_called_once_with(conn)
+
+
+def test_save_event_report_marks_correction_with_corrects_event_id(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    db.save_event_report(
+        event_id="evt-1-correction-abc",
+        market="mFRR_capacity",
+        zone="DK1",
+        product="up",
+        time=datetime(2026, 7, 16, 10, 0, tzinfo=UTC),
+        report={"event_id": "evt-1-correction-abc"},
+        is_correction=True,
+        corrects_event_id="evt-1",
+    )
+
+    _, params = cursor.execute.call_args.args
+    assert params[6] is True
+    assert params[7] == "evt-1"
+
+
+def test_save_event_report_rolls_back_and_reraises_on_failure(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.execute.side_effect = RuntimeError("insert failed")
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    with pytest.raises(RuntimeError):
+        db.save_event_report(
+            event_id="evt-1",
+            market="mFRR_capacity",
+            zone="DK1",
+            product="up",
+            time=datetime(2026, 7, 16, 10, 0, tzinfo=UTC),
+            report={},
+        )
+
+    conn.rollback.assert_called_once()
+    mock_pool.putconn.assert_called_once_with(conn)
+
+
+def test_find_published_report_returns_none_when_absent(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.fetchone.return_value = None
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    result = db.find_published_report(
+        "mFRR_capacity", "DK1", "up", datetime(2026, 7, 16, 10, 0, tzinfo=UTC)
+    )
+
+    assert result is None
+    mock_pool.putconn.assert_called_once_with(conn)
+
+
+def test_find_published_report_maps_row_to_dict(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    report_json = {"event_id": "evt-1", "confidence": "medium"}
+    cursor.fetchone.return_value = (
+        "evt-1",
+        "mFRR_capacity",
+        "DK1",
+        "up",
+        datetime(2026, 7, 16, 10, 0, tzinfo=UTC),
+        datetime(2026, 7, 16, 10, 20, tzinfo=UTC),
+        json.dumps(report_json),
+        False,
+        None,
+    )
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    result = db.find_published_report(
+        "mFRR_capacity", "DK1", "up", datetime(2026, 7, 16, 10, 0, tzinfo=UTC)
+    )
+
+    assert result["event_id"] == "evt-1"
+    assert result["report"] == report_json
+    assert result["is_correction"] is False
+    query, params = cursor.execute.call_args.args
+    assert "event_reports" in query
+    assert params == ("mFRR_capacity", "DK1", "up", datetime(2026, 7, 16, 10, 0, tzinfo=UTC))
 
 
 def test_dataset_config_defaults():
