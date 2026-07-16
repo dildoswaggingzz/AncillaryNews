@@ -37,3 +37,6 @@ jobs:
 
       - name: Build ingestor image
         run: docker build -f services/ingestor/Dockerfile .
+
+      - name: Build api image
+        run: docker build -f services/api/Dockerfile .

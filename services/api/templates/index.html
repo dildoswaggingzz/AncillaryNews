@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Event Reports — AncillaryNews{% endblock %}
+{% block content %}
+<h1>Recent Event Reports</h1>
+<p class="muted">Most recently published first.</p>
+
+{% if not reports %}
+<p>No Event Reports published yet.</p>
+{% endif %}
+
+{% for row in reports %}
+{% set report = row.report %}
+<div class="card">
+  <h3>
+    <a href="/dashboard/event-reports/{{ row.event_id }}">{{ report.get('observation', row.event_id) }}</a>
+    {% if row.is_correction %}<span class="badge badge-correction">CORRECTION</span>{% endif %}
+  </h3>
+  <p class="muted">
+    {{ row.market }} / {{ row.zone }} / {{ row.product }} — {{ row.time }}
+    &middot; published {{ row.published_at }}
+  </p>
+  <p>
+    <span class="badge badge-confidence-{{ report.get('confidence', 'medium') }}">
+      confidence: {{ report.get('confidence', 'n/a') }}
+    </span>
+    <span class="muted">data maturity: {{ report.get('data_maturity', 'n/a') }}</span>
+  </p>
+</div>
+{% endfor %}
+{% endblock %}

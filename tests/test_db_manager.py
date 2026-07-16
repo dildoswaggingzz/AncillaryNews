@@ -396,6 +396,231 @@ def test_find_published_report_maps_row_to_dict(db, pooled_conn):
     assert params == ("mFRR_capacity", "DK1", "up", datetime(2026, 7, 16, 10, 0, tzinfo=UTC))
 
 
+def test_fetch_series_values_defaults_to_latest_view(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [
+        (
+            datetime(2026, 7, 16, 10, 0, tzinfo=UTC),
+            450.5,
+            "Energinet",
+            True,
+            datetime(2026, 7, 16, 10, 5, tzinfo=UTC),
+        )
+    ]
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    result = db.fetch_series_values("mFRR_capacity", "DK1", "up", limit=100)
+
+    assert result == [
+        {
+            "time": datetime(2026, 7, 16, 10, 0, tzinfo=UTC),
+            "value": 450.5,
+            "source": "Energinet",
+            "is_provisional": True,
+            "ingested_at": datetime(2026, 7, 16, 10, 5, tzinfo=UTC),
+        }
+    ]
+    query, params = cursor.execute.call_args.args
+    assert "FROM market_data\n" in query
+    assert "market_data_history" not in query
+    assert params == ["mFRR_capacity", "DK1", "up", 100]
+    mock_pool.putconn.assert_called_once_with(conn)
+
+
+def test_fetch_series_values_history_flag_reads_raw_history(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [
+        (
+            datetime(2026, 7, 16, 10, 0, tzinfo=UTC),
+            450.5,
+            "Energinet",
+            True,
+            datetime(2026, 7, 16, 10, 5, tzinfo=UTC),
+        )
+    ]
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    result = db.fetch_series_values("mFRR_capacity", "DK1", "up", history=True)
+
+    assert result[0]["fetched_at"] == datetime(2026, 7, 16, 10, 5, tzinfo=UTC)
+    query, _ = cursor.execute.call_args.args
+    assert "FROM market_data_history" in query
+
+
+def test_fetch_series_values_applies_time_range_filters(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.fetchall.return_value = []
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    time_from = datetime(2026, 7, 1, tzinfo=UTC)
+    time_to = datetime(2026, 7, 31, tzinfo=UTC)
+    db.fetch_series_values("mFRR_capacity", "DK1", "up", time_from=time_from, time_to=time_to)
+
+    query, params = cursor.execute.call_args.args
+    assert "time >= %s" in query
+    assert "time <= %s" in query
+    assert params == ["mFRR_capacity", "DK1", "up", time_from, time_to, 500]
+
+
+def test_fetch_event_reports_returns_mapped_rows(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [
+        (
+            "evt-1",
+            "mFRR_capacity",
+            "DK1",
+            "up",
+            datetime(2026, 7, 16, 10, 0, tzinfo=UTC),
+            datetime(2026, 7, 16, 10, 20, tzinfo=UTC),
+            json.dumps({"event_id": "evt-1"}),
+            False,
+            None,
+        )
+    ]
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    result = db.fetch_event_reports(market="mFRR_capacity", limit=10, offset=0)
+
+    assert result[0]["event_id"] == "evt-1"
+    assert result[0]["report"] == {"event_id": "evt-1"}
+    query, params = cursor.execute.call_args.args
+    assert "market = %s" in query
+    assert params == ["mFRR_capacity", 10, 0]
+    mock_pool.putconn.assert_called_once_with(conn)
+
+
+def test_fetch_event_reports_no_filters_omits_where_clause(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.fetchall.return_value = []
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    db.fetch_event_reports()
+
+    query, params = cursor.execute.call_args.args
+    assert "WHERE" not in query
+    assert params == [50, 0]
+
+
+def test_fetch_event_report_returns_none_when_absent(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.fetchone.return_value = None
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    result = db.fetch_event_report("does-not-exist")
+
+    assert result is None
+
+
+def test_fetch_event_report_maps_row_to_dict(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (
+        "evt-1",
+        "mFRR_capacity",
+        "DK1",
+        "up",
+        datetime(2026, 7, 16, 10, 0, tzinfo=UTC),
+        datetime(2026, 7, 16, 10, 20, tzinfo=UTC),
+        {"event_id": "evt-1"},
+        True,
+        "evt-0",
+    )
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    result = db.fetch_event_report("evt-1")
+
+    assert result["event_id"] == "evt-1"
+    assert result["is_correction"] is True
+    assert result["corrects_event_id"] == "evt-0"
+    query, params = cursor.execute.call_args.args
+    assert params == ("evt-1",)
+
+
+def test_save_trigger_inserts_row(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    trigger = {
+        "trigger_type": "price_spike",
+        "market": "mFRR_capacity",
+        "zone": "DK1",
+        "product": "up",
+        "value": 5000.0,
+        "time": "2026-07-16 17:15:00+00:00",
+        "baseline": 1200.0,
+        "threshold": 3600.0,
+        "details": "z-score=4.10",
+        "detected_at": "2026-07-16T17:20:00+00:00",
+    }
+    db.save_trigger(trigger)
+
+    cursor.execute.assert_called_once()
+    query, params = cursor.execute.call_args.args
+    assert "INSERT INTO triggers" in query
+    assert params[0] == "price_spike"
+    assert params[5] == "2026-07-16 17:15:00+00:00"
+    conn.commit.assert_called_once()
+    mock_pool.putconn.assert_called_once_with(conn)
+
+
+def test_save_trigger_rolls_back_and_reraises_on_failure(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.execute.side_effect = RuntimeError("insert failed")
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    with pytest.raises(RuntimeError):
+        db.save_trigger(
+            {
+                "trigger_type": "price_spike",
+                "market": "m",
+                "zone": "z",
+                "product": "p",
+                "value": 1.0,
+                "time": "t",
+            }
+        )
+
+    conn.rollback.assert_called_once()
+    mock_pool.putconn.assert_called_once_with(conn)
+
+
+def test_fetch_triggers_returns_mapped_rows(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [
+        (
+            1,
+            "price_spike",
+            "mFRR_capacity",
+            "DK1",
+            "up",
+            5000.0,
+            "2026-07-16T17:15:00",
+            1200.0,
+            3600.0,
+            "z-score=4.10",
+            datetime(2026, 7, 16, 17, 20, tzinfo=UTC),
+        )
+    ]
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    result = db.fetch_triggers(market="mFRR_capacity", limit=10, offset=0)
+
+    assert result[0]["trigger_type"] == "price_spike"
+    assert result[0]["id"] == 1
+    query, params = cursor.execute.call_args.args
+    assert "market = %s" in query
+    assert params == ["mFRR_capacity", 10, 0]
+
+
 def test_dataset_config_defaults():
     cfg = DatasetConfig(
         name="test",

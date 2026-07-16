@@ -24,6 +24,13 @@ EVENT_REPORT_INSERT_QUERY = """
     ON CONFLICT (event_id) DO NOTHING;
 """
 
+TRIGGER_INSERT_QUERY = """
+    INSERT INTO triggers
+        (trigger_type, market, zone, product, value, time, baseline, threshold, details,
+         detected_at)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+"""
+
 
 class DatabaseManager:
     """
@@ -274,6 +281,287 @@ class DatabaseManager:
             "is_correction": row[7],
             "corrects_event_id": row[8],
         }
+
+    def fetch_series_values(
+        self,
+        market: str,
+        zone: str,
+        product: str,
+        limit: int = 500,
+        time_from: datetime | None = None,
+        time_to: datetime | None = None,
+        history: bool = False,
+    ) -> list[dict]:
+        """
+        Returns time-series data for one (market, zone, product) key for the
+        Phase 5 read API/dashboard (services/api), most-recent-time-first.
+
+        By default reads the `market_data` view (init-db/01-init.sql) — one
+        row per `time`, the latest fetched revision — since a chart or table
+        of "recent values" should show the current known figure, not every
+        revision. Pass `history=True` to read `market_data_history` directly
+        instead, returning every revision (with its own `fetched_at`) rather
+        than only the latest one per `time`.
+        """
+        conditions = ["market = %s", "zone = %s", "product = %s"]
+        params: list = [market, zone, product]
+        if time_from is not None:
+            conditions.append("time >= %s")
+            params.append(time_from)
+        if time_to is not None:
+            conditions.append("time <= %s")
+            params.append(time_to)
+        where_clause = " AND ".join(conditions)
+
+        if history:
+            table = "market_data_history"
+            select_cols = "time, value, source, is_provisional, fetched_at"
+            order_clause = "time DESC, fetched_at DESC"
+        else:
+            table = "market_data"
+            select_cols = "time, value, source, is_provisional, ingested_at"
+            order_clause = "time DESC"
+
+        query = f"""
+            SELECT {select_cols}
+            FROM {table}
+            WHERE {where_clause}
+            ORDER BY {order_clause}
+            LIMIT %s;
+        """
+        params.append(limit)
+
+        conn = self._pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                rows = cur.fetchall()
+        finally:
+            self._pool.putconn(conn)
+
+        if history:
+            return [
+                {
+                    "time": r[0],
+                    "value": r[1],
+                    "source": r[2],
+                    "is_provisional": r[3],
+                    "fetched_at": r[4],
+                }
+                for r in rows
+            ]
+        return [
+            {
+                "time": r[0],
+                "value": r[1],
+                "source": r[2],
+                "is_provisional": r[3],
+                "ingested_at": r[4],
+            }
+            for r in rows
+        ]
+
+    def fetch_event_reports(
+        self,
+        market: str | None = None,
+        zone: str | None = None,
+        product: str | None = None,
+        time_from: datetime | None = None,
+        time_to: datetime | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict]:
+        """
+        Returns published Event Reports (init-db/02-event-reports.sql) for
+        the Phase 5 API `GET /event-reports`, most-recently-published-first,
+        optionally filtered by market/zone/product and a [time_from, time_to]
+        range on the report's own `time` (the market time unit it's about,
+        not `published_at`), paginated via limit/offset.
+        """
+        conditions = []
+        params: list = []
+        if market is not None:
+            conditions.append("market = %s")
+            params.append(market)
+        if zone is not None:
+            conditions.append("zone = %s")
+            params.append(zone)
+        if product is not None:
+            conditions.append("product = %s")
+            params.append(product)
+        if time_from is not None:
+            conditions.append("time >= %s")
+            params.append(time_from)
+        if time_to is not None:
+            conditions.append("time <= %s")
+            params.append(time_to)
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        query = f"""
+            SELECT event_id, market, zone, product, time, published_at, report,
+                   is_correction, corrects_event_id
+            FROM event_reports
+            {where_clause}
+            ORDER BY published_at DESC
+            LIMIT %s OFFSET %s;
+        """
+        params.extend([limit, offset])
+
+        conn = self._pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                rows = cur.fetchall()
+        finally:
+            self._pool.putconn(conn)
+
+        return [self._row_to_event_report(row) for row in rows]
+
+    def fetch_event_report(self, event_id: str) -> dict | None:
+        """
+        Returns a single published Event Report by its `event_id` (Phase 5
+        API `GET /event-reports/{event_id}`), or None if no such report
+        exists. Unlike `find_published_report` (which looks up the current
+        report for a (market, zone, product, time) key), this looks up one
+        exact row by its primary key — including correction rows, which
+        `find_published_report` would return in preference to the report
+        they correct.
+        """
+        conn = self._pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT event_id, market, zone, product, time, published_at, report,
+                           is_correction, corrects_event_id
+                    FROM event_reports
+                    WHERE event_id = %s;
+                    """,
+                    (event_id,),
+                )
+                row = cur.fetchone()
+        finally:
+            self._pool.putconn(conn)
+
+        if row is None:
+            return None
+        return self._row_to_event_report(row)
+
+    @staticmethod
+    def _row_to_event_report(row: tuple) -> dict:
+        report_payload = row[6]
+        if isinstance(report_payload, str):
+            report_payload = json.loads(report_payload)
+        return {
+            "event_id": row[0],
+            "market": row[1],
+            "zone": row[2],
+            "product": row[3],
+            "time": row[4],
+            "published_at": row[5],
+            "report": report_payload,
+            "is_correction": row[7],
+            "corrects_event_id": row[8],
+        }
+
+    def save_trigger(self, trigger: dict) -> None:
+        """
+        Persists one fired rule-engine Trigger (shared/rule_engine.py's
+        `Trigger.to_dict()`) to `triggers` (init-db/03-triggers.sql), giving
+        the Phase 5 API a queryable trigger history — previously every fired
+        trigger existed only as an ephemeral Slack post.
+
+        Called from `shared/rule_engine.py:run_rule_engine` alongside (not
+        instead of) the existing Slack alert; that caller wraps this in its
+        own try/except so a persistence failure never blocks the Slack
+        alert or evaluation of the rest of the cycle's triggers.
+        """
+        conn = self._pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    TRIGGER_INSERT_QUERY,
+                    (
+                        trigger["trigger_type"],
+                        trigger["market"],
+                        trigger["zone"],
+                        trigger["product"],
+                        trigger["value"],
+                        trigger["time"],
+                        trigger.get("baseline"),
+                        trigger.get("threshold"),
+                        trigger.get("details", ""),
+                        trigger.get("detected_at"),
+                    ),
+                )
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Trigger insertion failed for {trigger.get('trigger_type')}: {e}")
+            raise
+        finally:
+            self._pool.putconn(conn)
+
+    def fetch_triggers(
+        self,
+        market: str | None = None,
+        zone: str | None = None,
+        product: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict]:
+        """
+        Returns persisted rule-engine triggers (Phase 5 API `GET /triggers`),
+        most-recently-detected-first, optionally filtered by
+        market/zone/product and paginated via limit/offset.
+        """
+        conditions = []
+        params: list = []
+        if market is not None:
+            conditions.append("market = %s")
+            params.append(market)
+        if zone is not None:
+            conditions.append("zone = %s")
+            params.append(zone)
+        if product is not None:
+            conditions.append("product = %s")
+            params.append(product)
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        query = f"""
+            SELECT id, trigger_type, market, zone, product, value, time, baseline,
+                   threshold, details, detected_at
+            FROM triggers
+            {where_clause}
+            ORDER BY detected_at DESC
+            LIMIT %s OFFSET %s;
+        """
+        params.extend([limit, offset])
+
+        conn = self._pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                rows = cur.fetchall()
+        finally:
+            self._pool.putconn(conn)
+
+        return [
+            {
+                "id": r[0],
+                "trigger_type": r[1],
+                "market": r[2],
+                "zone": r[3],
+                "product": r[4],
+                "value": r[5],
+                "time": r[6],
+                "baseline": r[7],
+                "threshold": r[8],
+                "details": r[9],
+                "detected_at": r[10],
+            }
+            for r in rows
+        ]
 
     def close(self):
         """Releases all pooled connections. Call once per process lifecycle."""

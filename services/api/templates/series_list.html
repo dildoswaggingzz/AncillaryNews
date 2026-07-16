@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Series — AncillaryNews{% endblock %}
+{% block content %}
+<h1>Available Series</h1>
+{% if not series %}
+<p>No series ingested yet.</p>
+{% endif %}
+<table>
+  <tr><th>Market</th><th>Zone</th><th>Product</th></tr>
+  {% for market, zone, product in series %}
+  <tr>
+    <td><a href="/dashboard/series/{{ market }}/{{ zone }}/{{ product }}">{{ market }}</a></td>
+    <td>{{ zone }}</td>
+    <td>{{ product }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endblock %}

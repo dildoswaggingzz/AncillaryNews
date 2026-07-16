@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}{{ market }}/{{ zone }}/{{ product }} — AncillaryNews{% endblock %}
+{% block content %}
+<h1>{{ market }} / {{ zone }} / {{ product }}</h1>
+<p class="muted">Most recent {{ rows|length }} value(s), latest revision per time unit.</p>
+
+{% if rows %}
+<canvas id="series-chart" height="80"></canvas>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<script>
+  const labels = {{ rows|reverse|map(attribute='time')|map('string')|list|tojson }};
+  const values = {{ rows|reverse|map(attribute='value')|list|tojson }};
+  new Chart(document.getElementById('series-chart'), {
+    type: 'line',
+    data: {
+      labels: labels,
+      datasets: [{ label: '{{ market }}/{{ zone }}/{{ product }}', data: values, borderColor: '#0b5fff', tension: 0.1 }]
+    },
+    options: { animation: false, scales: { x: { display: false } } }
+  });
+</script>
+{% endif %}
+
+<table>
+  <tr><th>Time</th><th>Value</th><th>Source</th><th>Provisional</th><th>Ingested at</th></tr>
+  {% for row in rows %}
+  <tr>
+    <td>{{ row.time }}</td>
+    <td>{{ row.value }}</td>
+    <td>{{ row.source }}</td>
+    <td>{{ row.is_provisional }}</td>
+    <td>{{ row.ingested_at }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% if not rows %}
+<p>No data for this series yet.</p>
+{% endif %}
+{% endblock %}

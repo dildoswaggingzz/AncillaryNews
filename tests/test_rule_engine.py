@@ -268,6 +268,33 @@ async def test_run_rule_engine_continues_when_slack_send_fails():
     assert len(triggers) == 1
 
 
+async def test_run_rule_engine_persists_each_fired_trigger():
+    db = MagicMock()
+    db.fetch_distinct_series.return_value = [("mFRR_capacity", "DK1", "up")]
+    normal = [100.0 + (i % 5) for i in range(MIN_HISTORY_POINTS)]
+    db.fetch_history.return_value = _rows([*normal, 5000.0])
+
+    with patch("shared.rule_engine.send_slack_alert", new=AsyncMock()):
+        triggers = await run_rule_engine(db)
+
+    assert len(triggers) == 1
+    db.save_trigger.assert_called_once_with(triggers[0].to_dict())
+
+
+async def test_run_rule_engine_continues_when_trigger_persistence_fails():
+    db = MagicMock()
+    db.fetch_distinct_series.return_value = [("mFRR_capacity", "DK1", "up")]
+    normal = [100.0 + (i % 5) for i in range(MIN_HISTORY_POINTS)]
+    db.fetch_history.return_value = _rows([*normal, 5000.0])
+    db.save_trigger.side_effect = RuntimeError("db down")
+
+    with patch("shared.rule_engine.send_slack_alert", new=AsyncMock()) as mock_send:
+        triggers = await run_rule_engine(db)
+
+    assert len(triggers) == 1
+    mock_send.assert_awaited_once()
+
+
 @pytest.fixture(autouse=True)
 def _no_real_slack_webhook(monkeypatch):
     monkeypatch.delenv("SLACK_WEBHOOK_URL", raising=False)

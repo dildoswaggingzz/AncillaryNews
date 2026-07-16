@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{% block title %}AncillaryNews{% endblock %}</title>
+  <style>
+    body { font-family: -apple-system, Helvetica, Arial, sans-serif; margin: 2rem; color: #1a1a1a; background: #fafafa; }
+    a { color: #0b5fff; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    nav { margin-bottom: 1.5rem; }
+    nav a { margin-right: 1rem; font-weight: 600; }
+    table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
+    th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid #ddd; }
+    th { background: #f0f0f0; }
+    .badge { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 0.3rem; font-size: 0.8rem; font-weight: 600; }
+    .badge-correction { background: #ffe1e1; color: #a30000; }
+    .badge-confidence-high { background: #d8f5d8; color: #1a6b1a; }
+    .badge-confidence-medium { background: #fff3cd; color: #806600; }
+    .badge-confidence-low { background: #ffe1e1; color: #a30000; }
+    .card { background: white; border: 1px solid #e0e0e0; border-radius: 0.5rem; padding: 1rem 1.25rem; margin-bottom: 1rem; }
+    .muted { color: #666; font-size: 0.9rem; }
+    code { background: #f0f0f0; padding: 0.1rem 0.3rem; border-radius: 0.2rem; }
+  </style>
+</head>
+<body>
+  <nav>
+    <a href="/">Event Reports</a>
+    <a href="/dashboard/series">Series</a>
+  </nav>
+  {% block content %}{% endblock %}
+</body>
+</html>

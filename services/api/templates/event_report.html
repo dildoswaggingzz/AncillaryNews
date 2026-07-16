@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block title %}{{ row.event_id }} — AncillaryNews{% endblock %}
+{% block content %}
+{% set report = row.report %}
+<h1>
+  {{ row.event_id }}
+  {% if row.is_correction %}<span class="badge badge-correction">CORRECTION</span>{% endif %}
+</h1>
+
+{% if row.is_correction and row.corrects_event_id %}
+<p class="card">
+  This report corrects
+  {% if corrects %}
+    <a href="/dashboard/event-reports/{{ corrects.event_id }}">{{ corrects.event_id }}</a>
+  {% else %}
+    <code>{{ row.corrects_event_id }}</code> (original report not found)
+  {% endif %}
+</p>
+{% endif %}
+
+<div class="card">
+  <p><strong>Market:</strong> {{ row.market }} &middot; <strong>Zone:</strong> {{ row.zone }}
+     &middot; <strong>Product:</strong> {{ row.product }} &middot; <strong>Time:</strong> {{ row.time }}</p>
+  <p><strong>Direction:</strong> {{ report.get('direction', 'n/a') }}</p>
+  <p>
+    <span class="badge badge-confidence-{{ report.get('confidence', 'medium') }}">
+      confidence: {{ report.get('confidence', 'n/a') }}
+    </span>
+  </p>
+  <p class="muted">Data maturity: {{ report.get('data_maturity', 'n/a') }}</p>
+</div>
+
+<div class="card">
+  <h2>Observation</h2>
+  <p>{{ report.get('observation', '') }}</p>
+</div>
+
+<div class="card">
+  <h2>Hard data correlates</h2>
+  {% if report.get('hard_data_correlates') %}
+  <table>
+    <tr><th>Signal</th><th>Value</th><th>Source</th></tr>
+    {% for item in report.hard_data_correlates %}
+    <tr>
+      <td>{{ item.get('signal', '') }}</td>
+      <td>{{ item.get('value', '') }}</td>
+      <td>{{ item.get('source', '') }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="muted">None recorded.</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Market theories</h2>
+  {% if report.get('market_theories') %}
+  <table>
+    <tr><th>Claim</th><th>Source</th><th>Type</th></tr>
+    {% for item in report.market_theories %}
+    <tr>
+      <td>{{ item.get('claim', '') }}</td>
+      <td>{{ item.get('source', '') }}</td>
+      <td>{{ item.get('type', '') }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="muted">None recorded.</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Synthesis</h2>
+  <p>{{ report.get('synthesis', '') }}</p>
+</div>
+{% endblock %}

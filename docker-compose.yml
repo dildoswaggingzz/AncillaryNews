@@ -82,6 +82,22 @@ services:
       - ./shared:/app/shared
       - ./services/orchestrator:/app/services/orchestrator
 
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://postgres:${DB_PASSWORD:-secret}@db:5432/energy
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./shared:/app/shared
+      - ./services/api:/app/services/api
+
 volumes:
   pgdata:
   qdrant_data:
