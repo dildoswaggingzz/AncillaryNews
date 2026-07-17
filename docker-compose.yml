@@ -103,7 +103,7 @@ services:
       - DATABASE_URL=postgresql://postgres:${DB_PASSWORD:-secret}@db:5432/energy
       - API_KEY=${API_KEY:-}
     ports:
-      - "8000:8000"
+      - "8080:8000"
     volumes:
       - ./shared:/app/shared
       - ./services/api:/app/services/api

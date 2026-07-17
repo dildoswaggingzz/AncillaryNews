@@ -10,7 +10,7 @@ deploys this beyond a laptop `docker-compose up --build`.
 |---|---|---|
 | `DB_PASSWORD` | `secret` (docker-compose.yml fallback) | Hardcoded, well-known default. **Set this before deploying anywhere reachable outside your own machine.** |
 | `GRAFANA_ADMIN_PASSWORD` | `admin` (docker-compose.yml fallback) | Same story -- Grafana's own well-known default admin password. |
-| `API_KEY` | unset (API stays fully open) | Not required to *run* the stack, but if the API/dashboard (port 8000) is reachable by anyone other than you, set this. See "Auth posture" below. |
+| `API_KEY` | unset (API stays fully open) | Not required to *run* the stack, but if the API/dashboard (host port `8080`, container port `8000` -- see `docker-compose.yml`) is reachable by anyone other than you, set this. See "Auth posture" below. |
 
 Everything else below is genuinely optional (the code already degrades
 gracefully if unset):
