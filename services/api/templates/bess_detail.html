@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% block title %}BESS Backtest #{{ run.id }} — AncillaryNews{% endblock %}
+{% block content %}
+<h1>BESS Backtest #{{ run.id }} — {{ run.zone }}</h1>
+<p class="muted">
+  Period: {{ run.start_time }} &rarr; {{ run.end_time }} &middot; {{ run.tick_count }} tick(s) &middot;
+  created {{ run.created_at }}
+</p>
+<p class="card">
+  <strong>Both revenue streams below are estimates, not a real co-optimized dispatch</strong> —
+  see <code>shared/bess_simulator.py</code>'s module docstring for exactly what's simplified
+  (e.g. capacity reservation assumes the commitment always clears at the published price).
+</p>
+
+<div class="card">
+  <h3>Summary</h3>
+  <table>
+    <tr><th>Arbitrage revenue (DKK)</th><td>{{ "%.2f"|format(run.total_arbitrage_revenue_dkk) }}</td></tr>
+    <tr><th>Capacity reservation revenue (DKK)</th><td>{{ "%.2f"|format(run.total_capacity_revenue_dkk) }}</td></tr>
+    <tr><th>Total revenue (DKK)</th><td>{{ "%.2f"|format(run.total_revenue_dkk) }}</td></tr>
+    <tr><th>Full cycle equivalents</th><td>{{ "%.3f"|format(run.full_cycle_equivalents) }}</td></tr>
+  </table>
+</div>
+
+<div class="card">
+  <h3>Battery configuration used for this run</h3>
+  <table>
+    {% for key, value in run.config.items() %}
+    <tr><th>{{ key }}</th><td>{{ value }}</td></tr>
+    {% endfor %}
+  </table>
+</div>
+
+{% if ticks %}
+<h3>State of charge over time</h3>
+<canvas id="soc-chart" height="80"></canvas>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<script>
+  const labels = {{ ticks|map(attribute='time')|map('string')|list|tojson }};
+  const soc = {{ ticks|map(attribute='soc_fraction')|list|tojson }};
+  const cumulative = {{ ticks|map(attribute='cumulative_total_revenue_dkk')|list|tojson }};
+  new Chart(document.getElementById('soc-chart'), {
+    type: 'line',
+    data: {
+      labels: labels,
+      datasets: [
+        { label: 'SoC fraction', data: soc, borderColor: '#0b5fff', tension: 0.1, yAxisID: 'y' },
+        { label: 'Cumulative revenue (DKK)', data: cumulative, borderColor: '#1a6b1a', tension: 0.1, yAxisID: 'y1' }
+      ]
+    },
+    options: {
+      animation: false,
+      scales: {
+        x: { display: false },
+        y: { position: 'left', title: { display: true, text: 'SoC fraction' } },
+        y1: { position: 'right', title: { display: true, text: 'Cumulative revenue (DKK)' }, grid: { drawOnChartArea: false } }
+      }
+    }
+  });
+</script>
+
+<h3>Tick-level detail</h3>
+<table>
+  <tr>
+    <th>Time</th><th>Action</th><th>SoC fraction</th><th>Day-ahead price</th>
+    <th>Arbitrage rev.</th><th>Capacity reserved (MW)</th><th>Capacity rev.</th><th>Cumulative total</th>
+  </tr>
+  {% for t in ticks %}
+  <tr>
+    <td>{{ t.time }}</td>
+    <td>{{ t.action }}</td>
+    <td>{{ "%.3f"|format(t.soc_fraction) }}</td>
+    <td>{{ t.day_ahead_price }}</td>
+    <td>{{ "%.2f"|format(t.arbitrage_revenue_dkk) }}</td>
+    <td>{{ "%.2f"|format(t.capacity_reserved_mw) }}</td>
+    <td>{{ "%.2f"|format(t.capacity_revenue_dkk) }}</td>
+    <td>{{ "%.2f"|format(t.cumulative_total_revenue_dkk) }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p>No ticks for this run (no day-ahead price data in the requested window).</p>
+{% endif %}
+{% endblock %}

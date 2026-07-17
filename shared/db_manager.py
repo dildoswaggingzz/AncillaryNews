@@ -71,6 +71,8 @@ class DatabaseManager:
             for s in dataset.series:
                 if record.get(s.value_field) is None:
                     continue
+                if s.filter_field is not None and record.get(s.filter_field) != s.filter_value:
+                    continue
                 values.append(
                     (
                         time_value,
@@ -562,6 +564,201 @@ class DatabaseManager:
             }
             for r in rows
         ]
+
+    def save_bess_run(self, result) -> int:
+        """
+        Persists one `shared.bess_simulator.BacktestResult` header + its
+        per-tick rows (init-db/04-bess-simulations.sql) and returns the new
+        run's `id`. Imports `dataclasses.asdict`/`json` locally to avoid a
+        module-level dependency from this general-purpose DB layer on the
+        BESS simulator's dataclasses.
+        """
+        from dataclasses import asdict
+
+        conn = self._pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO bess_simulation_runs
+                        (zone, start_time, end_time, config, total_arbitrage_revenue_dkk,
+                         total_capacity_revenue_dkk, total_revenue_dkk, full_cycle_equivalents,
+                         tick_count)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id;
+                    """,
+                    (
+                        result.zone,
+                        result.start_time,
+                        result.end_time,
+                        Json(asdict(result.config)),
+                        result.total_arbitrage_revenue_dkk,
+                        result.total_capacity_revenue_dkk,
+                        result.total_revenue_dkk,
+                        result.full_cycle_equivalents,
+                        len(result.ticks),
+                    ),
+                )
+                run_id = cur.fetchone()[0]
+
+                if result.ticks:
+                    tick_values = [
+                        (
+                            run_id,
+                            t.time,
+                            t.soc_mwh,
+                            t.soc_fraction,
+                            t.action,
+                            t.day_ahead_price,
+                            t.energy_discharged_mwh,
+                            t.arbitrage_revenue_dkk,
+                            t.capacity_reserved_mw,
+                            t.capacity_revenue_dkk,
+                            Json(t.capacity_revenue_by_market),
+                            t.cumulative_arbitrage_revenue_dkk,
+                            t.cumulative_capacity_revenue_dkk,
+                            t.cumulative_total_revenue_dkk,
+                        )
+                        for t in result.ticks
+                    ]
+                    execute_values(
+                        cur,
+                        """
+                        INSERT INTO bess_simulation_ticks
+                            (run_id, time, soc_mwh, soc_fraction, action, day_ahead_price,
+                             energy_discharged_mwh, arbitrage_revenue_dkk, capacity_reserved_mw,
+                             capacity_revenue_dkk, capacity_revenue_by_market,
+                             cumulative_arbitrage_revenue_dkk, cumulative_capacity_revenue_dkk,
+                             cumulative_total_revenue_dkk)
+                        VALUES %s;
+                        """,
+                        tick_values,
+                    )
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"BESS run persistence failed: {e}")
+            raise
+        finally:
+            self._pool.putconn(conn)
+
+        return run_id
+
+    def fetch_bess_runs(
+        self, zone: str | None = None, limit: int = 50, offset: int = 0
+    ) -> list[dict]:
+        """Returns BESS backtest run headers, most-recently-created-first,
+        optionally filtered by zone."""
+        conditions = []
+        params: list = []
+        if zone is not None:
+            conditions.append("zone = %s")
+            params.append(zone)
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        query = f"""
+            SELECT id, zone, start_time, end_time, config, total_arbitrage_revenue_dkk,
+                   total_capacity_revenue_dkk, total_revenue_dkk, full_cycle_equivalents,
+                   tick_count, created_at
+            FROM bess_simulation_runs
+            {where_clause}
+            ORDER BY created_at DESC
+            LIMIT %s OFFSET %s;
+        """
+        params.extend([limit, offset])
+
+        conn = self._pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                rows = cur.fetchall()
+        finally:
+            self._pool.putconn(conn)
+
+        return [self._row_to_bess_run(row) for row in rows]
+
+    def fetch_bess_run(self, run_id: int) -> dict | None:
+        """Returns one BESS backtest run header by id, or None if unknown."""
+        conn = self._pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, zone, start_time, end_time, config, total_arbitrage_revenue_dkk,
+                           total_capacity_revenue_dkk, total_revenue_dkk, full_cycle_equivalents,
+                           tick_count, created_at
+                    FROM bess_simulation_runs
+                    WHERE id = %s;
+                    """,
+                    (run_id,),
+                )
+                row = cur.fetchone()
+        finally:
+            self._pool.putconn(conn)
+
+        if row is None:
+            return None
+        return self._row_to_bess_run(row)
+
+    def fetch_bess_ticks(self, run_id: int) -> list[dict]:
+        """Returns every tick for one BESS backtest run, ordered oldest-to-newest."""
+        conn = self._pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT time, soc_mwh, soc_fraction, action, day_ahead_price,
+                           energy_discharged_mwh, arbitrage_revenue_dkk, capacity_reserved_mw,
+                           capacity_revenue_dkk, capacity_revenue_by_market,
+                           cumulative_arbitrage_revenue_dkk, cumulative_capacity_revenue_dkk,
+                           cumulative_total_revenue_dkk
+                    FROM bess_simulation_ticks
+                    WHERE run_id = %s
+                    ORDER BY time ASC;
+                    """,
+                    (run_id,),
+                )
+                rows = cur.fetchall()
+        finally:
+            self._pool.putconn(conn)
+
+        return [
+            {
+                "time": r[0],
+                "soc_mwh": r[1],
+                "soc_fraction": r[2],
+                "action": r[3],
+                "day_ahead_price": r[4],
+                "energy_discharged_mwh": r[5],
+                "arbitrage_revenue_dkk": r[6],
+                "capacity_reserved_mw": r[7],
+                "capacity_revenue_dkk": r[8],
+                "capacity_revenue_by_market": r[9],
+                "cumulative_arbitrage_revenue_dkk": r[10],
+                "cumulative_capacity_revenue_dkk": r[11],
+                "cumulative_total_revenue_dkk": r[12],
+            }
+            for r in rows
+        ]
+
+    @staticmethod
+    def _row_to_bess_run(row: tuple) -> dict:
+        config = row[4]
+        if isinstance(config, str):
+            config = json.loads(config)
+        return {
+            "id": row[0],
+            "zone": row[1],
+            "start_time": row[2],
+            "end_time": row[3],
+            "config": config,
+            "total_arbitrage_revenue_dkk": row[5],
+            "total_capacity_revenue_dkk": row[6],
+            "total_revenue_dkk": row[7],
+            "full_cycle_equivalents": row[8],
+            "tick_count": row[9],
+            "created_at": row[10],
+        }
 
     def close(self):
         """Releases all pooled connections. Call once per process lifecycle."""

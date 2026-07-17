@@ -713,6 +713,192 @@ def test_fetch_triggers_returns_mapped_rows(db, pooled_conn):
     assert params == ["mFRR_capacity", 10, 0]
 
 
+def test_save_bess_run_inserts_header_and_ticks(db, pooled_conn):
+    from shared.bess_simulator import BacktestResult, BessConfig, BessTick
+
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (7,)
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    result = BacktestResult(
+        zone="DK1",
+        start_time=datetime(2026, 7, 16, tzinfo=UTC),
+        end_time=datetime(2026, 7, 17, tzinfo=UTC),
+        config=BessConfig(),
+        ticks=[
+            BessTick(
+                time=datetime(2026, 7, 16, tzinfo=UTC),
+                soc_mwh=1.0,
+                soc_fraction=0.5,
+                action="idle",
+                day_ahead_price=500.0,
+                energy_discharged_mwh=0.0,
+                arbitrage_revenue_dkk=0.0,
+                capacity_reserved_mw=0.3,
+                capacity_revenue_dkk=15.0,
+                capacity_revenue_by_market={"FCR": 10.0, "aFRR_capacity": 5.0},
+                cumulative_arbitrage_revenue_dkk=0.0,
+                cumulative_capacity_revenue_dkk=15.0,
+                cumulative_total_revenue_dkk=15.0,
+            )
+        ],
+    )
+
+    with patch("shared.db_manager.execute_values") as mock_execute_values:
+        run_id = db.save_bess_run(result)
+
+    assert run_id == 7
+    insert_run_call = cursor.execute.call_args_list[0]
+    assert "INSERT INTO bess_simulation_runs" in insert_run_call.args[0]
+    mock_execute_values.assert_called_once()
+    tick_query = mock_execute_values.call_args.args[1]
+    assert "INSERT INTO bess_simulation_ticks" in tick_query
+    conn.commit.assert_called_once()
+    mock_pool.putconn.assert_called_once_with(conn)
+
+
+def test_save_bess_run_skips_tick_insert_when_no_ticks(db, pooled_conn):
+    from shared.bess_simulator import BacktestResult, BessConfig
+
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (3,)
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    result = BacktestResult(
+        zone="DK1",
+        start_time=datetime(2026, 7, 16, tzinfo=UTC),
+        end_time=datetime(2026, 7, 17, tzinfo=UTC),
+        config=BessConfig(),
+        ticks=[],
+    )
+
+    with patch("shared.db_manager.execute_values") as mock_execute_values:
+        run_id = db.save_bess_run(result)
+
+    assert run_id == 3
+    mock_execute_values.assert_not_called()
+
+
+def test_save_bess_run_rolls_back_and_reraises_on_failure(db, pooled_conn):
+    from shared.bess_simulator import BacktestResult, BessConfig
+
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.execute.side_effect = RuntimeError("insert failed")
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    result = BacktestResult(
+        zone="DK1",
+        start_time=datetime(2026, 7, 16, tzinfo=UTC),
+        end_time=datetime(2026, 7, 17, tzinfo=UTC),
+        config=BessConfig(),
+        ticks=[],
+    )
+
+    with pytest.raises(RuntimeError):
+        db.save_bess_run(result)
+
+    conn.rollback.assert_called_once()
+    mock_pool.putconn.assert_called_once_with(conn)
+
+
+def test_fetch_bess_runs_returns_mapped_rows(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [
+        (
+            1,
+            "DK1",
+            datetime(2026, 7, 16, tzinfo=UTC),
+            datetime(2026, 7, 17, tzinfo=UTC),
+            {"power_mw": 1.0},
+            100.0,
+            50.0,
+            150.0,
+            0.5,
+            48,
+            datetime(2026, 7, 17, 9, tzinfo=UTC),
+        )
+    ]
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    result = db.fetch_bess_runs(zone="DK1", limit=10, offset=0)
+
+    assert result[0]["id"] == 1
+    assert result[0]["zone"] == "DK1"
+    assert result[0]["config"] == {"power_mw": 1.0}
+    query, params = cursor.execute.call_args.args
+    assert "zone = %s" in query
+    assert params == ["DK1", 10, 0]
+
+
+def test_fetch_bess_runs_decodes_json_string_config(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [
+        (
+            1,
+            "DK1",
+            datetime(2026, 7, 16, tzinfo=UTC),
+            datetime(2026, 7, 17, tzinfo=UTC),
+            json.dumps({"power_mw": 1.0}),
+            100.0,
+            50.0,
+            150.0,
+            0.5,
+            48,
+            datetime(2026, 7, 17, 9, tzinfo=UTC),
+        )
+    ]
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    result = db.fetch_bess_runs()
+
+    assert result[0]["config"] == {"power_mw": 1.0}
+
+
+def test_fetch_bess_run_returns_none_when_absent(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.fetchone.return_value = None
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    assert db.fetch_bess_run(999) is None
+
+
+def test_fetch_bess_ticks_returns_mapped_rows(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [
+        (
+            datetime(2026, 7, 16, tzinfo=UTC),
+            1.0,
+            0.5,
+            "idle",
+            500.0,
+            0.0,
+            0.0,
+            0.3,
+            15.0,
+            {"FCR": 10.0, "aFRR_capacity": 5.0},
+            0.0,
+            15.0,
+            15.0,
+        )
+    ]
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    result = db.fetch_bess_ticks(1)
+
+    assert result[0]["action"] == "idle"
+    assert result[0]["capacity_revenue_by_market"] == {"FCR": 10.0, "aFRR_capacity": 5.0}
+    query, params = cursor.execute.call_args.args
+    assert "run_id = %s" in query
+    assert params == (1,)
+
+
 def test_dataset_config_defaults():
     cfg = DatasetConfig(
         name="test",
@@ -725,3 +911,61 @@ def test_dataset_config_defaults():
     assert cfg.zone == "ALL"
     assert cfg.source == "Energinet"
     assert cfg.is_provisional is True
+
+
+# --- BESS-eligible datasets (FCR / aFRR capacity) --------------------------
+
+
+def test_fcr_dk1_and_dk2_datasets_are_registered():
+    fcr_dk1 = next(d for d in DATASETS if d.name == "fcr_dk1")
+    fcr_dk2 = next(d for d in DATASETS if d.name == "fcr_dk2")
+    assert fcr_dk1.market == "FCR"
+    assert fcr_dk1.zone == "DK1"
+    assert fcr_dk2.market == "FCR"
+    assert fcr_dk2.zone_field == "PriceArea"
+
+
+def test_afrr_reserves_nordic_dataset_is_registered():
+    afrr_capacity = next(d for d in DATASETS if d.name == "afrr_reserves_nordic")
+    assert afrr_capacity.market == "aFRR_capacity"
+    products = {s.product for s in afrr_capacity.series}
+    assert products == {"up", "down"}
+
+
+@patch("shared.db_manager.execute_values")
+def test_save_market_data_applies_series_filter_field(mock_execute, db):
+    dataset = DatasetConfig(
+        name="fcr_dk2_test",
+        dataset_id="FcrNdDK2",
+        market="FCR",
+        time_field="HourUTC",
+        zone_field="PriceArea",
+        series=[
+            SeriesConfig(
+                product="price",
+                value_field="PriceTotalEUR",
+                filter_field="ProductName",
+                filter_value="FCR-N",
+            )
+        ],
+    )
+    records = [
+        {
+            "HourUTC": "2026-07-18T21:00:00",
+            "PriceArea": "DK2",
+            "ProductName": "FCR-D ned",
+            "PriceTotalEUR": 1.73,
+        },
+        {
+            "HourUTC": "2026-07-18T21:00:00",
+            "PriceArea": "DK2",
+            "ProductName": "FCR-N",
+            "PriceTotalEUR": 20.0,
+        },
+    ]
+
+    saved = db.save_market_data(records, dataset)
+
+    assert saved == 1
+    values = mock_execute.call_args.args[2]
+    assert values[0][4] == 20.0  # only the FCR-N row's price is mapped

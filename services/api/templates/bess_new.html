@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}New BESS Backtest — AncillaryNews{% endblock %}
+{% block content %}
+<h1>Run a New BESS Backtest</h1>
+<p class="muted">
+  Runs a threshold-rule battery simulation over real historical data already ingested into
+  <code>market_data_history</code> for the given zone/time window (<code>shared/bess_simulator.py</code>).
+  Defaults describe a generic 1&nbsp;MW / 2&nbsp;MWh grid-scale unit, not a specific real battery.
+</p>
+
+{% if error %}
+<div class="card" style="border-color:#a30000;"><strong>Error:</strong> {{ error }}</div>
+{% endif %}
+
+<form method="post" action="/dashboard/bess/new">
+  <table>
+    <tr><td><label for="zone">Zone</label></td>
+        <td><input type="text" id="zone" name="zone" value="DK1" required></td></tr>
+    <tr><td><label for="start_time">Start time (UTC)</label></td>
+        <td><input type="datetime-local" id="start_time" name="start_time" required></td></tr>
+    <tr><td><label for="end_time">End time (UTC)</label></td>
+        <td><input type="datetime-local" id="end_time" name="end_time" required></td></tr>
+    <tr><td><label for="power_mw">Power (MW)</label></td>
+        <td><input type="number" step="any" id="power_mw" name="power_mw" value="{{ defaults.power_mw }}" required></td></tr>
+    <tr><td><label for="capacity_mwh">Capacity (MWh)</label></td>
+        <td><input type="number" step="any" id="capacity_mwh" name="capacity_mwh" value="{{ defaults.capacity_mwh }}" required></td></tr>
+    <tr><td><label for="round_trip_efficiency">Round-trip efficiency</label></td>
+        <td><input type="number" step="any" id="round_trip_efficiency" name="round_trip_efficiency" value="{{ defaults.round_trip_efficiency }}" required></td></tr>
+    <tr><td><label for="soc_min_fraction">SoC min fraction</label></td>
+        <td><input type="number" step="any" id="soc_min_fraction" name="soc_min_fraction" value="{{ defaults.soc_min_fraction }}" required></td></tr>
+    <tr><td><label for="soc_max_fraction">SoC max fraction</label></td>
+        <td><input type="number" step="any" id="soc_max_fraction" name="soc_max_fraction" value="{{ defaults.soc_max_fraction }}" required></td></tr>
+    <tr><td><label for="starting_soc_fraction">Starting SoC fraction</label></td>
+        <td><input type="number" step="any" id="starting_soc_fraction" name="starting_soc_fraction" value="{{ defaults.starting_soc_fraction }}" required></td></tr>
+    <tr><td><label for="arbitrage_lookback_periods">Arbitrage lookback periods</label></td>
+        <td><input type="number" id="arbitrage_lookback_periods" name="arbitrage_lookback_periods" value="{{ defaults.arbitrage_lookback_periods }}" required></td></tr>
+    <tr><td><label for="arbitrage_z_threshold">Arbitrage z-score threshold</label></td>
+        <td><input type="number" step="any" id="arbitrage_z_threshold" name="arbitrage_z_threshold" value="{{ defaults.arbitrage_z_threshold }}" required></td></tr>
+    <tr><td><label for="capacity_commit_mw">Capacity commit (MW)</label></td>
+        <td><input type="number" step="any" id="capacity_commit_mw" name="capacity_commit_mw" value="{{ defaults.capacity_commit_mw }}" required></td></tr>
+  </table>
+  <p><button type="submit">Run backtest</button></p>
+</form>
+{% endblock %}

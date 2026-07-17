@@ -44,6 +44,16 @@ class SeriesConfig:
     # dataset spans more than one logical market (unused today, kept for
     # forward-compatibility with e.g. combined capacity+energy datasets).
     market: str | None = None
+    # Optional record-level filter: only map this series for records where
+    # `record[filter_field] == filter_value`. Needed for datasets that pack
+    # several distinct products into one shared value column, distinguished
+    # only by a categorical field rather than by separate columns — e.g.
+    # `FcrNdDK2` (see below) carries "FCR-D ned"/"FCR-D upp"/"FCR-N" and
+    # "D-1 early"/"Total" auction rows all through the same `PriceTotalEUR`
+    # column. Unused (None) for the common case of one value_field == one
+    # product.
+    filter_field: str | None = None
+    filter_value: str | None = None
 
 
 @dataclass(frozen=True)
@@ -205,6 +215,77 @@ DATASETS: list[DatasetConfig] = [
             SeriesConfig(product="price", value_field="DayAheadPriceDKK"),
         ],
         is_provisional=False,
+    ),
+    # BESS simulator (shared/bess_simulator.py) — FCR capacity/reservation
+    # prices. Two different datasets per zone since FCR is structured
+    # differently in each synchronous area (README §1 table): DK1 sits in
+    # the FCR Cooperation (regelleistung.net) joint auction with Germany,
+    # DK2 sits in the Nordic FCR-N/FCR-D market. Confirmed live via direct
+    # API query 2026-07-17 (docs/dataset-catalogue-addendum.md §"Other
+    # datasets confirmed live").
+    #
+    # FcrDK1 has no PriceArea field (it's already DK1-specific) and no
+    # up/down split (FCR is a single symmetric band) — one "price" product,
+    # using `FCRdk_DKK` (the domestic-weighted clearing price, combining
+    # domestic + cross-border volume) rather than `FCRcross_DKK` alone.
+    DatasetConfig(
+        name="fcr_dk1",
+        dataset_id="FcrDK1",
+        market="FCR",
+        time_field="HourUTC",
+        zone_field=None,
+        zone="DK1",
+        series=[
+            SeriesConfig(product="price", value_field="FCRdk_DKK"),
+        ],
+        is_provisional=True,
+        params={"limit": 100, "sort": "HourUTC DESC"},
+    ),
+    # FcrNdDK2 packs three products (FCR-D ned/upp, FCR-N) and two auction
+    # views (D-1 early / Total) into one shared `PriceTotalEUR` column,
+    # distinguished only by `ProductName`/`AuctionType` — hence the
+    # `filter_field`/`filter_value` on SeriesConfig. Only the "FCR-N"
+    # product's "Total" (final cleared) auction row is mapped: FCR-N is the
+    # Nordic normal-operation band, the closest DK2 analogue to DK1's single
+    # symmetric FCR price above; FCR-D (disturbance, split up/down) is a
+    # distinct product family left unmapped for now rather than guessing
+    # which of the three FCR-D/FCR-N series a generic BESS estimate should
+    # use.
+    DatasetConfig(
+        name="fcr_dk2",
+        dataset_id="FcrNdDK2",
+        market="FCR",
+        time_field="HourUTC",
+        zone_field="PriceArea",
+        series=[
+            SeriesConfig(
+                product="price",
+                value_field="PriceTotalEUR",
+                filter_field="ProductName",
+                filter_value="FCR-N",
+            ),
+        ],
+        is_provisional=True,
+        params={"limit": 100, "sort": "HourUTC DESC"},
+    ),
+    # BESS simulator — Nordic aFRR capacity/reservation market (distinct
+    # from `afrr_energy_activation` above, which is the PICASSO
+    # *activation/energy* price). Confirmed live 2026-07-17. Up/down
+    # procured prices are genuinely asymmetric (separate auctions), so both
+    # are mapped as their own products, consistent with `mfrr_capacity`'s
+    # up/down pattern.
+    DatasetConfig(
+        name="afrr_reserves_nordic",
+        dataset_id="AfrrReservesNordic",
+        market="aFRR_capacity",
+        time_field="TimeUTC",
+        zone_field="PriceArea",
+        series=[
+            SeriesConfig(product="up", value_field="UpPriceDKK"),
+            SeriesConfig(product="down", value_field="DownPriceDKK"),
+        ],
+        is_provisional=True,
+        params={"limit": 100, "sort": "TimeUTC DESC"},
     ),
     # High priority — near-real-time system state (wind/solar/CO2), used as
     # explanatory soft-signal context ("low wind" style narratives). No

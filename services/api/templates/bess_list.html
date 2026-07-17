@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}BESS Backtests — AncillaryNews{% endblock %}
+{% block content %}
+<h1>BESS Backtest Runs</h1>
+<p class="muted">
+  Simulated battery charge/discharge/reservation decisions over real historical market data
+  (<code>shared/bess_simulator.py</code>). Both revenue streams shown are <strong>estimates</strong>,
+  not a real co-optimized dispatch — see the run detail page for exactly what's simplified.
+</p>
+<p><a href="/dashboard/bess/new">Run a new backtest &rarr;</a></p>
+
+{% if not runs %}
+<p>No BESS backtest runs yet.</p>
+{% endif %}
+
+{% if runs %}
+<table>
+  <tr>
+    <th>Run</th><th>Zone</th><th>Period</th><th>Arbitrage revenue (DKK)</th>
+    <th>Capacity revenue (DKK)</th><th>Total revenue (DKK)</th><th>Full cycle equivalents</th>
+    <th>Created</th>
+  </tr>
+  {% for run in runs %}
+  <tr>
+    <td><a href="/dashboard/bess/{{ run.id }}">#{{ run.id }}</a></td>
+    <td>{{ run.zone }}</td>
+    <td>{{ run.start_time }} &rarr; {{ run.end_time }}</td>
+    <td>{{ "%.2f"|format(run.total_arbitrage_revenue_dkk) }}</td>
+    <td>{{ "%.2f"|format(run.total_capacity_revenue_dkk) }}</td>
+    <td>{{ "%.2f"|format(run.total_revenue_dkk) }}</td>
+    <td>{{ "%.3f"|format(run.full_cycle_equivalents) }}</td>
+    <td>{{ run.created_at }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% endblock %}
