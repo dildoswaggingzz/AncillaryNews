@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Recent Manual Claims — AncillaryNews{% endblock %}
+{% block content %}
+<h1>Recently Submitted LinkedIn Claims</h1>
+<p class="muted">Most recently submitted first.</p>
+
+{% if not claims %}
+<p>No manually-submitted posts yet. <a href="/dashboard/manual-articles">Submit one</a>.</p>
+{% endif %}
+
+{% for claim in claims %}
+<div class="card">
+  <p class="muted">
+    {% if claim.author %}{{ claim.author }} &middot; {% endif %}
+    <a href="{{ claim.article_url }}">{{ claim.article_title or claim.article_url }}</a>
+    &middot; retrieved {{ claim.retrieved_at }}
+  </p>
+  <p>
+    <span class="badge badge-confidence-{{ 'high' if claim.claim_type == 'fact' else 'medium' }}">
+      {{ claim.claim_type }}
+    </span>
+    {{ claim.claim }}
+  </p>
+</div>
+{% endfor %}
+{% endblock %}

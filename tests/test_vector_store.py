@@ -189,6 +189,40 @@ async def test_search_claims_returns_empty_list_when_no_matches(store, qdrant_cl
     assert results == []
 
 
+async def test_scroll_by_source_filters_and_sorts_most_recent_first(store, qdrant_client):
+    older = MagicMock(
+        payload={
+            "source": "LinkedIn",
+            "claim": "older",
+            "retrieved_at": "2026-07-01T00:00:00+00:00",
+        }
+    )
+    newer = MagicMock(
+        payload={
+            "source": "LinkedIn",
+            "claim": "newer",
+            "retrieved_at": "2026-07-15T00:00:00+00:00",
+        }
+    )
+    qdrant_client.scroll = AsyncMock(return_value=([older, newer], None))
+
+    results = await store.scroll_by_source("LinkedIn", limit=100)
+
+    assert [r["claim"] for r in results] == ["newer", "older"]
+    _, kwargs = qdrant_client.scroll.call_args
+    assert kwargs["collection_name"] == COLLECTION_NAME
+    assert kwargs["limit"] == 100
+    condition = kwargs["scroll_filter"].must[0]
+    assert condition.key == "source"
+    assert condition.match.value == "LinkedIn"
+
+
+async def test_scroll_by_source_returns_empty_list_when_no_matches(store, qdrant_client):
+    results = await store.scroll_by_source("LinkedIn")
+
+    assert results == []
+
+
 async def test_raw_article_and_claim_ids_are_derived_from_url_deterministically():
     """Re-crawling produces the same raw-article point ID as before (upsert semantics)."""
     from shared.vector_store import _raw_point_id

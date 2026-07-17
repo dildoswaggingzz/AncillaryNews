@@ -99,9 +99,17 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      vector-db:
+        condition: service_healthy
     environment:
       - DATABASE_URL=postgresql://postgres:${DB_PASSWORD:-secret}@db:5432/energy
       - API_KEY=${API_KEY:-}
+      # Manual-article submission tool (services/api/main.py's
+      # /manual-articles / /dashboard/manual-articles): reuses the same
+      # crawler pipeline shared/claim_extractor.py + shared/vector_store.py
+      # already talk to.
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - QDRANT_URL=http://vector-db:6333
     ports:
       - "8080:8000"
     volumes:

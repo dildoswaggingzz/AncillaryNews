@@ -1,10 +1,13 @@
 import importlib.util
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
+
+from shared.bess_simulator import BacktestResult
+from shared.claim_extractor import ExtractedClaim, ExtractionResult
 
 MAIN_PATH = Path(__file__).parent.parent / "services" / "api" / "main.py"
 
@@ -65,8 +68,20 @@ def db():
 
 
 @pytest.fixture
-def client(db):
+def vector_store():
+    store = MagicMock()
+    store.ensure_collection = AsyncMock()
+    store.is_processed = AsyncMock(return_value=False)
+    store.upsert_claims = AsyncMock(return_value=1)
+    store.upsert_raw_article = AsyncMock()
+    store.scroll_by_source = AsyncMock(return_value=[])
+    return store
+
+
+@pytest.fixture
+def client(db, vector_store):
     api_main.app.dependency_overrides[api_main.get_db] = lambda: db
+    api_main.app.dependency_overrides[api_main.get_vector_store] = lambda: vector_store
     with TestClient(api_main.app) as test_client:
         yield test_client
     api_main.app.dependency_overrides.clear()
@@ -284,6 +299,432 @@ def test_list_triggers(client, db):
     assert body["triggers"][0]["trigger_type"] == "price_spike"
     kwargs = db.fetch_triggers.call_args.kwargs
     assert kwargs["market"] == "mFRR EAM"
+
+
+# --- /bess (BESS backtest simulator) ----------------------------------------
+
+BESS_RUN_ROW = {
+    "id": 1,
+    "zone": "DK1",
+    "start_time": "2026-07-16T20:00:00+00:00",
+    "end_time": "2026-07-17T08:00:00+00:00",
+    "config": {"power_mw": 1.0, "capacity_mwh": 2.0},
+    "total_arbitrage_revenue_dkk": 120.5,
+    "total_capacity_revenue_dkk": 60.0,
+    "total_revenue_dkk": 180.5,
+    "full_cycle_equivalents": 0.75,
+    "tick_count": 48,
+    "created_at": "2026-07-17T09:00:00+00:00",
+}
+
+BESS_TICK_ROW = {
+    "time": "2026-07-16T20:00:00+00:00",
+    "soc_mwh": 1.0,
+    "soc_fraction": 0.5,
+    "action": "idle",
+    "day_ahead_price": 500.0,
+    "energy_discharged_mwh": 0.0,
+    "arbitrage_revenue_dkk": 0.0,
+    "capacity_reserved_mw": 0.3,
+    "capacity_revenue_dkk": 15.0,
+    "capacity_revenue_by_market": {"FCR": 10.0, "aFRR_capacity": 5.0},
+    "cumulative_arbitrage_revenue_dkk": 0.0,
+    "cumulative_capacity_revenue_dkk": 15.0,
+    "cumulative_total_revenue_dkk": 15.0,
+}
+
+
+def test_trigger_bess_backtest_runs_and_persists(client, db, monkeypatch):
+    monkeypatch.setattr(
+        api_main,
+        "run_backtest",
+        lambda db_arg, zone, start, end, config: BacktestResult(
+            zone=zone, start_time=start, end_time=end, config=config, ticks=[]
+        ),
+    )
+    db.save_bess_run.return_value = 42
+
+    resp = client.post(
+        "/bess/backtest",
+        json={
+            "zone": "DK1",
+            "start_time": "2026-07-16T20:00:00Z",
+            "end_time": "2026-07-17T08:00:00Z",
+        },
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["run_id"] == 42
+    assert body["zone"] == "DK1"
+    assert body["tick_count"] == 0
+    db.save_bess_run.assert_called_once()
+
+
+def test_trigger_bess_backtest_rejects_invalid_config(client, db):
+    resp = client.post(
+        "/bess/backtest",
+        json={
+            "zone": "DK1",
+            "start_time": "2026-07-16T20:00:00Z",
+            "end_time": "2026-07-17T08:00:00Z",
+            "power_mw": -1.0,
+        },
+    )
+
+    assert resp.status_code == 422
+
+
+def test_list_bess_runs(client, db):
+    db.fetch_bess_runs.return_value = [BESS_RUN_ROW]
+
+    resp = client.get("/bess/runs?zone=DK1")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["count"] == 1
+    assert body["runs"][0]["id"] == 1
+    kwargs = db.fetch_bess_runs.call_args.kwargs
+    assert kwargs["zone"] == "DK1"
+
+
+def test_get_bess_run_found(client, db):
+    db.fetch_bess_run.return_value = BESS_RUN_ROW
+
+    resp = client.get("/bess/runs/1")
+
+    assert resp.status_code == 200
+    assert resp.json()["id"] == 1
+    db.fetch_bess_ticks.assert_not_called()
+
+
+def test_get_bess_run_with_ticks(client, db):
+    db.fetch_bess_run.return_value = BESS_RUN_ROW
+    db.fetch_bess_ticks.return_value = [BESS_TICK_ROW]
+
+    resp = client.get("/bess/runs/1?include_ticks=true")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ticks"] == [BESS_TICK_ROW]
+
+
+def test_get_bess_run_not_found(client, db):
+    db.fetch_bess_run.return_value = None
+
+    resp = client.get("/bess/runs/999")
+
+    assert resp.status_code == 404
+
+
+def test_bess_routes_gated_by_api_key(client, db, monkeypatch):
+    monkeypatch.setenv("API_KEY", "s3cret")
+    db.fetch_bess_runs.return_value = []
+
+    resp = client.get("/bess/runs")
+
+    assert resp.status_code == 401
+
+
+def test_dashboard_bess_list_renders(client, db):
+    db.fetch_bess_runs.return_value = [BESS_RUN_ROW]
+
+    resp = client.get("/dashboard/bess")
+
+    assert resp.status_code == 200
+    assert "BESS" in resp.text
+
+
+def test_dashboard_bess_new_form_renders(client):
+    resp = client.get("/dashboard/bess/new")
+
+    assert resp.status_code == 200
+
+
+def test_dashboard_bess_detail_renders(client, db):
+    db.fetch_bess_run.return_value = BESS_RUN_ROW
+    db.fetch_bess_ticks.return_value = [BESS_TICK_ROW]
+
+    resp = client.get("/dashboard/bess/1")
+
+    assert resp.status_code == 200
+
+
+def test_dashboard_bess_detail_not_found(client, db):
+    db.fetch_bess_run.return_value = None
+
+    resp = client.get("/dashboard/bess/999")
+
+    assert resp.status_code == 404
+
+
+def test_dashboard_bess_trigger_redirects_to_detail(client, db, monkeypatch):
+    monkeypatch.setattr(
+        api_main,
+        "run_backtest",
+        lambda db_arg, zone, start, end, config: BacktestResult(
+            zone=zone, start_time=start, end_time=end, config=config, ticks=[]
+        ),
+    )
+    db.save_bess_run.return_value = 7
+
+    resp = client.post(
+        "/dashboard/bess/new",
+        data={
+            "zone": "DK1",
+            "start_time": "2026-07-16T20:00",
+            "end_time": "2026-07-17T08:00",
+            "power_mw": "1.0",
+            "capacity_mwh": "2.0",
+            "round_trip_efficiency": "0.9",
+            "soc_min_fraction": "0.1",
+            "soc_max_fraction": "0.9",
+            "starting_soc_fraction": "0.5",
+            "arbitrage_lookback_periods": "30",
+            "arbitrage_z_threshold": "0.5",
+            "capacity_commit_mw": "0.3",
+        },
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/dashboard/bess/7"
+
+
+def test_dashboard_bess_trigger_shows_error_on_invalid_config(client, db):
+    resp = client.post(
+        "/dashboard/bess/new",
+        data={
+            "zone": "DK1",
+            "start_time": "2026-07-16T20:00",
+            "end_time": "2026-07-17T08:00",
+            "power_mw": "-1.0",
+            "capacity_mwh": "2.0",
+            "round_trip_efficiency": "0.9",
+            "soc_min_fraction": "0.1",
+            "soc_max_fraction": "0.9",
+            "starting_soc_fraction": "0.5",
+            "arbitrage_lookback_periods": "30",
+            "arbitrage_z_threshold": "0.5",
+            "capacity_commit_mw": "0.3",
+        },
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 200
+    assert "Error" in resp.text
+    db.save_bess_run.assert_not_called()
+
+
+# --- /manual-articles (LinkedIn paste-in tool) ------------------------------
+
+MANUAL_SUBMISSION = {
+    "url": "https://www.linkedin.com/posts/jane-doe_dk1-afrr-pricing-activity-123",
+    "author": "Jane Doe",
+    "title": "aFRR pricing take",
+    "text": "DK1 aFRR capacity prices hit a new high this week. I think this is driven by "
+    "reduced wind availability.",
+}
+
+
+def test_submit_manual_article_happy_path(client, vector_store, monkeypatch):
+    """Claims come back typed, and go through ensure_collection/upsert_claims exactly
+    like the RSS crawler pipeline does."""
+    monkeypatch.delenv("API_KEY", raising=False)
+    extraction = ExtractionResult(
+        summary="Analyst comments on DK1 aFRR capacity price trends.",
+        claims=[
+            ExtractedClaim(claim="DK1 aFRR capacity prices hit a new high.", claim_type="fact"),
+            ExtractedClaim(
+                claim="Reduced wind availability is driving the increase.", claim_type="theory"
+            ),
+        ],
+    )
+    with_extract = AsyncMock(return_value=extraction)
+    with monkeypatch.context() as m:
+        m.setattr(api_main, "extract_claims", with_extract)
+        resp = client.post("/manual-articles", json=MANUAL_SUBMISSION)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["feed_tier"] == "tier2"
+    assert body["already_processed"] is False
+    assert body["stored_raw"] is False
+    assert [c["claim_type"] for c in body["claims"]] == ["fact", "theory"]
+
+    vector_store.ensure_collection.assert_awaited_once()
+    vector_store.upsert_claims.assert_awaited_once()
+    article_arg = vector_store.upsert_claims.call_args.args[0]
+    assert article_arg.feed_tier == "tier2"
+    assert article_arg.feed_name == "LinkedIn"
+    assert article_arg.url == MANUAL_SUBMISSION["url"]
+
+
+def test_submit_manual_article_downgrades_tier2_fact_to_theory(client, vector_store, monkeypatch):
+    """README §6: reuses shared/claim_extractor.py's existing Tier 2 downgrade rather than
+    reimplementing it -- a claim Claude marks 'fact' comes back as 'theory' because the
+    ArticleRef built here is always feed_tier='tier2'. Exercises the real
+    `api_main.extract_claims` (not mocked) against a mocked Anthropic client, so the
+    downgrade logic in shared/claim_extractor.py actually runs."""
+    monkeypatch.delenv("API_KEY", raising=False)
+
+    from types import SimpleNamespace
+
+    response_text = (
+        '{"summary": "s", "claims": [{"claim": "DK1 aFRR hit a new high.", "claim_type": "fact"}]}'
+    )
+    text_block = SimpleNamespace(type="text", text=response_text)
+    message = SimpleNamespace(content=[text_block])
+    fake_anthropic_client = SimpleNamespace(
+        messages=SimpleNamespace(create=AsyncMock(return_value=message))
+    )
+
+    # api_main.extract_claims is the real function object imported from
+    # shared.claim_extractor; call it directly with an injected fake client
+    # (its own `client=` parameter) instead of stubbing internals.
+    real_extract_claims = api_main.extract_claims
+
+    async def call_with_fake_client(text, article, client=None):
+        return await real_extract_claims(text, article, client=fake_anthropic_client)
+
+    monkeypatch.setattr(api_main, "extract_claims", call_with_fake_client)
+
+    resp = client.post("/manual-articles", json=MANUAL_SUBMISSION)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["claims"][0]["claim_type"] == "theory"
+
+
+def test_submit_manual_article_dedup_skips_reextraction_on_resubmit(
+    client, vector_store, monkeypatch
+):
+    monkeypatch.delenv("API_KEY", raising=False)
+    vector_store.is_processed = AsyncMock(return_value=True)
+    fake_extract = AsyncMock()
+    monkeypatch.setattr(api_main, "extract_claims", fake_extract)
+
+    resp = client.post("/manual-articles", json=MANUAL_SUBMISSION)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["already_processed"] is True
+    assert body["claims"] == []
+    fake_extract.assert_not_awaited()
+    vector_store.upsert_claims.assert_not_awaited()
+    vector_store.upsert_raw_article.assert_not_awaited()
+
+
+def test_submit_manual_article_stores_raw_when_no_api_key(client, vector_store, monkeypatch):
+    monkeypatch.delenv("API_KEY", raising=False)
+    fake_extract = AsyncMock(return_value=None)
+    monkeypatch.setattr(api_main, "extract_claims", fake_extract)
+
+    resp = client.post("/manual-articles", json=MANUAL_SUBMISSION)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["stored_raw"] is True
+    assert body["claims"] == []
+    vector_store.upsert_raw_article.assert_awaited_once()
+    vector_store.upsert_claims.assert_not_awaited()
+
+
+def test_submit_manual_article_gated_by_api_key(client, vector_store, monkeypatch):
+    monkeypatch.setenv("API_KEY", "s3cret")
+
+    resp = client.post("/manual-articles", json=MANUAL_SUBMISSION)
+
+    assert resp.status_code == 401
+
+
+def test_submit_manual_article_accepts_correct_api_key(client, vector_store, monkeypatch):
+    monkeypatch.setenv("API_KEY", "s3cret")
+    fake_extract = AsyncMock(return_value=ExtractionResult(summary="s", claims=[]))
+    monkeypatch.setattr(api_main, "extract_claims", fake_extract)
+
+    resp = client.post("/manual-articles", json=MANUAL_SUBMISSION, headers={"X-API-Key": "s3cret"})
+
+    assert resp.status_code == 200
+
+
+def test_submit_manual_article_requires_url(client, vector_store, monkeypatch):
+    monkeypatch.delenv("API_KEY", raising=False)
+
+    resp = client.post("/manual-articles", json={"text": "some text, no url"})
+
+    assert resp.status_code == 422
+
+
+# --- dashboard manual-article form ------------------------------------------
+
+
+def test_dashboard_manual_article_form_renders(client):
+    resp = client.get("/dashboard/manual-articles")
+
+    assert resp.status_code == 200
+    assert "Submit a LinkedIn Post" in resp.text
+
+
+def test_dashboard_manual_article_form_stays_open_regardless_of_api_key(client, monkeypatch):
+    monkeypatch.setenv("API_KEY", "s3cret")
+
+    resp = client.get("/dashboard/manual-articles")
+
+    assert resp.status_code == 200
+
+
+def test_dashboard_submit_manual_article_renders_confirmation(client, vector_store, monkeypatch):
+    monkeypatch.setenv(
+        "API_KEY", "s3cret"
+    )  # dashboard form still works even when JSON API is gated
+    extraction = ExtractionResult(
+        summary="s", claims=[ExtractedClaim(claim="DK1 aFRR spike.", claim_type="theory")]
+    )
+    fake_extract = AsyncMock(return_value=extraction)
+    monkeypatch.setattr(api_main, "extract_claims", fake_extract)
+
+    resp = client.post(
+        "/dashboard/manual-articles",
+        data={
+            "url": MANUAL_SUBMISSION["url"],
+            "author": MANUAL_SUBMISSION["author"],
+            "title": MANUAL_SUBMISSION["title"],
+            "text": MANUAL_SUBMISSION["text"],
+        },
+    )
+
+    assert resp.status_code == 200
+    assert "DK1 aFRR spike." in resp.text
+    assert "theory" in resp.text
+
+
+def test_dashboard_recent_manual_claims_lists_scroll_results(client, vector_store):
+    vector_store.scroll_by_source.return_value = [
+        {
+            "claim": "DK1 aFRR capacity prices hit a new high.",
+            "claim_type": "theory",
+            "article_url": MANUAL_SUBMISSION["url"],
+            "article_title": MANUAL_SUBMISSION["title"],
+            "author": MANUAL_SUBMISSION["author"],
+            "retrieved_at": "2026-07-16T09:00:00+00:00",
+        }
+    ]
+
+    resp = client.get("/dashboard/manual-articles/recent")
+
+    assert resp.status_code == 200
+    assert "DK1 aFRR capacity prices hit a new high." in resp.text
+    vector_store.scroll_by_source.assert_awaited_once_with("LinkedIn", limit=100)
+
+
+def test_dashboard_recent_manual_claims_empty_state(client, vector_store):
+    vector_store.scroll_by_source.return_value = []
+
+    resp = client.get("/dashboard/manual-articles/recent")
+
+    assert resp.status_code == 200
+    assert "No manually-submitted posts yet." in resp.text
 
 
 # --- dashboard pages -------------------------------------------------------

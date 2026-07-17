@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}Submit LinkedIn Post — AncillaryNews{% endblock %}
+{% block content %}
+<h1>Submit a LinkedIn Post</h1>
+<p class="muted">
+  Paste in a post's URL, author, and text. It runs through the same Claude
+  Haiku claim-extraction pipeline used for RSS articles, always as a
+  Tier 2 source — any claim Claude classifies as "fact" is downgraded to
+  "theory" (README §6: an individual's LinkedIn commentary is never citable
+  as bare fact).
+</p>
+
+<form method="post" action="/dashboard/manual-articles" class="card">
+  <p>
+    <label for="url"><strong>Post URL</strong> (required, used to dedupe resubmissions)</label><br>
+    <input type="url" id="url" name="url" required style="width: 100%;" value="{{ result.url if result else '' }}">
+  </p>
+  <p>
+    <label for="author"><strong>Author</strong></label><br>
+    <input type="text" id="author" name="author" style="width: 100%;" value="{{ result.author if result else '' }}">
+  </p>
+  <p>
+    <label for="title"><strong>Title</strong> (optional)</label><br>
+    <input type="text" id="title" name="title" style="width: 100%;" value="{{ result.title if result else '' }}">
+  </p>
+  <p>
+    <label for="text"><strong>Post text</strong></label><br>
+    <textarea id="text" name="text" rows="8" style="width: 100%;" required></textarea>
+  </p>
+  <button type="submit">Extract Claims</button>
+</form>
+
+{% if result %}
+<div class="card">
+  <h2>Result</h2>
+  <p class="muted">
+    <strong>Source:</strong> {{ result.feed_tier }} &middot;
+    <strong>URL:</strong> {{ result.url }}
+    {% if result.author %} &middot; <strong>Author:</strong> {{ result.author }}{% endif %}
+  </p>
+
+  {% if result.already_processed %}
+  <p>This post URL was already submitted previously — skipped re-extraction (dedup by URL).</p>
+  {% elif result.stored_raw %}
+  <p>
+    <code>ANTHROPIC_API_KEY</code> is not configured, so the raw post text was stored without
+    derived claims (same fallback as the RSS crawler).
+  </p>
+  {% else %}
+  {% if result.summary %}<p><strong>Summary:</strong> {{ result.summary }}</p>{% endif %}
+  {% if result.claims %}
+  <table>
+    <tr><th>Claim</th><th>Type</th></tr>
+    {% for claim in result.claims %}
+    <tr>
+      <td>{{ claim.claim }}</td>
+      <td><span class="badge badge-confidence-{{ 'high' if claim.claim_type == 'fact' else 'medium' }}">{{ claim.claim_type }}</span></td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="muted">No relevant balancing-market claims were extracted from this post.</p>
+  {% endif %}
+  {% endif %}
+</div>
+{% endif %}
+{% endblock %}

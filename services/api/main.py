@@ -5,19 +5,25 @@ service serving the Event Reports, market data, and rule-engine triggers
 built up by M0-M4 as both JSON endpoints and simple server-rendered HTML
 pages (README §7: "dashboard later" -- this is that later).
 
-Read-only: this service never writes to `market_data_history`,
+Read-only for Postgres: this service never writes to `market_data_history`,
 `event_reports`, or `triggers` -- those tables remain owned by the
-ingestor/orchestrator (see shared/db_manager.py, shared/rule_engine.py).
+ingestor/orchestrator (see shared/db_manager.py, shared/rule_engine.py). It
+does, however, *write* to Qdrant via `/manual-articles` (and its dashboard
+form counterpart) -- a paste-in entry point that runs manually-submitted
+LinkedIn posts through the exact same claim-extraction/storage pipeline
+services/crawler/main.py uses for RSS articles (see that route's docstring
+below for the full rationale).
 
 Auth (Phase 6 production readiness): optional API-key gating via the
 `API_KEY` env var -- see `require_api_key` below. If `API_KEY` is unset the
 service stays exactly as open as it always was (local dev/tests
 unaffected). The gate applies only to the JSON API routes
-(`/series*`, `/event-reports*`, `/triggers`); the server-rendered dashboard
-HTML pages stay open regardless, since they're meant for humans clicking
-around in a browser (which can't easily attach a custom header) rather than
-programmatic API clients -- see DEPLOYMENT.md for the full rationale.
-`/health` and `/metrics` are always unauthenticated (needed for
+(`/series*`, `/event-reports*`, `/triggers`, `/manual-articles`); the
+server-rendered dashboard HTML pages (including the manual-article
+submission form) stay open regardless, since they're meant for humans
+clicking around in a browser (which can't easily attach a custom header)
+rather than programmatic API clients -- see DEPLOYMENT.md for the full
+rationale. `/health` and `/metrics` are always unauthenticated (needed for
 healthchecks/Prometheus scraping).
 """
 
@@ -28,19 +34,39 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, Response
+from fastapi import Depends, FastAPI, Form, Header, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
+from pydantic import BaseModel
+from qdrant_client import AsyncQdrantClient
 
+from shared.bess_simulator import BessConfig, run_backtest
+from shared.claim_extractor import extract_claims
 from shared.db_manager import DatabaseManager
 from shared.logging_config import configure_logging
+from shared.rss_reader import ArticleRef
+from shared.vector_store import QdrantStore
 
 configure_logging()
 logger = logging.getLogger(__name__)
 
 TEMPLATES_DIR = os.path.join(os.path.dirname(__file__), "templates")
 templates = Jinja2Templates(directory=TEMPLATES_DIR)
+
+# services/crawler/main.py hardcodes this same default (the container DNS
+# name from docker-compose.yml); an env override is added here purely so
+# this can be pointed elsewhere in tests/non-Docker runs without touching
+# the crawler.
+QDRANT_URL = os.getenv("QDRANT_URL", "http://vector-db:6333")
+
+# Fixed `feed_name` for every manually-submitted post (see
+# `_process_manual_article` below) -- always Tier 2 per README §6, and kept
+# as one constant value (rather than folding the author into it) so
+# `QdrantStore.scroll_by_source` can filter for "everything manually
+# submitted" with one exact-match query; the actual author is carried
+# separately on `ArticleRef.author` / `ClaimPayload.author`.
+MANUAL_SUBMISSION_SOURCE = "LinkedIn"
 
 REQUEST_COUNT = Counter(
     "api_requests_total", "API HTTP requests, by route/method/status", ["method", "path", "status"]
@@ -77,13 +103,32 @@ def get_db() -> DatabaseManager:
     return _db
 
 
+# Same lazy-singleton pattern as `_db`/`get_db` above, for the manual-article
+# submission tool's Qdrant access (point 2 of the M3 follow-on brief). Tests
+# override `get_vector_store` via `app.dependency_overrides`, same as `get_db`.
+_qdrant_client: AsyncQdrantClient | None = None
+_vector_store: QdrantStore | None = None
+
+
+def get_vector_store() -> QdrantStore:
+    global _qdrant_client, _vector_store
+    if _vector_store is None:
+        _qdrant_client = AsyncQdrantClient(url=QDRANT_URL)
+        _vector_store = QdrantStore(_qdrant_client)
+    return _vector_store
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     yield
-    global _db
+    global _db, _qdrant_client, _vector_store
     if _db is not None:
         _db.close()
         _db = None
+    if _qdrant_client is not None:
+        await _qdrant_client.close()
+        _qdrant_client = None
+        _vector_store = None
 
 
 app = FastAPI(
@@ -216,6 +261,209 @@ def list_triggers(
     return {"count": len(rows), "limit": limit, "offset": offset, "triggers": rows}
 
 
+# --- BESS backtest simulator (shared/bess_simulator.py) --------------------
+#
+# Triggers and reads back BESS (Battery Energy Storage System) backtest
+# runs: a simple threshold-rule simulation of a battery's charge/discharge
+# and capacity-reservation decisions over *real* historical
+# `market_data_history` data, with estimated revenue by stream. This is a
+# **backtest over history**, not a live/forward dispatch service -- there is
+# no scheduled job here, only an on-demand trigger endpoint. Both revenue
+# streams the simulator computes are explicitly estimates, not a real
+# co-optimized dispatch (see shared/bess_simulator.py's module docstring for
+# every simplification).
+
+
+class BessBacktestRequest(BaseModel):
+    zone: str
+    start_time: datetime
+    end_time: datetime
+    # Optional BessConfig overrides -- unset fields fall back to
+    # shared.bess_simulator.BessConfig's own defaults (a generic 1 MW / 2
+    # MWh unit), not anything hardcoded here.
+    power_mw: float | None = None
+    capacity_mwh: float | None = None
+    round_trip_efficiency: float | None = None
+    soc_min_fraction: float | None = None
+    soc_max_fraction: float | None = None
+    starting_soc_fraction: float | None = None
+    arbitrage_lookback_periods: int | None = None
+    arbitrage_z_threshold: float | None = None
+    capacity_commit_mw: float | None = None
+
+
+def _build_bess_config(overrides: dict) -> BessConfig:
+    """Builds a BessConfig from a dict of possibly-None overrides, keeping BessConfig's own defaults
+    for any field left unset (None)."""
+    kwargs = {k: v for k, v in overrides.items() if v is not None}
+    return BessConfig(**kwargs)
+
+
+def _run_and_save_bess_backtest(
+    db: DatabaseManager, zone: str, start_time: datetime, end_time: datetime, config: BessConfig
+) -> dict:
+    """Runs one backtest and persists it (init-db/04-bess-simulations.sql),
+    returning the run summary dict `save_bess_run`'s caller needs for both
+    the JSON API and the dashboard form."""
+    result = run_backtest(db, zone, start_time, end_time, config)
+    run_id = db.save_bess_run(result)
+    return {
+        "run_id": run_id,
+        "zone": result.zone,
+        "start_time": result.start_time,
+        "end_time": result.end_time,
+        "tick_count": len(result.ticks),
+        "total_arbitrage_revenue_dkk": result.total_arbitrage_revenue_dkk,
+        "total_capacity_revenue_dkk": result.total_capacity_revenue_dkk,
+        "total_revenue_dkk": result.total_revenue_dkk,
+        "full_cycle_equivalents": result.full_cycle_equivalents,
+    }
+
+
+@app.post("/bess/backtest", dependencies=[Depends(require_api_key)])
+def trigger_bess_backtest(req: BessBacktestRequest, db: DatabaseManager = Depends(get_db)):
+    """
+    Runs a BESS backtest over `[start_time, end_time]` for `zone` against
+    real historical `market_data_history` data and persists the result
+    (init-db/04-bess-simulations.sql). Synchronous: a backtest over a
+    bounded historical window is a bounded amount of work, unlike the
+    crawler's fire-and-forget cycle, so the caller gets the run's summary
+    directly rather than having to poll for it.
+    """
+    overrides = req.model_dump(exclude={"zone", "start_time", "end_time"})
+    try:
+        config = _build_bess_config(overrides)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    return _run_and_save_bess_backtest(db, req.zone, req.start_time, req.end_time, config)
+
+
+@app.get("/bess/runs", dependencies=[Depends(require_api_key)])
+def list_bess_runs(
+    zone: str | None = None,
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: DatabaseManager = Depends(get_db),
+):
+    """Persisted BESS backtest run headers, most-recently-created-first."""
+    rows = db.fetch_bess_runs(zone=zone, limit=limit, offset=offset)
+    return {"count": len(rows), "limit": limit, "offset": offset, "runs": rows}
+
+
+@app.get("/bess/runs/{run_id}", dependencies=[Depends(require_api_key)])
+def get_bess_run(run_id: int, include_ticks: bool = False, db: DatabaseManager = Depends(get_db)):
+    """One BESS backtest run's header, optionally with every tick (`?include_ticks=true`); 404 if
+    unknown."""
+    row = db.fetch_bess_run(run_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"BESS run {run_id} not found")
+    if include_ticks:
+        row = {**row, "ticks": db.fetch_bess_ticks(run_id)}
+    return row
+
+
+# --- manual article submission (LinkedIn paste-in tool) -------------------
+#
+# A new entry point into the *existing* crawler pipeline
+# (shared/claim_extractor.py + shared/vector_store.py), for content that
+# can't be polled via RSS (README §6 two-tier trust model: LinkedIn has no
+# public API for an arbitrary profile's posts, and scraping it violates
+# their ToS -- both correctly ruled out). Instead, a human pastes in a
+# post's URL/author/text when they see something worth capturing, and it
+# runs through the exact same Claude Haiku extraction + Qdrant storage as
+# every RSS article, just skipping the HTML-fetch/trafilatura step (the
+# text is already plain, already copied -- see shared/article_extractor.py,
+# which only applies to the RSS pipeline's web-fetching).
+#
+# Always Tier 2 (`ArticleRef.feed_tier="tier2"`): an individual's LinkedIn
+# commentary is never citable as bare fact regardless of what Claude
+# classifies it as -- this reuses shared/claim_extractor.py's existing
+# fact->theory downgrade rather than building a new mechanism.
+
+
+class ManualArticleSubmission(BaseModel):
+    url: str
+    author: str | None = None
+    title: str | None = None
+    text: str
+
+
+async def _process_manual_article(submission: ManualArticleSubmission, store: QdrantStore) -> dict:
+    """
+    Runs one manually-submitted post through the crawler's claim-extraction
+    + storage pipeline, dedup'd by URL (same `is_processed` convention as
+    services/crawler/main.py's `process_article`). Unlike the crawler's
+    fire-and-forget background cycle, this returns the outcome directly --
+    a human is actively submitting and wants to see what was captured.
+    """
+    await store.ensure_collection()
+
+    article = ArticleRef(
+        url=submission.url,
+        title=submission.title or "",
+        author=submission.author,
+        published=None,
+        feed_name=MANUAL_SUBMISSION_SOURCE,
+        feed_tier="tier2",
+    )
+
+    if await store.is_processed(article.url):
+        logger.info("Manual article %s already processed; skipping re-extraction", article.url)
+        return {
+            "url": article.url,
+            "title": article.title,
+            "author": article.author,
+            "feed_tier": article.feed_tier,
+            "already_processed": True,
+            "stored_raw": False,
+            "summary": None,
+            "claims": [],
+        }
+
+    extraction = await extract_claims(submission.text, article)
+    if extraction is None:
+        # No ANTHROPIC_API_KEY (or the call/parse failed outright): store the
+        # raw pasted text without derived claims -- same fallback precedent
+        # as services/crawler/main.py's process_article.
+        await store.upsert_raw_article(article, submission.text)
+        return {
+            "url": article.url,
+            "title": article.title,
+            "author": article.author,
+            "feed_tier": article.feed_tier,
+            "already_processed": False,
+            "stored_raw": True,
+            "summary": None,
+            "claims": [],
+        }
+
+    await store.upsert_claims(article, extraction.claims)
+    return {
+        "url": article.url,
+        "title": article.title,
+        "author": article.author,
+        "feed_tier": article.feed_tier,
+        "already_processed": False,
+        "stored_raw": False,
+        "summary": extraction.summary,
+        "claims": [{"claim": c.claim, "claim_type": c.claim_type} for c in extraction.claims],
+    }
+
+
+@app.post("/manual-articles", dependencies=[Depends(require_api_key)])
+async def submit_manual_article(
+    submission: ManualArticleSubmission, store: QdrantStore = Depends(get_vector_store)
+):
+    """
+    Paste-in entry point for LinkedIn (or any other non-RSS-able) posts.
+    `url` is the dedup key -- resubmitting the same post URL is a no-op
+    rather than a duplicate (see `_process_manual_article`). Gated behind
+    `API_KEY` like every other mutating/protected route: submitting data is
+    at least as sensitive as the read-only JSON routes above.
+    """
+    return await _process_manual_article(submission, store)
+
+
 # --- dashboard (server-rendered Jinja2 HTML, no JS build toolchain) ------
 
 
@@ -267,3 +515,114 @@ def dashboard_series_detail(
         "series_detail.html",
         {"market": market, "zone": zone, "product": product, "rows": rows},
     )
+
+
+@app.get("/dashboard/manual-articles", response_class=HTMLResponse)
+def dashboard_manual_article_form(request: Request):
+    """The LinkedIn paste-in form -- URL, author, title, and post text,
+    posting to the handler below. Stays open regardless of `API_KEY` (same
+    "dashboard HTML is for humans clicking around a browser" exception as
+    every other dashboard route, see module docstring); the underlying JSON
+    `/manual-articles` route this shares logic with is what's gated."""
+    return templates.TemplateResponse(request, "manual_article_form.html", {"result": None})
+
+
+@app.post("/dashboard/manual-articles", response_class=HTMLResponse)
+async def dashboard_submit_manual_article(
+    request: Request,
+    url: str = Form(...),
+    author: str = Form(""),
+    title: str = Form(""),
+    text: str = Form(...),
+    store: QdrantStore = Depends(get_vector_store),
+):
+    """Runs the pasted-in form through the same `_process_manual_article`
+    logic the JSON API uses, then re-renders the form with the extracted
+    claims shown as confirmation (README brief point 4/5: a human is
+    actively submitting and wants to see the result immediately)."""
+    submission = ManualArticleSubmission(
+        url=url, author=author or None, title=title or None, text=text
+    )
+    result = await _process_manual_article(submission, store)
+    return templates.TemplateResponse(request, "manual_article_form.html", {"result": result})
+
+
+@app.get("/dashboard/manual-articles/recent", response_class=HTMLResponse)
+async def dashboard_recent_manual_claims(
+    request: Request, store: QdrantStore = Depends(get_vector_store)
+):
+    """Minimal browsing surface over manually-submitted claims in Qdrant --
+    the dashboard otherwise has no way to browse anything the crawler
+    pipeline has stored (Phase 5's dashboard only ever covered
+    `market_data`/`event_reports`, never the vector store)."""
+    claims = await store.scroll_by_source(MANUAL_SUBMISSION_SOURCE, limit=100)
+    return templates.TemplateResponse(request, "manual_articles_recent.html", {"claims": claims})
+
+
+# --- BESS backtest dashboard ------------------------------------------------
+
+
+@app.get("/dashboard/bess", response_class=HTMLResponse)
+def dashboard_bess_list(request: Request, db: DatabaseManager = Depends(get_db)):
+    """Lists recent BESS backtest runs, linking to each one's detail page."""
+    runs = db.fetch_bess_runs(limit=25)
+    return templates.TemplateResponse(request, "bess_list.html", {"runs": runs})
+
+
+@app.get("/dashboard/bess/new", response_class=HTMLResponse)
+def dashboard_bess_new_form(request: Request):
+    """Form to trigger a new backtest run over a given zone/time window, with the battery's
+    defaults pre-filled (shared.bess_simulator.BessConfig)."""
+    return templates.TemplateResponse(
+        request, "bess_new.html", {"error": None, "defaults": BessConfig()}
+    )
+
+
+@app.post("/dashboard/bess/new", response_class=HTMLResponse)
+def dashboard_bess_trigger(
+    request: Request,
+    zone: str = Form(...),
+    start_time: datetime = Form(...),
+    end_time: datetime = Form(...),
+    power_mw: float = Form(...),
+    capacity_mwh: float = Form(...),
+    round_trip_efficiency: float = Form(...),
+    soc_min_fraction: float = Form(...),
+    soc_max_fraction: float = Form(...),
+    starting_soc_fraction: float = Form(...),
+    arbitrage_lookback_periods: int = Form(...),
+    arbitrage_z_threshold: float = Form(...),
+    capacity_commit_mw: float = Form(...),
+    db: DatabaseManager = Depends(get_db),
+):
+    """Runs the submitted form through the same trigger logic the JSON API uses, then redirects to
+    the new run's detail page."""
+    try:
+        config = BessConfig(
+            power_mw=power_mw,
+            capacity_mwh=capacity_mwh,
+            round_trip_efficiency=round_trip_efficiency,
+            soc_min_fraction=soc_min_fraction,
+            soc_max_fraction=soc_max_fraction,
+            starting_soc_fraction=starting_soc_fraction,
+            arbitrage_lookback_periods=arbitrage_lookback_periods,
+            arbitrage_z_threshold=arbitrage_z_threshold,
+            capacity_commit_mw=capacity_commit_mw,
+        )
+        summary = _run_and_save_bess_backtest(db, zone, start_time, end_time, config)
+    except ValueError as e:
+        return templates.TemplateResponse(
+            request, "bess_new.html", {"error": str(e), "defaults": BessConfig()}
+        )
+    return RedirectResponse(f"/dashboard/bess/{summary['run_id']}", status_code=303)
+
+
+@app.get("/dashboard/bess/{run_id}", response_class=HTMLResponse)
+def dashboard_bess_detail(request: Request, run_id: int, db: DatabaseManager = Depends(get_db)):
+    """Full detail for one BESS backtest run: revenue-by-stream summary, full-cycle-equivalents, a
+    SoC-over-time chart, and the tick-level action table."""
+    run = db.fetch_bess_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"BESS run {run_id} not found")
+    ticks = db.fetch_bess_ticks(run_id)
+    return templates.TemplateResponse(request, "bess_detail.html", {"run": run, "ticks": ticks})

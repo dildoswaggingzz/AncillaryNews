@@ -193,6 +193,33 @@ class QdrantStore:
         )
         return [point.payload for point in response.points]
 
+    async def scroll_by_source(self, source: str, limit: int = 100) -> list[dict]:
+        """
+        Returns up to `limit` points whose payload `source` field exactly
+        matches `source`, most-recently-retrieved first.
+
+        Used by the dashboard's "recent manually-submitted claims" view
+        (services/api/main.py) -- the only browsing surface over Qdrant
+        content the dashboard has at all, since `search_claims` requires a
+        semantic query rather than a plain listing. Manual submissions
+        (services/api/main.py's `/manual-articles`) always store
+        `feed_name="LinkedIn"`, which becomes this `source` value, making a
+        simple exact-match filter sufficient without needing a dedicated
+        "is manual" flag on the payload.
+        """
+        points, _ = await self._client.scroll(
+            collection_name=COLLECTION_NAME,
+            scroll_filter=models.Filter(
+                must=[models.FieldCondition(key="source", match=models.MatchValue(value=source))]
+            ),
+            limit=limit,
+            with_payload=True,
+            with_vectors=False,
+        )
+        payloads = [point.payload for point in points]
+        payloads.sort(key=lambda p: p.get("retrieved_at", ""), reverse=True)
+        return payloads
+
     async def upsert_raw_article(self, article: ArticleRef, article_text: str) -> None:
         """
         Stores the raw article text as a single point with `claim_type="raw"`
