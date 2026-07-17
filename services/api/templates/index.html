@@ -1,6 +1,35 @@
 {% extends "base.html" %}
 {% block title %}Event Reports — AncillaryNews{% endblock %}
 {% block content %}
+
+<div class="card">
+  <h3>On-demand runs</h3>
+  <p class="muted">
+    The orchestrator's synthesis cycle and the crawler's crawl cycle both default to
+    <code>AUTO_RUN_ENABLED=false</code> (no automatic Claude API calls on a schedule) --
+    see <code>DEPLOYMENT.md</code>. Use these buttons to fire one real cycle right now,
+    regardless of that setting. Each costs real Anthropic credit (Opus for the
+    orchestrator, per trigger fired; Haiku for the crawler, per new article found).
+  </p>
+  <form method="post" action="/dashboard/orchestrator/run-now" style="display:inline;">
+    <button type="submit">Run orchestrator now</button>
+  </form>
+  <form method="post" action="/dashboard/crawler/run-now" style="display:inline;">
+    <button type="submit">Run crawler now</button>
+  </form>
+
+  {% if orchestrator_result is not none %}
+  <p><strong>Orchestrator run result:</strong>
+    {{ orchestrator_result.triggers_fired }} trigger(s) fired,
+    {{ orchestrator_result.reports_published }} Event Report(s) published.</p>
+  {% endif %}
+  {% if crawler_result is not none %}
+  <p><strong>Crawler run result:</strong>
+    {{ crawler_result.articles_processed }} article(s) processed,
+    {{ crawler_result.claims_extracted }} claim(s) extracted.</p>
+  {% endif %}
+</div>
+
 <h1>Recent Event Reports</h1>
 <p class="muted">Most recently published first.</p>
 

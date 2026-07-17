@@ -64,6 +64,11 @@ services:
     environment:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - METRICS_PORT=9101
+      # Opt-in gate on the scheduler's automatic 30-minute crawl cycle (each
+      # cycle costs one Claude Haiku call per new article found) -- defaults
+      # to off. `POST /crawler/run-now` on the api service always works
+      # regardless. See .env.example / DEPLOYMENT.md.
+      - AUTO_RUN_ENABLED=${AUTO_RUN_ENABLED:-false}
     ports:
       - "9101:9101"
     volumes:
@@ -85,6 +90,11 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
       - METRICS_PORT=9102
+      # Opt-in gate on the scheduler's automatic 15-minute trigger-evaluation
+      # + synthesis cycle (each fired trigger costs one Claude Opus call) --
+      # defaults to off. `POST /orchestrator/run-now` on the api service
+      # always works regardless. See .env.example / DEPLOYMENT.md.
+      - AUTO_RUN_ENABLED=${AUTO_RUN_ENABLED:-false}
     ports:
       - "9102:9102"
     volumes:
@@ -107,9 +117,17 @@ services:
       # Manual-article submission tool (services/api/main.py's
       # /manual-articles / /dashboard/manual-articles): reuses the same
       # crawler pipeline shared/claim_extractor.py + shared/vector_store.py
-      # already talk to.
+      # already talk to. Also used by the on-demand /crawler/run-now and
+      # /orchestrator/run-now routes below, which load and run
+      # services/crawler/main.py's/services/orchestrator/main.py's exact
+      # cycle functions in-process against these same env vars.
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - QDRANT_URL=http://vector-db:6333
+      # Needed only for the on-demand /orchestrator/run-now route (a
+      # published Event Report posts to Slack exactly like the scheduled
+      # cycle does) -- same graceful-skip-if-unset behavior as everywhere
+      # else this is read (shared/slack_notifier.py).
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
     ports:
       - "8080:8000"
     volumes:

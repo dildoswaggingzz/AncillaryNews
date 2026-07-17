@@ -49,10 +49,11 @@ async def test_process_article_stores_raw_text_when_no_api_key(store):
         patch.object(crawler_main, "extract_markdown", return_value="clean article text"),
         patch.object(crawler_main, "extract_claims", new=AsyncMock(return_value=None)),
     ):
-        await crawler_main.process_article(ARTICLE, http_client=MagicMock(), store=store)
+        result = await crawler_main.process_article(ARTICLE, http_client=MagicMock(), store=store)
 
     store.upsert_raw_article.assert_awaited_once_with(ARTICLE, "clean article text")
     store.upsert_claims.assert_not_awaited()
+    assert result == 0
 
 
 async def test_process_article_stores_claims_when_extraction_succeeds(store):
@@ -67,10 +68,11 @@ async def test_process_article_stores_claims_when_extraction_succeeds(store):
         patch.object(crawler_main, "extract_markdown", return_value="clean article text"),
         patch.object(crawler_main, "extract_claims", new=AsyncMock(return_value=extraction)),
     ):
-        await crawler_main.process_article(ARTICLE, http_client=MagicMock(), store=store)
+        result = await crawler_main.process_article(ARTICLE, http_client=MagicMock(), store=store)
 
     store.upsert_claims.assert_awaited_once_with(ARTICLE, extraction.claims)
     store.upsert_raw_article.assert_not_awaited()
+    assert result == 1
 
 
 async def test_process_article_skips_when_html_fetch_fails(store):
@@ -147,6 +149,69 @@ async def test_run_crawl_cycle_continues_after_one_article_fails():
 
     assert mock_process.await_count == 2
     mock_qdrant_instance.close.assert_awaited_once()
+
+
+# --- AUTO_RUN_ENABLED (cost-control gate) -------------------------------------
+
+
+async def test_scheduled_crawl_cycle_no_ops_when_auto_run_disabled(monkeypatch):
+    monkeypatch.delenv("AUTO_RUN_ENABLED", raising=False)
+
+    with patch.object(crawler_main, "run_crawl_cycle", new=AsyncMock()) as mock_run:
+        await crawler_main.scheduled_crawl_cycle()
+
+    mock_run.assert_not_awaited()
+
+
+async def test_scheduled_crawl_cycle_no_ops_when_auto_run_explicitly_false(monkeypatch):
+    monkeypatch.setenv("AUTO_RUN_ENABLED", "false")
+
+    with patch.object(crawler_main, "run_crawl_cycle", new=AsyncMock()) as mock_run:
+        await crawler_main.scheduled_crawl_cycle()
+
+    mock_run.assert_not_awaited()
+
+
+async def test_scheduled_crawl_cycle_runs_when_auto_run_enabled(monkeypatch):
+    monkeypatch.setenv("AUTO_RUN_ENABLED", "true")
+
+    with patch.object(crawler_main, "run_crawl_cycle", new=AsyncMock()) as mock_run:
+        await crawler_main.scheduled_crawl_cycle()
+
+    mock_run.assert_awaited_once()
+
+
+def test_auto_run_enabled_is_case_insensitive(monkeypatch):
+    monkeypatch.setenv("AUTO_RUN_ENABLED", "TRUE")
+    assert crawler_main._auto_run_enabled() is True
+
+    monkeypatch.setenv("AUTO_RUN_ENABLED", "False")
+    assert crawler_main._auto_run_enabled() is False
+
+
+# --- run_crawl_cycle return summary ------------------------------------------
+
+
+async def test_run_crawl_cycle_returns_articles_processed_and_claims_extracted_summary():
+    with (
+        patch.object(crawler_main, "AsyncQdrantClient") as mock_qdrant_cls,
+        patch.object(crawler_main, "QdrantStore") as mock_store_cls,
+        patch.object(
+            crawler_main, "fetch_feed_entries", new=AsyncMock(return_value=[ARTICLE, ARTICLE])
+        ),
+        patch.object(crawler_main, "process_article", new=AsyncMock(side_effect=[3, 0])),
+    ):
+        mock_qdrant_instance = MagicMock()
+        mock_qdrant_instance.close = AsyncMock()
+        mock_qdrant_cls.return_value = mock_qdrant_instance
+
+        mock_store_instance = MagicMock()
+        mock_store_instance.ensure_collection = AsyncMock()
+        mock_store_cls.return_value = mock_store_instance
+
+        result = await crawler_main.run_crawl_cycle()
+
+    assert result == {"articles_processed": 2, "claims_extracted": 3}
 
 
 # --- metrics (Phase 6 production readiness) ---------------------------------

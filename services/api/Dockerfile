@@ -28,6 +28,19 @@ ENV PYTHONPATH=/app
 COPY shared ./shared
 COPY services/api ./services/api
 
+# On-demand `POST /orchestrator/run-now` / `POST /crawler/run-now`
+# (services/api/main.py) load these two files directly (by path, via
+# importlib -- this repo has no `__init__.py`/package-mode, see
+# pyproject.toml) to call their exact `run_synthesis_cycle`/`run_crawl_cycle`
+# functions in-process, rather than duplicating that pipeline logic here or
+# introducing a message queue/RPC layer this repo otherwise has none of. Only
+# the two `main.py` files are needed (not their Dockerfiles/other service
+# files) -- everything they import (shared/*, apscheduler, prometheus_client,
+# etc.) is already installed above from the same shared pyproject.toml/poetry.lock
+# every service's image is built from.
+COPY services/orchestrator/main.py ./services/orchestrator/main.py
+COPY services/crawler/main.py ./services/crawler/main.py
+
 # Create a non-root user for security
 RUN useradd -m agentuser && chown -R agentuser:agentuser /opt/venv /app
 USER agentuser

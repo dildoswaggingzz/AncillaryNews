@@ -104,9 +104,10 @@ async def test_process_trigger_no_op_when_synthesis_returns_none(db, store):
     with patch.object(
         orchestrator_main, "synthesize_event_report", new=AsyncMock(return_value=None)
     ):
-        await orchestrator_main.process_trigger(PRICE_SPIKE_TRIGGER, db, store)
+        result = await orchestrator_main.process_trigger(PRICE_SPIKE_TRIGGER, db, store)
 
     db.save_event_report.assert_not_called()
+    assert result is False
 
 
 async def test_process_trigger_persists_and_posts_to_slack_on_success(db, store):
@@ -119,8 +120,9 @@ async def test_process_trigger_persists_and_posts_to_slack_on_success(db, store)
             orchestrator_main, "send_event_report_alert", new=AsyncMock(return_value=True)
         ) as mock_slack,
     ):
-        await orchestrator_main.process_trigger(PRICE_SPIKE_TRIGGER, db, store)
+        result = await orchestrator_main.process_trigger(PRICE_SPIKE_TRIGGER, db, store)
 
+    assert result is True
     db.save_event_report.assert_called_once()
     _, kwargs = db.save_event_report.call_args
     assert kwargs["is_correction"] is False
@@ -356,6 +358,100 @@ async def test_run_synthesis_cycle_continues_after_one_trigger_synthesis_fails()
     assert mock_process.await_count == 2
     mock_qdrant_instance.close.assert_awaited_once()
     mock_db_instance.close.assert_called_once()
+
+
+# --- AUTO_RUN_ENABLED (cost-control gate) -------------------------------------
+
+
+async def test_scheduled_synthesis_cycle_no_ops_when_auto_run_disabled(monkeypatch):
+    monkeypatch.delenv("AUTO_RUN_ENABLED", raising=False)
+
+    with patch.object(orchestrator_main, "run_synthesis_cycle", new=AsyncMock()) as mock_run:
+        await orchestrator_main.scheduled_synthesis_cycle()
+
+    mock_run.assert_not_awaited()
+
+
+async def test_scheduled_synthesis_cycle_no_ops_when_auto_run_explicitly_false(monkeypatch):
+    monkeypatch.setenv("AUTO_RUN_ENABLED", "false")
+
+    with patch.object(orchestrator_main, "run_synthesis_cycle", new=AsyncMock()) as mock_run:
+        await orchestrator_main.scheduled_synthesis_cycle()
+
+    mock_run.assert_not_awaited()
+
+
+async def test_scheduled_synthesis_cycle_runs_when_auto_run_enabled(monkeypatch):
+    monkeypatch.setenv("AUTO_RUN_ENABLED", "true")
+
+    with patch.object(orchestrator_main, "run_synthesis_cycle", new=AsyncMock()) as mock_run:
+        await orchestrator_main.scheduled_synthesis_cycle()
+
+    mock_run.assert_awaited_once()
+
+
+def test_auto_run_enabled_is_case_insensitive(monkeypatch):
+    monkeypatch.setenv("AUTO_RUN_ENABLED", "TRUE")
+    assert orchestrator_main._auto_run_enabled() is True
+
+    monkeypatch.setenv("AUTO_RUN_ENABLED", "False")
+    assert orchestrator_main._auto_run_enabled() is False
+
+
+# --- run_synthesis_cycle return summary --------------------------------------
+
+
+async def test_run_synthesis_cycle_returns_triggers_fired_and_reports_published_summary():
+    with (
+        patch.object(orchestrator_main, "DatabaseManager") as mock_db_cls,
+        patch.object(orchestrator_main, "AsyncQdrantClient") as mock_qdrant_cls,
+        patch.object(orchestrator_main, "QdrantStore") as mock_store_cls,
+        patch.object(
+            orchestrator_main,
+            "run_rule_engine",
+            new=AsyncMock(return_value=[PRICE_SPIKE_TRIGGER, REVISION_TRIGGER]),
+        ),
+        patch.object(
+            orchestrator_main, "process_trigger", new=AsyncMock(side_effect=[True, False])
+        ),
+    ):
+        mock_db_cls.return_value = MagicMock()
+
+        mock_qdrant_instance = MagicMock()
+        mock_qdrant_instance.close = AsyncMock()
+        mock_qdrant_cls.return_value = mock_qdrant_instance
+
+        mock_store_instance = MagicMock()
+        mock_store_instance.ensure_collection = AsyncMock()
+        mock_store_cls.return_value = mock_store_instance
+
+        result = await orchestrator_main.run_synthesis_cycle()
+
+    assert result == {"triggers_fired": 2, "reports_published": 1}
+
+
+async def test_run_synthesis_cycle_returns_zero_summary_on_rule_engine_failure():
+    with (
+        patch.object(orchestrator_main, "DatabaseManager") as mock_db_cls,
+        patch.object(orchestrator_main, "AsyncQdrantClient") as mock_qdrant_cls,
+        patch.object(orchestrator_main, "QdrantStore") as mock_store_cls,
+        patch.object(
+            orchestrator_main, "run_rule_engine", new=AsyncMock(side_effect=RuntimeError("boom"))
+        ),
+    ):
+        mock_db_cls.return_value = MagicMock()
+
+        mock_qdrant_instance = MagicMock()
+        mock_qdrant_instance.close = AsyncMock()
+        mock_qdrant_cls.return_value = mock_qdrant_instance
+
+        mock_store_instance = MagicMock()
+        mock_store_instance.ensure_collection = AsyncMock()
+        mock_store_cls.return_value = mock_store_instance
+
+        result = await orchestrator_main.run_synthesis_cycle()
+
+    assert result == {"triggers_fired": 0, "reports_published": 0}
 
 
 # --- metrics (Phase 6 production readiness) ---------------------------------

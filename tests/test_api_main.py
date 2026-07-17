@@ -904,6 +904,162 @@ def test_dashboard_recent_manual_claims_empty_state(client, vector_store):
     assert "No manually-submitted posts yet." in resp.text
 
 
+# --- on-demand orchestrator/crawler triggers (cost-control escape hatch) --
+
+
+@pytest.fixture
+def orchestrator_main_mock():
+    module = MagicMock()
+    module.run_synthesis_cycle = AsyncMock(
+        return_value={"triggers_fired": 3, "reports_published": 1}
+    )
+    return module
+
+
+@pytest.fixture
+def crawler_main_mock():
+    module = MagicMock()
+    module.run_crawl_cycle = AsyncMock(
+        return_value={"articles_processed": 5, "claims_extracted": 12}
+    )
+    return module
+
+
+def test_trigger_orchestrator_run_now_calls_real_cycle_function(
+    client, monkeypatch, orchestrator_main_mock
+):
+    monkeypatch.delenv("API_KEY", raising=False)
+    api_main.app.dependency_overrides[api_main.get_orchestrator_main] = (
+        lambda: orchestrator_main_mock
+    )
+    try:
+        resp = client.post("/orchestrator/run-now")
+    finally:
+        del api_main.app.dependency_overrides[api_main.get_orchestrator_main]
+
+    assert resp.status_code == 200
+    assert resp.json() == {"triggers_fired": 3, "reports_published": 1}
+    orchestrator_main_mock.run_synthesis_cycle.assert_awaited_once()
+
+
+def test_trigger_orchestrator_run_now_gated_by_api_key(client, monkeypatch, orchestrator_main_mock):
+    monkeypatch.setenv("API_KEY", "s3cret")
+    api_main.app.dependency_overrides[api_main.get_orchestrator_main] = (
+        lambda: orchestrator_main_mock
+    )
+    try:
+        resp = client.post("/orchestrator/run-now")
+    finally:
+        del api_main.app.dependency_overrides[api_main.get_orchestrator_main]
+
+    assert resp.status_code == 401
+    orchestrator_main_mock.run_synthesis_cycle.assert_not_awaited()
+
+
+def test_trigger_orchestrator_run_now_accepts_correct_api_key(
+    client, monkeypatch, orchestrator_main_mock
+):
+    monkeypatch.setenv("API_KEY", "s3cret")
+    api_main.app.dependency_overrides[api_main.get_orchestrator_main] = (
+        lambda: orchestrator_main_mock
+    )
+    try:
+        resp = client.post("/orchestrator/run-now", headers={"X-API-Key": "s3cret"})
+    finally:
+        del api_main.app.dependency_overrides[api_main.get_orchestrator_main]
+
+    assert resp.status_code == 200
+    orchestrator_main_mock.run_synthesis_cycle.assert_awaited_once()
+
+
+def test_trigger_crawler_run_now_calls_real_cycle_function(client, monkeypatch, crawler_main_mock):
+    monkeypatch.delenv("API_KEY", raising=False)
+    api_main.app.dependency_overrides[api_main.get_crawler_main] = lambda: crawler_main_mock
+    try:
+        resp = client.post("/crawler/run-now")
+    finally:
+        del api_main.app.dependency_overrides[api_main.get_crawler_main]
+
+    assert resp.status_code == 200
+    assert resp.json() == {"articles_processed": 5, "claims_extracted": 12}
+    crawler_main_mock.run_crawl_cycle.assert_awaited_once()
+
+
+def test_trigger_crawler_run_now_gated_by_api_key(client, monkeypatch, crawler_main_mock):
+    monkeypatch.setenv("API_KEY", "s3cret")
+    api_main.app.dependency_overrides[api_main.get_crawler_main] = lambda: crawler_main_mock
+    try:
+        resp = client.post("/crawler/run-now")
+    finally:
+        del api_main.app.dependency_overrides[api_main.get_crawler_main]
+
+    assert resp.status_code == 401
+    crawler_main_mock.run_crawl_cycle.assert_not_awaited()
+
+
+def test_dashboard_trigger_orchestrator_run_now_renders_summary(
+    client, db, monkeypatch, orchestrator_main_mock
+):
+    monkeypatch.delenv("API_KEY", raising=False)
+    db.fetch_event_reports.return_value = []
+    api_main.app.dependency_overrides[api_main.get_orchestrator_main] = (
+        lambda: orchestrator_main_mock
+    )
+    try:
+        resp = client.post("/dashboard/orchestrator/run-now")
+    finally:
+        del api_main.app.dependency_overrides[api_main.get_orchestrator_main]
+
+    assert resp.status_code == 200
+    assert "3 trigger(s) fired" in resp.text
+    assert "1 Event Report(s) published" in resp.text
+    orchestrator_main_mock.run_synthesis_cycle.assert_awaited_once()
+
+
+def test_dashboard_trigger_orchestrator_run_now_stays_open_regardless_of_api_key(
+    client, db, monkeypatch, orchestrator_main_mock
+):
+    monkeypatch.setenv("API_KEY", "s3cret")
+    db.fetch_event_reports.return_value = []
+    api_main.app.dependency_overrides[api_main.get_orchestrator_main] = (
+        lambda: orchestrator_main_mock
+    )
+    try:
+        resp = client.post("/dashboard/orchestrator/run-now")
+    finally:
+        del api_main.app.dependency_overrides[api_main.get_orchestrator_main]
+
+    assert resp.status_code == 200
+    orchestrator_main_mock.run_synthesis_cycle.assert_awaited_once()
+
+
+def test_dashboard_trigger_crawler_run_now_renders_summary(
+    client, db, monkeypatch, crawler_main_mock
+):
+    monkeypatch.delenv("API_KEY", raising=False)
+    db.fetch_event_reports.return_value = []
+    api_main.app.dependency_overrides[api_main.get_crawler_main] = lambda: crawler_main_mock
+    try:
+        resp = client.post("/dashboard/crawler/run-now")
+    finally:
+        del api_main.app.dependency_overrides[api_main.get_crawler_main]
+
+    assert resp.status_code == 200
+    assert "5 article(s) processed" in resp.text
+    assert "12 claim(s) extracted" in resp.text
+    crawler_main_mock.run_crawl_cycle.assert_awaited_once()
+
+
+def test_dashboard_home_run_now_buttons_present(client, db):
+    db.fetch_event_reports.return_value = []
+
+    resp = client.get("/")
+
+    assert resp.status_code == 200
+    assert "/dashboard/orchestrator/run-now" in resp.text
+    assert "/dashboard/crawler/run-now" in resp.text
+
+
 # --- dashboard pages -------------------------------------------------------
 
 

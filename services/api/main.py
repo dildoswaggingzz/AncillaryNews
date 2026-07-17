@@ -27,12 +27,14 @@ rationale. `/health` and `/metrics` are always unauthenticated (needed for
 healthchecks/Prometheus scraping).
 """
 
+import importlib.util
 import logging
 import os
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, Form, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
@@ -117,6 +119,54 @@ def get_vector_store() -> QdrantStore:
         _qdrant_client = AsyncQdrantClient(url=QDRANT_URL)
         _vector_store = QdrantStore(_qdrant_client)
     return _vector_store
+
+
+# Lazy singletons over the *real* services/orchestrator/main.py and
+# services/crawler/main.py modules, loaded by file path via `importlib`
+# (this repo has no `__init__.py`/package-mode -- see pyproject.toml's
+# `package-mode = false` -- so a normal `import services.orchestrator.main`
+# isn't available; this mirrors the exact convention
+# tests/test_orchestrator_main.py and tests/test_crawler_main.py already use
+# to import those files). Backing the on-demand `POST /orchestrator/run-now`
+# / `POST /crawler/run-now` routes below (see DEPLOYMENT.md's "Cost control:
+# AUTO_RUN_ENABLED" for the full rationale): this process has no message
+# queue/RPC layer to reach into the separate orchestrator/crawler containers,
+# so it loads their exact `run_synthesis_cycle`/`run_crawl_cycle` functions
+# in-process instead, against the same DATABASE_URL/QDRANT_URL/
+# ANTHROPIC_API_KEY/SLACK_WEBHOOK_URL those services use
+# (docker-compose.yml's `api` environment; services/api/Dockerfile now also
+# COPYs those two `main.py` files in for this). Loaded lazily (on first
+# on-demand trigger, not at import time) so this module stays importable
+# even without those two files present, and tests override these via
+# `app.dependency_overrides` (same pattern as `get_db`/`get_vector_store`)
+# rather than ever triggering the real load.
+_orchestrator_main = None
+_crawler_main = None
+
+
+def _load_sibling_service_module(service_dir: str, module_name: str):
+    """Loads `services/<service_dir>/main.py` by file path. `Path(__file__).parent.parent`
+    is `services/` (this file is `services/api/main.py`), matching both a local
+    checkout and the Docker image's `/app/services/` layout."""
+    path = Path(__file__).resolve().parent.parent / service_dir / "main.py"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def get_orchestrator_main():
+    global _orchestrator_main
+    if _orchestrator_main is None:
+        _orchestrator_main = _load_sibling_service_module("orchestrator", "orchestrator_main")
+    return _orchestrator_main
+
+
+def get_crawler_main():
+    global _crawler_main
+    if _crawler_main is None:
+        _crawler_main = _load_sibling_service_module("crawler", "crawler_main")
+    return _crawler_main
 
 
 @asynccontextmanager
@@ -491,14 +541,102 @@ async def submit_manual_article(
     return await _process_manual_article(submission, store)
 
 
+# --- on-demand orchestrator/crawler triggers (cost-control escape hatch) --
+#
+# services/orchestrator/main.py and services/crawler/main.py both default to
+# AUTO_RUN_ENABLED=false (their automatic scheduled cycles are opt-in, not
+# opt-out -- see DEPLOYMENT.md's "Cost control: AUTO_RUN_ENABLED"), since
+# every fired rule-engine trigger burns a Claude Opus call (orchestrator) and
+# every new article burns a Claude Haiku call (crawler). These two routes are
+# the always-available on-demand escape hatch, independent of
+# AUTO_RUN_ENABLED -- they call the exact same run_synthesis_cycle /
+# run_crawl_cycle functions the schedulers use (via get_orchestrator_main /
+# get_crawler_main above), never a duplicated copy of that pipeline logic.
+# Gated behind API_KEY like every other mutating route (/manual-articles,
+# /bess/backtest).
+
+
+@app.post("/orchestrator/run-now", dependencies=[Depends(require_api_key)])
+async def trigger_orchestrator_run_now(orchestrator_main=Depends(get_orchestrator_main)):
+    """
+    Fires one real orchestrator synthesis cycle right now: evaluates the
+    rule engine, then runs RAG + Claude Opus synthesis for every trigger
+    that fires. Costs one Opus call per trigger fired this cycle. Returns
+    `run_synthesis_cycle`'s own `{"triggers_fired": ..., "reports_published":
+    ...}` summary.
+    """
+    return await orchestrator_main.run_synthesis_cycle()
+
+
+@app.post("/crawler/run-now", dependencies=[Depends(require_api_key)])
+async def trigger_crawler_run_now(crawler_main=Depends(get_crawler_main)):
+    """
+    Fires one real crawler cycle right now: polls every RSS feed and runs
+    Claude Haiku claim extraction on every new article found. Costs one
+    Haiku call per new article this cycle. Returns `run_crawl_cycle`'s own
+    `{"articles_processed": ..., "claims_extracted": ...}` summary.
+    """
+    return await crawler_main.run_crawl_cycle()
+
+
 # --- dashboard (server-rendered Jinja2 HTML, no JS build toolchain) ------
 
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard_home(request: Request, db: DatabaseManager = Depends(get_db)):
-    """Recent Event Reports list -- the dashboard's landing page."""
+    """Recent Event Reports list -- the dashboard's landing page. Also hosts the
+    "Run orchestrator now" / "Run crawler now" on-demand buttons (see the two POST routes
+    below) -- `orchestrator_result`/`crawler_result` are `None` on a plain `GET`."""
     reports = db.fetch_event_reports(limit=25, offset=0)
-    return templates.TemplateResponse(request, "index.html", {"reports": reports})
+    return templates.TemplateResponse(
+        request,
+        "index.html",
+        {"reports": reports, "orchestrator_result": None, "crawler_result": None},
+    )
+
+
+@app.post("/dashboard/orchestrator/run-now", response_class=HTMLResponse)
+async def dashboard_trigger_orchestrator_run_now(
+    request: Request,
+    db: DatabaseManager = Depends(get_db),
+    orchestrator_main=Depends(get_orchestrator_main),
+):
+    """
+    Dashboard counterpart to `POST /orchestrator/run-now` above -- same
+    synchronous trigger-and-show-result flow as `/dashboard/bess/new`: runs
+    the real cycle, then re-renders the dashboard home with the run's
+    summary shown inline. Stays open regardless of `API_KEY` (same
+    "dashboard HTML is for humans clicking around a browser" exception as
+    every other dashboard route, see module docstring) -- the underlying
+    JSON `/orchestrator/run-now` route this shares logic with is what's
+    gated; see DEPLOYMENT.md if you want this button itself gated too (e.g.
+    a reverse-proxy auth layer), since a click here spends real Anthropic
+    credit.
+    """
+    result = await orchestrator_main.run_synthesis_cycle()
+    reports = db.fetch_event_reports(limit=25, offset=0)
+    return templates.TemplateResponse(
+        request,
+        "index.html",
+        {"reports": reports, "orchestrator_result": result, "crawler_result": None},
+    )
+
+
+@app.post("/dashboard/crawler/run-now", response_class=HTMLResponse)
+async def dashboard_trigger_crawler_run_now(
+    request: Request,
+    db: DatabaseManager = Depends(get_db),
+    crawler_main=Depends(get_crawler_main),
+):
+    """Dashboard counterpart to `POST /crawler/run-now` above -- see
+    `dashboard_trigger_orchestrator_run_now`'s docstring for the full rationale."""
+    result = await crawler_main.run_crawl_cycle()
+    reports = db.fetch_event_reports(limit=25, offset=0)
+    return templates.TemplateResponse(
+        request,
+        "index.html",
+        {"reports": reports, "orchestrator_result": None, "crawler_result": result},
+    )
 
 
 @app.get("/dashboard/event-reports/{event_id}", response_class=HTMLResponse)

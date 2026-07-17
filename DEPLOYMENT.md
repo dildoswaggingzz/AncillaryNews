@@ -20,15 +20,83 @@ gracefully if unset):
 | `ANTHROPIC_API_KEY` | crawler (`shared/claim_extractor.py`), orchestrator (`shared/event_synthesizer.py`) | Crawler stores raw article text without derived claims; orchestrator skips LLM synthesis (the raw trigger still reaches Slack via `shared/rule_engine.py`). Neither crashes. |
 | `SLACK_WEBHOOK_URL` | rule engine + orchestrator (`shared/slack_notifier.py`) | Logs a warning and skips the Slack post instead of crashing. |
 | `METRICS_PORT` | ingestor (default `9100`), crawler (`9101`), orchestrator (`9102`) | Falls back to the documented default; the API always serves `/metrics` on its main port (`8000`). |
+| `AUTO_RUN_ENABLED` | crawler, orchestrator | Falls back to `false` -- their *automatic* scheduled cycles don't fire (no Claude API calls happen on a schedule). See "Cost control: AUTO_RUN_ENABLED" below. |
+
+## Cost control: `AUTO_RUN_ENABLED`
+
+Two of this stack's four services call the Anthropic API on every scheduled
+cycle, and both cycles run unattended, indefinitely, by default:
+
+- **`orchestrator`** (`services/orchestrator/main.py`, 15-minute interval):
+  evaluates the rule engine (`shared/rule_engine.py`), then runs the full
+  RAG + **Claude Opus** synthesis pipeline (`shared/event_synthesizer.py`,
+  the most expensive model this repo calls) for *every* trigger that fires
+  that cycle. In observed live runs this fired 2-7 triggers per 15-minute
+  cycle -- i.e. up to 7 Opus calls every 15 minutes, unattended.
+- **`crawler`** (`services/crawler/main.py`, 30-minute interval): polls every
+  RSS feed (`shared/rss_feeds.py`) and runs **Claude Haiku** claim extraction
+  (`shared/claim_extractor.py`) on every new article found. Haiku is cheaper
+  per-call than Opus, but still scales with feed volume and cycle count.
+- **`ingestor`** (`services/ingestor/main.py`) makes **zero** LLM calls --
+  pure Energinet HTTP polling + Postgres writes -- and has no such gate; it's
+  the free, always-on data-collection layer and is meant to keep running
+  unconditionally regardless of `AUTO_RUN_ENABLED`.
+
+`AUTO_RUN_ENABLED` (`docker-compose.yml`, defaults to `false` if unset --
+see `.env.example`) makes `crawler`'s and `orchestrator`'s automatic
+scheduled cycles **opt-in, not opt-out**:
+
+- **Unset / `false` (the default)**: both services still start, still run
+  their APScheduler instance, and still stay healthy for their Docker
+  healthcheck and `/metrics` endpoint -- but the scheduled job
+  (`scheduled_crawl_cycle` / `scheduled_synthesis_cycle`) no-ops with a
+  clear `AUTO_RUN_ENABLED is unset/false; skipping...` log line each time it
+  would otherwise have fired, instead of calling `run_crawl_cycle` /
+  `run_synthesis_cycle` (and therefore Anthropic) at all.
+- **`true`**: both services behave exactly as before this gate existed --
+  fully automatic scheduled cycles, no manual intervention needed.
+
+Regardless of `AUTO_RUN_ENABLED`, you can always fire **one real cycle on
+demand**:
+
+- `POST /orchestrator/run-now` and `POST /crawler/run-now` on the `api`
+  service -- gated behind `API_KEY` like the other mutating JSON routes
+  (`/manual-articles`, `/bess/backtest`). Each returns a small JSON summary
+  of what that one cycle did (`{"triggers_fired": ..., "reports_published":
+  ...}` / `{"articles_processed": ..., "claims_extracted": ...}`).
+- The matching "Run orchestrator now" / "Run crawler now" buttons on the
+  dashboard homepage (`/`), which POST to the routes above and render the
+  same summary inline -- same synchronous trigger-and-show-result pattern as
+  `/dashboard/bess/new`. These dashboard buttons stay open regardless of
+  `API_KEY`, same exception as every other dashboard HTML route (see "Auth
+  posture" below) -- so put the dashboard behind a reverse proxy/VPN if you
+  don't want anyone who can reach it able to spend Anthropic credit on
+  demand.
+
+**Implementation note**: the `api` service has no message queue or RPC layer
+to reach into the separate `orchestrator`/`crawler` containers, so
+`services/api/main.py` loads `services/orchestrator/main.py` and
+`services/crawler/main.py` directly (by file path, via `importlib` -- this
+repo has no `__init__.py`/package-mode) and calls their exact
+`run_synthesis_cycle` / `run_crawl_cycle` functions in-process, against the
+same `DATABASE_URL`/`QDRANT_URL`/`ANTHROPIC_API_KEY`/`SLACK_WEBHOOK_URL` the
+real services use (`docker-compose.yml`'s `api` environment; its Dockerfile
+now also `COPY`s those two `main.py` files in for this reason). This is the
+pragmatic choice for this codebase's existing architecture (everything talks
+to Postgres/Qdrant directly, no RPC), not a general-purpose pattern -- it
+does mean an on-demand run happens synchronously inside the API request
+(fine for the cycle volumes this repo sees; would need to move to a
+background task/queue if cycles ever grew large enough to risk request
+timeouts).
 
 ## What each service needs to run
 
 | Service | Requires | Optional |
 |---|---|---|
 | `ingestor` | `DATABASE_URL` (set by compose from `DB_PASSWORD`), reachable `db` | `METRICS_PORT` |
-| `crawler` | reachable `vector-db` (Qdrant) | `ANTHROPIC_API_KEY`, `METRICS_PORT` |
-| `orchestrator` | `DATABASE_URL`, reachable `db` and `vector-db` | `ANTHROPIC_API_KEY`, `SLACK_WEBHOOK_URL`, `METRICS_PORT` |
-| `api` | `DATABASE_URL`, reachable `db` | `API_KEY` |
+| `crawler` | reachable `vector-db` (Qdrant) | `ANTHROPIC_API_KEY`, `METRICS_PORT`, `AUTO_RUN_ENABLED` |
+| `orchestrator` | `DATABASE_URL`, reachable `db` and `vector-db` | `ANTHROPIC_API_KEY`, `SLACK_WEBHOOK_URL`, `METRICS_PORT`, `AUTO_RUN_ENABLED` |
+| `api` | `DATABASE_URL`, reachable `db`; reachable `vector-db` and `ANTHROPIC_API_KEY` for `/manual-articles` and the on-demand `/crawler/run-now`/`/orchestrator/run-now` routes | `API_KEY`, `SLACK_WEBHOOK_URL` (for `/orchestrator/run-now`'s Slack post) |
 | `prometheus` | reachable `ingestor:9100`, `crawler:9101`, `orchestrator:9102`, `api:8000/metrics` | -- |
 | `grafana` | reachable `prometheus:9090` | `GRAFANA_ADMIN_PASSWORD` |
 

@@ -89,7 +89,7 @@ def _parse_trigger_time(trigger: Trigger) -> datetime | None:
         return None
 
 
-async def process_trigger(trigger: Trigger, db: DatabaseManager, store: QdrantStore) -> None:
+async def process_trigger(trigger: Trigger, db: DatabaseManager, store: QdrantStore) -> bool:
     """
     Runs the full context-fetch + RAG + LLM-synthesis + citation-validation
     + persist + Slack pipeline for one fired Trigger.
@@ -98,10 +98,15 @@ async def process_trigger(trigger: Trigger, db: DatabaseManager, store: QdrantSt
     reached Slack via `run_rule_engine` regardless of what happens in this
     pipeline, and one trigger's synthesis failing must never stop evaluation
     of the rest of the cycle's triggers.
+
+    Returns `True` only when an Event Report was actually persisted this
+    call (used by `run_synthesis_cycle` to count `reports_published` for the
+    on-demand run-now summary); every early-return path below returns
+    `False`.
     """
     center_time = _parse_trigger_time(trigger)
     if center_time is None:
-        return
+        return False
 
     context_window = db.fetch_context_window(
         trigger.market,
@@ -126,7 +131,7 @@ async def process_trigger(trigger: Trigger, db: DatabaseManager, store: QdrantSt
         # rejected by citation validation -- already logged by
         # shared/event_synthesizer.py. The raw trigger already reached
         # Slack, so nothing is silently lost.
-        return
+        return False
 
     is_correction = False
     corrects_event_id = None
@@ -162,7 +167,7 @@ async def process_trigger(trigger: Trigger, db: DatabaseManager, store: QdrantSt
         )
     except Exception:
         logger.exception("Failed to persist Event Report %s", report["event_id"])
-        return
+        return False
 
     logger.info("Published Event Report %s (is_correction=%s)", report["event_id"], is_correction)
 
@@ -173,17 +178,27 @@ async def process_trigger(trigger: Trigger, db: DatabaseManager, store: QdrantSt
     except Exception:
         logger.exception("Failed to send Slack alert for Event Report %s", report["event_id"])
 
+    return True
 
-async def run_synthesis_cycle() -> None:
+
+async def run_synthesis_cycle() -> dict:
     """
     Evaluates every rule-engine trigger class (relocated here from
     `services/ingestor/main.py` per the M4 brief -- see module docstring)
     and runs the synthesis pipeline for every trigger it fires.
+
+    Returns a small `{"triggers_fired": int, "reports_published": int}`
+    summary -- used by the on-demand `POST /orchestrator/run-now` route
+    (`services/api/main.py`) and its dashboard button to report back what
+    one cycle actually did; the automatic scheduler (`scheduled_synthesis_cycle`
+    below) ignores the return value, same as before this was added.
     """
     db = DatabaseManager()
     qdrant_client = AsyncQdrantClient(url=QDRANT_URL)
     store = QdrantStore(qdrant_client)
     cycle_start = time.monotonic()
+    triggers: list[Trigger] = []
+    reports_published = 0
 
     try:
         await store.ensure_collection()
@@ -193,11 +208,17 @@ async def run_synthesis_cycle() -> None:
             logger.info("Rule engine evaluated cycle: %d trigger(s) fired", len(triggers))
         except Exception:
             logger.exception("Rule engine evaluation failed")
-            return
+            return {"triggers_fired": 0, "reports_published": 0}
 
         for trigger in triggers:
             try:
-                await process_trigger(trigger, db, store)
+                # `process_trigger` returns `True` only on a successfully
+                # persisted Event Report; an `is True` check (rather than
+                # truthiness) so a mocked `process_trigger` in tests --
+                # which defaults to returning a truthy `MagicMock` -- never
+                # gets miscounted as a publish.
+                if await process_trigger(trigger, db, store) is True:
+                    reports_published += 1
             except Exception:
                 logger.exception(
                     "Synthesis pipeline failed for trigger_type=%s market=%s zone=%s product=%s",
@@ -211,12 +232,50 @@ async def run_synthesis_cycle() -> None:
         db.close()
         SYNTHESIS_CYCLE_DURATION.observe(time.monotonic() - cycle_start)
 
+    return {"triggers_fired": len(triggers), "reports_published": reports_published}
+
+
+def _auto_run_enabled() -> bool:
+    """
+    Reads `AUTO_RUN_ENABLED` fresh on every call (same "read the env var live,
+    don't freeze it at import time" convention as
+    `services/api/main.py`'s `require_api_key`). Defaults to `False`:
+    automatic scheduled synthesis cycles are opt-in, not opt-out, since every
+    fired rule-engine trigger this cycle processes costs one Claude Opus call
+    (`shared/event_synthesizer.py`) -- see `.env.example` / `DEPLOYMENT.md`.
+    Set `AUTO_RUN_ENABLED=true` to restore the fully-automatic behavior this
+    service had before this gate existed.
+    """
+    return os.getenv("AUTO_RUN_ENABLED", "false").strip().lower() == "true"
+
+
+async def scheduled_synthesis_cycle() -> None:
+    """
+    The APScheduler job entrypoint (see `main` below) -- wraps
+    `run_synthesis_cycle` behind the `AUTO_RUN_ENABLED` gate so the scheduler
+    itself, this service's process, and its `/metrics` exposition endpoint
+    all stay up and healthy regardless, while no Claude Opus calls happen
+    automatically unless explicitly opted in. Firing one real cycle on
+    demand, independent of this gate, is always available via
+    `POST /orchestrator/run-now` on the API service
+    (`services/api/main.py`), which calls `run_synthesis_cycle` directly.
+    """
+    if not _auto_run_enabled():
+        logger.info(
+            "AUTO_RUN_ENABLED is unset/false; skipping this scheduled synthesis cycle "
+            "(no Claude Opus calls made). POST /orchestrator/run-now on the API service "
+            "to run one cycle on demand, or set AUTO_RUN_ENABLED=true for automatic "
+            "scheduled cycles."
+        )
+        return
+    await run_synthesis_cycle()
+
 
 async def main():
     start_metrics_server(METRICS_PORT)
     scheduler = AsyncIOScheduler()
     scheduler.add_job(
-        run_synthesis_cycle,
+        scheduled_synthesis_cycle,
         "interval",
         minutes=TRIGGER_EVALUATION_INTERVAL_MINUTES,
         next_run_time=datetime.now(),
