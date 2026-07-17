@@ -1,15 +1,14 @@
 """
-Slack alerting for raw rule-engine triggers (README §9 M2: "Slack alerting of
-raw triggers — no LLM yet — validates signal quality early") and, since M4,
-for the full synthesized Event Report (README §2) once the Intelligence
-Orchestrator has produced and validated one.
-
-`send_slack_alert` posts the raw, structured trigger as-is (unchanged since
-M2) so signal quality can still be eyeballed independently of whether
-synthesis succeeds — the orchestrator's synthesis is an enrichment on top of
-this, not a replacement for it (see `shared/rule_engine.py`).
-`send_event_report_alert` posts the richer, synthesized Event Report as a
-second, distinct message type once it exists.
+Slack alerting. `send_slack_alert` (M2-era) renders a raw rule-engine trigger
+into a single scannable `mrkdwn` line and is still used for the
+`/dashboard/triggers` manual-pull page's underlying formatting and by tests,
+but `shared/rule_engine.py:run_rule_engine` no longer calls it automatically
+— posting one raw Slack message per fired trigger (most of which never
+survive citation validation into a synthesized Event Report) read as spam in
+practice. `send_event_report_alert` is now the only automatic Slack push in
+the pipeline: it fires once the Intelligence Orchestrator has produced and
+citation-validated a full synthesized Event Report (README §2), and is the
+"interpretation" the user wants prioritized over raw signal.
 """
 
 import logging
@@ -18,6 +17,15 @@ import os
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# Cap on how many `hard_data_correlates` entries get their own bullet line in
+# the Slack message. The `synthesis` paragraph (the plain-English
+# interpretation) is the whole point of the message and stays uncut; raw
+# data references are a supporting citation trail, not the headline, so a
+# long `hard_data_correlates` list (some reports carry a dozen+ correlate
+# rows) gets capped to the most salient few plus a "+N more" tail instead of
+# growing the message indefinitely.
+MAX_HARD_DATA_BULLETS = 3
 
 
 async def send_slack_alert(trigger: dict) -> bool:
@@ -135,12 +143,15 @@ def _format_event_report_summary(report: dict) -> str:
     if hard_data:
         lines.append("")
         lines.append("*Hard data:*")
-        for item in hard_data:
+        for item in hard_data[:MAX_HARD_DATA_BULLETS]:
             signal = item.get("signal", "signal")
             value = item.get("value")
             source = item.get("source", "unknown source")
             value_part = f": {value}" if value else ""
             lines.append(f"• {signal}{value_part} ({source})")
+        remaining = len(hard_data) - MAX_HARD_DATA_BULLETS
+        if remaining > 0:
+            lines.append(f"• _+{remaining} more data point(s) — see full report_")
 
     theories = report.get("market_theories") or []
     if theories:

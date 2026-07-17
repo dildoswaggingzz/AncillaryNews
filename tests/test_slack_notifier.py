@@ -145,3 +145,32 @@ async def test_send_event_report_alert_returns_false_on_http_error(monkeypatch):
     sent = await send_event_report_alert(EVENT_REPORT)
 
     assert sent is False
+
+
+@respx.mock
+async def test_send_event_report_alert_condenses_long_hard_data_list(monkeypatch):
+    """
+    Interpretation (the `synthesis` paragraph) stays full-length and
+    prominent; raw `hard_data_correlates` references get capped so a report
+    with many correlates doesn't produce an ever-growing Slack message.
+    """
+    monkeypatch.setenv("SLACK_WEBHOOK_URL", WEBHOOK_URL)
+    route = respx.post(WEBHOOK_URL).mock(return_value=httpx.Response(200, json={"ok": True}))
+    many_hard_data = [
+        {"signal": f"signal-{i}", "value": f"{i} MW", "source": f"source-{i}"} for i in range(10)
+    ]
+    report = {**EVENT_REPORT, "hard_data_correlates": many_hard_data}
+
+    sent = await send_event_report_alert(report)
+
+    assert sent is True
+    body = json.loads(route.calls[0].request.content)
+    text = body["text"]
+    # The full synthesis paragraph is never truncated.
+    assert EVENT_REPORT["synthesis"] in text
+    # Only a small number of hard-data bullets are rendered...
+    assert text.count("signal-") <= 4  # a few bullet mentions + possibly the "+N more" line
+    assert "signal-0" in text
+    # ...and the later entries are summarized rather than individually listed.
+    assert "signal-9" not in text
+    assert "more" in text.lower()

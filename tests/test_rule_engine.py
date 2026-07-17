@@ -1,7 +1,5 @@
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
-
-import pytest
+from unittest.mock import MagicMock
 
 from shared.rule_engine import (
     MIN_HISTORY_POINTS,
@@ -217,18 +215,24 @@ async def test_run_rule_engine_returns_empty_when_no_series():
     assert triggers == []
 
 
-async def test_run_rule_engine_fires_and_alerts_slack():
+async def test_run_rule_engine_fires_trigger_without_posting_to_slack():
+    """
+    Raw triggers are persisted (see test_run_rule_engine_persists_each_fired_trigger
+    below) but no longer auto-posted to Slack -- that was M2 behavior the
+    user experienced as spam (most raw triggers never survive citation
+    validation into a synthesized Event Report). `run_rule_engine` has no
+    Slack dependency left at all, so there's nothing to mock/assert here
+    beyond the trigger itself firing.
+    """
     db = MagicMock()
     db.fetch_distinct_series.return_value = [("mFRR_capacity", "DK1", "up")]
     normal = [100.0 + (i % 5) for i in range(MIN_HISTORY_POINTS)]
     db.fetch_history.return_value = _rows([*normal, 5000.0])
 
-    with patch("shared.rule_engine.send_slack_alert", new=AsyncMock()) as mock_send:
-        triggers = await run_rule_engine(db)
+    triggers = await run_rule_engine(db)
 
     assert len(triggers) == 1
     assert triggers[0].trigger_type == "price_spike"
-    mock_send.assert_awaited_once()
 
 
 async def test_run_rule_engine_checks_zone_divergence_pairs_once():
@@ -247,25 +251,10 @@ async def test_run_rule_engine_checks_zone_divergence_pairs_once():
 
     db.fetch_history.side_effect = fake_history
 
-    with patch("shared.rule_engine.send_slack_alert", new=AsyncMock()):
-        triggers = await run_rule_engine(db)
+    triggers = await run_rule_engine(db)
 
     divergence_triggers = [t for t in triggers if t.trigger_type == "zone_divergence"]
     assert len(divergence_triggers) == 1
-
-
-async def test_run_rule_engine_continues_when_slack_send_fails():
-    db = MagicMock()
-    db.fetch_distinct_series.return_value = [("mFRR_capacity", "DK1", "up")]
-    normal = [100.0 + (i % 5) for i in range(MIN_HISTORY_POINTS)]
-    db.fetch_history.return_value = _rows([*normal, 5000.0])
-
-    with patch(
-        "shared.rule_engine.send_slack_alert", new=AsyncMock(side_effect=RuntimeError("boom"))
-    ):
-        triggers = await run_rule_engine(db)
-
-    assert len(triggers) == 1
 
 
 async def test_run_rule_engine_persists_each_fired_trigger():
@@ -274,8 +263,7 @@ async def test_run_rule_engine_persists_each_fired_trigger():
     normal = [100.0 + (i % 5) for i in range(MIN_HISTORY_POINTS)]
     db.fetch_history.return_value = _rows([*normal, 5000.0])
 
-    with patch("shared.rule_engine.send_slack_alert", new=AsyncMock()):
-        triggers = await run_rule_engine(db)
+    triggers = await run_rule_engine(db)
 
     assert len(triggers) == 1
     db.save_trigger.assert_called_once_with(triggers[0].to_dict())
@@ -288,16 +276,9 @@ async def test_run_rule_engine_continues_when_trigger_persistence_fails():
     db.fetch_history.return_value = _rows([*normal, 5000.0])
     db.save_trigger.side_effect = RuntimeError("db down")
 
-    with patch("shared.rule_engine.send_slack_alert", new=AsyncMock()) as mock_send:
-        triggers = await run_rule_engine(db)
+    triggers = await run_rule_engine(db)
 
     assert len(triggers) == 1
-    mock_send.assert_awaited_once()
-
-
-@pytest.fixture(autouse=True)
-def _no_real_slack_webhook(monkeypatch):
-    monkeypatch.delenv("SLACK_WEBHOOK_URL", raising=False)
 
 
 # --- metrics (Phase 6 production readiness) ---------------------------------
@@ -313,8 +294,7 @@ async def test_run_rule_engine_increments_trigger_fired_counter():
     normal = [100.0 + (i % 5) for i in range(MIN_HISTORY_POINTS)]
     db.fetch_history.return_value = _rows([*normal, 5000.0])
 
-    with patch("shared.rule_engine.send_slack_alert", new=AsyncMock()):
-        await run_rule_engine(db)
+    await run_rule_engine(db)
 
     after = TRIGGER_FIRED_TOTAL.labels(trigger_type="price_spike")._value.get()
     assert after == before + 1

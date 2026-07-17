@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}Triggers — AncillaryNews{% endblock %}
+{% block content %}
+<h1>Rule-Engine Triggers</h1>
+<p class="muted">
+  Every trigger the rule engine (<code>shared/rule_engine.py</code>) fires is persisted here, but
+  is no longer auto-posted to Slack — most raw triggers never survive citation validation into a
+  synthesized Event Report, and posting one anyway per trigger read as spam. This page is the
+  manual-pull replacement: check it whenever you want. Only synthesized, published Event Reports
+  still push to Slack automatically.
+</p>
+
+<form method="get" action="/dashboard/triggers">
+  <input type="text" name="market" placeholder="market" value="{{ market or '' }}">
+  <input type="text" name="zone" placeholder="zone" value="{{ zone or '' }}">
+  <input type="text" name="product" placeholder="product" value="{{ product or '' }}">
+  <button type="submit">Filter</button>
+</form>
+
+{% if not triggers %}
+<p>No triggers recorded yet.</p>
+{% endif %}
+
+{% if triggers %}
+<table>
+  <tr>
+    <th>Detected</th><th>Type</th><th>Market</th><th>Zone</th><th>Product</th>
+    <th>Value</th><th>Baseline</th><th>Threshold</th><th>Time</th><th>Details</th>
+  </tr>
+  {% for t in triggers %}
+  <tr>
+    <td>{{ t.detected_at }}</td>
+    <td>{{ t.trigger_type }}</td>
+    <td>{{ t.market }}</td>
+    <td>{{ t.zone }}</td>
+    <td>{{ t.product }}</td>
+    <td>{{ t.value }}</td>
+    <td>{{ t.baseline }}</td>
+    <td>{{ t.threshold }}</td>
+    <td>{{ t.time }}</td>
+    <td>{{ t.details }}</td>
+  </tr>
+  {% endfor %}
+</table>
+
+<p>
+  {% if offset > 0 %}
+  <a href="/dashboard/triggers?market={{ market or '' }}&zone={{ zone or '' }}&product={{ product or '' }}&limit={{ limit }}&offset={{ [offset - limit, 0] | max }}">&larr; Newer</a>
+  {% endif %}
+  {% if triggers|length == limit %}
+  <a href="/dashboard/triggers?market={{ market or '' }}&zone={{ zone or '' }}&product={{ product or '' }}&limit={{ limit }}&offset={{ offset + limit }}">Older &rarr;</a>
+  {% endif %}
+</p>
+{% endif %}
+{% endblock %}

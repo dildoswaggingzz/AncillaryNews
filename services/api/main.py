@@ -544,6 +544,47 @@ def dashboard_series_detail(
     )
 
 
+@app.get("/dashboard/triggers", response_class=HTMLResponse)
+def dashboard_triggers(
+    request: Request,
+    market: str | None = None,
+    zone: str | None = None,
+    product: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    db: DatabaseManager = Depends(get_db),
+):
+    """
+    Manual-pull listing of recent persisted rule-engine triggers
+    (shared/rule_engine.py, same `DatabaseManager.fetch_triggers` backing
+    the JSON `GET /triggers` route above), most-recently-detected-first,
+    with optional market/zone/product filters and offset/limit pagination.
+
+    This page exists because `run_rule_engine` no longer auto-posts every
+    fired trigger to Slack (that was M2 behavior the user experienced as
+    spam — most raw triggers never survive citation validation into a
+    synthesized Event Report, which is the only thing still auto-posted via
+    `send_event_report_alert`). Triggers are still fully persisted; this is
+    where a human checks them whenever they want, instead of every single
+    one landing in Slack unprompted.
+    """
+    triggers = db.fetch_triggers(
+        market=market, zone=zone, product=product, limit=limit, offset=offset
+    )
+    return templates.TemplateResponse(
+        request,
+        "triggers_list.html",
+        {
+            "triggers": triggers,
+            "market": market,
+            "zone": zone,
+            "product": product,
+            "limit": limit,
+            "offset": offset,
+        },
+    )
+
+
 @app.get("/dashboard/manual-articles", response_class=HTMLResponse)
 def dashboard_manual_article_form(request: Request):
     """The LinkedIn paste-in form -- URL, author, title, and a content field

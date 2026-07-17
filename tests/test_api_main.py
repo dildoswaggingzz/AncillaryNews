@@ -301,6 +301,52 @@ def test_list_triggers(client, db):
     assert kwargs["market"] == "mFRR EAM"
 
 
+def test_dashboard_triggers_renders(client, db):
+    db.fetch_triggers.return_value = [
+        {
+            "id": 1,
+            "trigger_type": "price_spike",
+            "market": "mFRR EAM",
+            "zone": "DK1",
+            "product": "up",
+            "value": 5000.0,
+            "time": "2026-07-16 17:15:00+00:00",
+            "baseline": 1200.0,
+            "threshold": 3600.0,
+            "details": "z-score=4.10",
+            "detected_at": "2026-07-16T17:20:00+00:00",
+        }
+    ]
+
+    resp = client.get("/dashboard/triggers")
+
+    assert resp.status_code == 200
+    assert "price_spike" in resp.text
+    assert "mFRR EAM" in resp.text
+    db.fetch_triggers.assert_called_once()
+
+
+def test_dashboard_triggers_passes_filters_through(client, db):
+    db.fetch_triggers.return_value = []
+
+    resp = client.get("/dashboard/triggers?market=mFRR+EAM&zone=DK1&product=up")
+
+    assert resp.status_code == 200
+    kwargs = db.fetch_triggers.call_args.kwargs
+    assert kwargs["market"] == "mFRR EAM"
+    assert kwargs["zone"] == "DK1"
+    assert kwargs["product"] == "up"
+
+
+def test_dashboard_triggers_renders_empty_state(client, db):
+    db.fetch_triggers.return_value = []
+
+    resp = client.get("/dashboard/triggers")
+
+    assert resp.status_code == 200
+    assert "No triggers recorded yet" in resp.text
+
+
 # --- /bess (BESS backtest simulator) ----------------------------------------
 
 BESS_RUN_ROW = {

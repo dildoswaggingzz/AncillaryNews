@@ -46,7 +46,6 @@ from datetime import UTC, datetime
 from prometheus_client import Counter
 
 from shared.db_manager import DatabaseManager
-from shared.slack_notifier import send_slack_alert
 
 logger = logging.getLogger(__name__)
 
@@ -306,17 +305,28 @@ def check_revisions(market: str, zone: str, product: str, raw_rows: list[dict]) 
 async def run_rule_engine(db: DatabaseManager) -> list[Trigger]:
     """
     Evaluates every trigger class above across every `(market, zone, product)`
-    series currently in `market_data_history`, persists each fired trigger
-    (init-db/03-triggers.sql, Phase 5's `GET /triggers`), and posts it to
-    Slack.
+    series currently in `market_data_history` and persists each fired
+    trigger (init-db/03-triggers.sql, Phase 5's `GET /triggers`).
+
+    Raw triggers are **no longer** auto-posted to Slack (that was M2
+    behavior; it produced one Slack message per fired trigger — most of
+    which never survive citation validation into a synthesized Event
+    Report — which the user experienced as spam). Persisted triggers remain
+    fully queryable via `GET /triggers` and the `/dashboard/triggers` page
+    (services/api/main.py) as the "manual pull" replacement. The only
+    automatic Slack push left in the pipeline is
+    `shared.slack_notifier.send_event_report_alert`, fired once a
+    synthesized, citation-validated Event Report is published (see
+    `shared/event_synthesizer.py` / `services/orchestrator/main.py`) — that
+    is the "interpretation" the user wants prioritized over raw signal.
 
     Called on its own schedule by `services/orchestrator/main.py`'s
     `run_synthesis_cycle` (README §9 M4) — no longer coupled to the
     ingestion poll cadence, and no longer called from
     `services/ingestor/main.py`. Every fired Trigger returned here also
     feeds the orchestrator's RAG + LLM synthesis pipeline on top of the
-    persistence/Slack calls below, which this function's own behavior is
-    unaware of and unaffected by.
+    persistence call below, which this function's own behavior is unaware
+    of and unaffected by.
     """
     series_keys = db.fetch_distinct_series()
     if not series_keys:
@@ -369,10 +379,5 @@ async def run_rule_engine(db: DatabaseManager) -> list[Trigger]:
             db.save_trigger(trigger.to_dict())
         except Exception:
             logger.exception("Failed to persist trigger: %s", trigger.trigger_type)
-
-        try:
-            await send_slack_alert(trigger.to_dict())
-        except Exception:
-            logger.exception("Failed to send Slack alert for trigger: %s", trigger.trigger_type)
 
     return triggers
