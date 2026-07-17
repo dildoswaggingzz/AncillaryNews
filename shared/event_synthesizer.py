@@ -15,7 +15,6 @@ untrusted input that must pass structural + numeric-provenance checks before
 anything is published.
 """
 
-import json
 import logging
 import os
 import re
@@ -24,6 +23,7 @@ import time
 from anthropic import AsyncAnthropic
 from prometheus_client import Counter, Histogram
 
+from shared.llm_json import extract_json_object
 from shared.rule_engine import Trigger
 
 logger = logging.getLogger(__name__)
@@ -233,11 +233,11 @@ def _validate_report(report: dict, trigger: Trigger, context_window: list[dict])
 
 
 def _parse_response(raw_text: str) -> dict | None:
-    try:
-        return json.loads(raw_text)
-    except (json.JSONDecodeError, TypeError):
+    payload = extract_json_object(raw_text)
+    if payload is None:
         logger.error("Claude returned non-JSON synthesis output")
         return None
+    return payload
 
 
 def _build_user_prompt(

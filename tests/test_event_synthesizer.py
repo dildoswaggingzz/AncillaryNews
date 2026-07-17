@@ -232,6 +232,24 @@ async def test_synthesize_rejects_invalid_confidence_value():
     assert report is None
 
 
+async def test_synthesize_parses_markdown_fenced_response():
+    """
+    Confirms shared/event_synthesizer.py handles the same markdown-fence
+    response shape live-confirmed for claude-haiku-4-5 in
+    shared/claim_extractor.py, in case claude-opus-4-8 does the same despite
+    the system prompt explicitly saying "no markdown fences, no prose".
+    """
+    response_text = f"```json\n{_valid_report_json()}\n```"
+    client = _mock_client(response_text)
+
+    report = await synthesize_event_report(
+        PRICE_SPIKE_TRIGGER, CONTEXT_WINDOW, RETRIEVED_CLAIMS, client=client
+    )
+
+    assert report is not None
+    assert report["confidence"] == "medium"
+
+
 async def test_synthesize_returns_none_on_invalid_json():
     client = _mock_client("not json at all")
 

@@ -19,7 +19,6 @@ found") rather than raising, letting the caller fall back to storing the raw
 article text.
 """
 
-import json
 import logging
 import os
 import time
@@ -29,6 +28,7 @@ from typing import Literal
 from anthropic import AsyncAnthropic
 from prometheus_client import Counter, Histogram
 
+from shared.llm_json import extract_json_object
 from shared.rss_reader import ArticleRef
 
 logger = logging.getLogger(__name__)
@@ -95,9 +95,8 @@ def _client() -> AsyncAnthropic | None:
 
 
 def _parse_response(raw_text: str, article: ArticleRef) -> ExtractionResult | None:
-    try:
-        payload = json.loads(raw_text)
-    except (json.JSONDecodeError, TypeError):
+    payload = extract_json_object(raw_text)
+    if payload is None:
         logger.error("Claude returned non-JSON claim extraction output for %s", article.url)
         return None
 

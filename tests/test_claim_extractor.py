@@ -113,6 +113,34 @@ async def test_extract_claims_defaults_unrecognised_claim_type_to_theory():
     assert result.claims[0].claim_type == "theory"
 
 
+async def test_extract_claims_parses_markdown_fenced_response():
+    """
+    Live-verified: claude-haiku-4-5 wraps its JSON in ```json ... ``` fences
+    despite the system prompt saying "Respond with ONLY a JSON object" --
+    this reproduces the exact real-world response shape.
+    """
+    inner = json.dumps(
+        {
+            "summary": "NBM confirms the Nordic mFRR MARI accession timeline.",
+            "claims": [
+                {
+                    "claim": "The four Nordic TSOs still target Q1 2027 for MARI accession.",
+                    "claim_type": "fact",
+                }
+            ],
+        },
+        indent=2,
+    )
+    response_text = f"```json\n{inner}\n```"
+    client = _mock_client(response_text)
+
+    result = await extract_claims("article text", TIER1_ARTICLE, client=client)
+
+    assert result is not None
+    assert result.summary.startswith("NBM confirms")
+    assert result.claims[0].claim_type == "fact"
+
+
 async def test_extract_claims_returns_none_on_invalid_json():
     client = _mock_client("not json at all")
 
