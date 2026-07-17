@@ -69,6 +69,11 @@ async def test_send_slack_alert_posts_structured_payload(monkeypatch):
     assert body["trigger"] == TRIGGER
     assert "price_spike" in body["text"]
     assert "mFRR_capacity" in body["text"]
+    # Numbers are rounded and phrased in plain words, not a raw key=value dump.
+    assert "value=" not in body["text"]
+    assert "4850.00" in body["text"]
+    assert "1200.00" in body["text"]
+    assert "3600.00" in body["text"]
 
 
 @respx.mock
@@ -103,6 +108,19 @@ async def test_send_event_report_alert_posts_structured_payload(monkeypatch):
     assert body["report"] == EVENT_REPORT
     assert "mFRR EAM" in body["text"]
     assert "DK1" in body["text"]
+    # The synthesis paragraph is the actual plain-English explanation the
+    # whole pipeline exists to produce — it must appear in the visible text,
+    # not just be buried in the unrendered `report` dict.
+    assert EVENT_REPORT["synthesis"] in body["text"]
+    # Hard data correlates are listed as verifiable, cited data points.
+    assert "Energinet" in body["text"]
+    assert "4,850 DKK/MWh" in body["text"]
+    # Market theories must always read as attributed claims, never bare fact.
+    assert "according to EnergiWatch" in body["text"]
+    assert "low wind + Karlshamn unavailability" in body["text"]
+    # Confidence and data maturity are shown plainly.
+    assert "medium" in body["text"]
+    assert "provisional" in body["text"]
 
 
 @respx.mock
@@ -115,7 +133,8 @@ async def test_send_event_report_alert_marks_correction_in_summary(monkeypatch):
 
     assert sent is True
     body = json.loads(route.calls[0].request.content)
-    assert "CORRECTION" in body["text"]
+    assert "CORRECTION to an earlier report" in body["text"]
+    assert "some-original-id" in body["text"]
 
 
 @respx.mock
