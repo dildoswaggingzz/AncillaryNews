@@ -73,6 +73,8 @@ class DatabaseManager:
                     continue
                 if s.filter_field is not None and record.get(s.filter_field) != s.filter_value:
                     continue
+                if any(record.get(k) != v for k, v in s.extra_filters.items()):
+                    continue
                 values.append(
                     (
                         time_value,
@@ -588,8 +590,8 @@ class DatabaseManager:
                     INSERT INTO bess_simulation_runs
                         (zone, start_time, end_time, config, total_arbitrage_revenue_dkk,
                          total_capacity_revenue_dkk, total_revenue_dkk, full_cycle_equivalents,
-                         tick_count, label)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                         tick_count, label, total_afrr_activation_revenue_eur)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id;
                     """,
                     (
@@ -603,6 +605,7 @@ class DatabaseManager:
                         result.full_cycle_equivalents,
                         len(result.ticks),
                         label,
+                        result.total_afrr_activation_revenue_eur,
                     ),
                 )
                 run_id = cur.fetchone()[0]
@@ -624,6 +627,8 @@ class DatabaseManager:
                             t.cumulative_arbitrage_revenue_dkk,
                             t.cumulative_capacity_revenue_dkk,
                             t.cumulative_total_revenue_dkk,
+                            t.afrr_activation_revenue_eur,
+                            t.cumulative_afrr_activation_revenue_eur,
                         )
                         for t in result.ticks
                     ]
@@ -635,7 +640,8 @@ class DatabaseManager:
                              energy_discharged_mwh, arbitrage_revenue_dkk, capacity_reserved_mw,
                              capacity_revenue_dkk, capacity_revenue_by_market,
                              cumulative_arbitrage_revenue_dkk, cumulative_capacity_revenue_dkk,
-                             cumulative_total_revenue_dkk)
+                             cumulative_total_revenue_dkk, afrr_activation_revenue_eur,
+                             cumulative_afrr_activation_revenue_eur)
                         VALUES %s;
                         """,
                         tick_values,
@@ -665,7 +671,7 @@ class DatabaseManager:
         query = f"""
             SELECT id, zone, start_time, end_time, config, total_arbitrage_revenue_dkk,
                    total_capacity_revenue_dkk, total_revenue_dkk, full_cycle_equivalents,
-                   tick_count, created_at, label
+                   tick_count, created_at, label, total_afrr_activation_revenue_eur
             FROM bess_simulation_runs
             {where_clause}
             ORDER BY created_at DESC
@@ -692,7 +698,7 @@ class DatabaseManager:
                     """
                     SELECT id, zone, start_time, end_time, config, total_arbitrage_revenue_dkk,
                            total_capacity_revenue_dkk, total_revenue_dkk, full_cycle_equivalents,
-                           tick_count, created_at, label
+                           tick_count, created_at, label, total_afrr_activation_revenue_eur
                     FROM bess_simulation_runs
                     WHERE id = %s;
                     """,
@@ -717,7 +723,8 @@ class DatabaseManager:
                            energy_discharged_mwh, arbitrage_revenue_dkk, capacity_reserved_mw,
                            capacity_revenue_dkk, capacity_revenue_by_market,
                            cumulative_arbitrage_revenue_dkk, cumulative_capacity_revenue_dkk,
-                           cumulative_total_revenue_dkk
+                           cumulative_total_revenue_dkk, afrr_activation_revenue_eur,
+                           cumulative_afrr_activation_revenue_eur
                     FROM bess_simulation_ticks
                     WHERE run_id = %s
                     ORDER BY time ASC;
@@ -743,6 +750,8 @@ class DatabaseManager:
                 "cumulative_arbitrage_revenue_dkk": r[10],
                 "cumulative_capacity_revenue_dkk": r[11],
                 "cumulative_total_revenue_dkk": r[12],
+                "afrr_activation_revenue_eur": r[13],
+                "cumulative_afrr_activation_revenue_eur": r[14],
             }
             for r in rows
         ]
@@ -765,6 +774,7 @@ class DatabaseManager:
             "tick_count": row[9],
             "created_at": row[10],
             "label": row[11],
+            "total_afrr_activation_revenue_eur": row[12],
         }
 
     # --- Morning Brief (M5) persistence: forecasts, briefs, aggregates -----

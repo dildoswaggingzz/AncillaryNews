@@ -821,6 +821,7 @@ def test_fetch_bess_runs_returns_mapped_rows(db, pooled_conn):
             48,
             datetime(2026, 7, 17, 9, tzinfo=UTC),
             None,
+            25.0,
         )
     ]
     conn.cursor.return_value.__enter__.return_value = cursor
@@ -831,6 +832,7 @@ def test_fetch_bess_runs_returns_mapped_rows(db, pooled_conn):
     assert result[0]["zone"] == "DK1"
     assert result[0]["config"] == {"power_mw": 1.0}
     assert result[0]["label"] is None
+    assert result[0]["total_afrr_activation_revenue_eur"] == 25.0
     query, params = cursor.execute.call_args.args
     assert "zone = %s" in query
     assert params == ["DK1", 10, 0]
@@ -853,6 +855,7 @@ def test_fetch_bess_runs_decodes_json_string_config(db, pooled_conn):
             48,
             datetime(2026, 7, 17, 9, tzinfo=UTC),
             "morning_brief",
+            0.0,
         )
     ]
     conn.cursor.return_value.__enter__.return_value = cursor
@@ -890,6 +893,8 @@ def test_fetch_bess_ticks_returns_mapped_rows(db, pooled_conn):
             0.0,
             15.0,
             15.0,
+            2.0,
+            2.0,
         )
     ]
     conn.cursor.return_value.__enter__.return_value = cursor
@@ -898,6 +903,8 @@ def test_fetch_bess_ticks_returns_mapped_rows(db, pooled_conn):
 
     assert result[0]["action"] == "idle"
     assert result[0]["capacity_revenue_by_market"] == {"FCR": 10.0, "aFRR_capacity": 5.0}
+    assert result[0]["afrr_activation_revenue_eur"] == 2.0
+    assert result[0]["cumulative_afrr_activation_revenue_eur"] == 2.0
     query, params = cursor.execute.call_args.args
     assert "run_id = %s" in query
     assert params == (1,)
@@ -975,6 +982,48 @@ def test_save_market_data_applies_series_filter_field(mock_execute, db):
     assert values[0][4] == 20.0  # only the FCR-N row's price is mapped
 
 
+@patch("shared.db_manager.execute_values")
+def test_save_market_data_applies_extra_filters(mock_execute, db):
+    dataset = DatasetConfig(
+        name="fcr_dk2_test",
+        dataset_id="FcrNdDK2",
+        market="FCR",
+        time_field="HourUTC",
+        zone_field="PriceArea",
+        series=[
+            SeriesConfig(
+                product="price",
+                value_field="PriceTotalEUR",
+                filter_field="ProductName",
+                filter_value="FCR-N",
+                extra_filters={"AuctionType": "Total"},
+            )
+        ],
+    )
+    records = [
+        {
+            "HourUTC": "2026-07-18T21:00:00",
+            "PriceArea": "DK2",
+            "ProductName": "FCR-N",
+            "AuctionType": "D-1 early",
+            "PriceTotalEUR": 1.73,
+        },
+        {
+            "HourUTC": "2026-07-18T21:00:00",
+            "PriceArea": "DK2",
+            "ProductName": "FCR-N",
+            "AuctionType": "Total",
+            "PriceTotalEUR": 20.0,
+        },
+    ]
+
+    saved = db.save_market_data(records, dataset)
+
+    assert saved == 1
+    values = mock_execute.call_args.args[2]
+    assert values[0][4] == 20.0  # only the "Total" auction row is mapped
+
+
 # --- save_bess_run label (M5) -------------------------------------------------
 
 
@@ -999,7 +1048,8 @@ def test_save_bess_run_persists_label(db, pooled_conn):
 
     assert run_id == 9
     insert_run_call = cursor.execute.call_args_list[0]
-    assert insert_run_call.args[1][-1] == "morning_brief"
+    # label is second-to-last (total_afrr_activation_revenue_eur is last).
+    assert insert_run_call.args[1][-2] == "morning_brief"
 
 
 # --- Morning Brief (M5) persistence -------------------------------------------

@@ -97,10 +97,18 @@ def _bess_line(estimate: dict) -> str:
     cap_note = (
         " (cycle cap limited earnings some days)" if estimate.get("cycle_cap_was_binding") else ""
     )
+    afrr_eur = estimate.get("total_afrr_activation_revenue_eur", 0)
+    # Deliberately kept as a separate clause, not summed into the DKK figure
+    # above -- consistent with the "never summed" product decision (mixing
+    # EUR into a DKK total would misstate it). Omitted entirely when zero
+    # (e.g. no aFRR_capacity committed, or a DK1 run) rather than showing a
+    # noisy "+0 EUR".
+    afrr_note = f"; +{afrr_eur:,.0f} EUR aFRR activation" if afrr_eur else ""
     return (
         f"{estimate.get('config_label')} in {estimate.get('zone')}: "
         f"{estimate.get('total_revenue_dkk', 0):,.0f} DKK over the window "
-        f"({estimate.get('full_cycle_equivalents', 0):.2f} full cycle equivalents){cap_note}"
+        f"({estimate.get('full_cycle_equivalents', 0):.2f} full cycle equivalents)"
+        f"{cap_note}{afrr_note}"
     )
 
 

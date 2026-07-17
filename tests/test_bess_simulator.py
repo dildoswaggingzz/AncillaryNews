@@ -20,10 +20,18 @@ def _price_rows(
 
 
 def _db_with_series(
-    day_ahead: list[dict], fcr: list[dict] | None = None, afrr: list[dict] | None = None
+    day_ahead: list[dict],
+    fcr: list[dict] | None = None,
+    afrr: list[dict] | None = None,
+    fcr_up: list[dict] | None = None,
+    fcr_down: list[dict] | None = None,
+    activation: list[dict] | None = None,
 ):
     """Builds a MagicMock DatabaseManager whose fetch_series_values returns the given series
-    per market, matching shared.db_manager.DatabaseManager.fetch_series_values's signature."""
+    per (market, product), matching shared.db_manager.DatabaseManager.fetch_series_values's
+    signature. `fcr` answers ("FCR", "price"); `fcr_up`/`fcr_down` answer ("FCR", "up")/
+    ("FCR", "down") (FCR-D legs); `afrr` answers ("aFRR_capacity", "up"); `activation`
+    answers ("aFRR_energy", "activation_price")."""
     db = MagicMock()
 
     def fetch_series_values(
@@ -31,11 +39,17 @@ def _db_with_series(
     ):
         if market == "day_ahead":
             return day_ahead
-        if market == "FCR":
+        if market == "FCR" and product == "price":
             return fcr or []
+        if market == "FCR" and product == "up":
+            return fcr_up or []
+        if market == "FCR" and product == "down":
+            return fcr_down or []
         if market == "aFRR_capacity":
             return afrr or []
-        raise AssertionError(f"unexpected market {market!r} requested")
+        if market == "aFRR_energy":
+            return activation or []
+        raise AssertionError(f"unexpected market/product {market!r}/{product!r} requested")
 
     db.fetch_series_values.side_effect = fetch_series_values
     return db
@@ -224,9 +238,11 @@ def test_capacity_revenue_uses_committed_mw_and_clearing_price():
     result = run_backtest(db, "DK1", BASE_TIME, BASE_TIME + timedelta(hours=20), config)
 
     first_tick = result.ticks[0]
-    # commit split evenly across 2 markets: 0.2 MW each, 1-hour tick.
-    assert first_tick.capacity_revenue_by_market["FCR"] == pytest.approx(50.0 * 0.2 * 1.0)
-    assert first_tick.capacity_revenue_by_market["aFRR_capacity"] == pytest.approx(30.0 * 0.2 * 1.0)
+    # commit split evenly across 2 market groups: 0.2 MW each, 1-hour tick.
+    assert first_tick.capacity_revenue_by_market["FCR:price"] == pytest.approx(50.0 * 0.2 * 1.0)
+    assert first_tick.capacity_revenue_by_market["aFRR_capacity:up"] == pytest.approx(
+        30.0 * 0.2 * 1.0
+    )
     assert first_tick.capacity_reserved_mw == pytest.approx(0.4)
     assert result.total_capacity_revenue_dkk > 0
 
@@ -411,3 +427,162 @@ def test_cycle_cap_is_a_rolling_24h_window_not_a_calendar_day_reset(monkeypatch)
     at_or_after_24h = [t for t in result.ticks if t.time >= first_tick.time + timedelta(hours=24)]
     assert at_or_after_24h  # sanity: the run extends past the 24h mark
     assert any(t.energy_discharged_mwh > 0 for t in at_or_after_24h)
+
+
+# --- FCR-D (DK2) capacity-market keying/commit-split ----------------------
+
+
+def test_afrr_activation_participation_rate_rejects_outside_unit_interval():
+    with pytest.raises(ValueError, match="afrr_activation_participation_rate"):
+        BessConfig(afrr_activation_participation_rate=-0.1)
+    with pytest.raises(ValueError, match="afrr_activation_participation_rate"):
+        BessConfig(afrr_activation_participation_rate=1.1)
+
+
+def test_fcr_up_down_legs_do_not_collide_in_capacity_revenue_by_market():
+    day_ahead = _price_rows([100.0] * 5)
+    fcr_up = _price_rows([40.0])
+    fcr_down = _price_rows([25.0])
+    db = _db_with_series(day_ahead, fcr_up=fcr_up, fcr_down=fcr_down)
+    config = BessConfig(
+        capacity_commit_mw=0.4,
+        capacity_markets=(("FCR", "up"), ("FCR", "down")),
+    )
+
+    result = run_backtest(db, "DK2", BASE_TIME, BASE_TIME + timedelta(hours=5), config)
+
+    first_tick = result.ticks[0]
+    # Both legs share market="FCR" but distinct products -- must not collide.
+    assert first_tick.capacity_revenue_by_market["FCR:up"] == pytest.approx(40.0 * 0.2 * 1.0)
+    assert first_tick.capacity_revenue_by_market["FCR:down"] == pytest.approx(25.0 * 0.2 * 1.0)
+    assert first_tick.capacity_revenue_by_market["FCR:up"] != first_tick.capacity_revenue_by_market[
+        "FCR:down"
+    ]
+
+
+def test_commit_splits_across_market_groups_not_raw_leg_entries():
+    # Regression test for the dilution bug: adding a second FCR-D leg to the
+    # "FCR" group must NOT shrink aFRR_capacity's share. With 2 groups (FCR,
+    # aFRR_capacity) each should get commit/2 regardless of how many legs
+    # the FCR group has.
+    day_ahead = _price_rows([100.0] * 5)
+    fcr = _price_rows([50.0])
+    fcr_up = _price_rows([40.0])
+    fcr_down = _price_rows([25.0])
+    afrr = _price_rows([30.0])
+    db = _db_with_series(day_ahead, fcr=fcr, fcr_up=fcr_up, fcr_down=fcr_down, afrr=afrr)
+    config = BessConfig(
+        capacity_commit_mw=0.4,
+        capacity_markets=(
+            ("FCR", "price"),
+            ("FCR", "up"),
+            ("FCR", "down"),
+            ("aFRR_capacity", "up"),
+        ),
+    )
+
+    result = run_backtest(db, "DK2", BASE_TIME, BASE_TIME + timedelta(hours=5), config)
+    first_tick = result.ticks[0]
+
+    # 2 groups -> 0.2 MW/group. FCR group has 3 legs -> 0.2/3 MW each.
+    commit_per_fcr_leg = 0.4 / 2 / 3
+    assert first_tick.capacity_revenue_by_market["FCR:price"] == pytest.approx(
+        50.0 * commit_per_fcr_leg * 1.0
+    )
+    assert first_tick.capacity_revenue_by_market["FCR:up"] == pytest.approx(
+        40.0 * commit_per_fcr_leg * 1.0
+    )
+    assert first_tick.capacity_revenue_by_market["FCR:down"] == pytest.approx(
+        25.0 * commit_per_fcr_leg * 1.0
+    )
+    # aFRR_capacity's group-level share (0.2 MW) is untouched by FCR having 3 legs.
+    assert first_tick.capacity_revenue_by_market["aFRR_capacity:up"] == pytest.approx(
+        30.0 * 0.2 * 1.0
+    )
+    assert first_tick.capacity_reserved_mw == pytest.approx(0.4)
+
+
+# --- aFRR energy activation revenue ----------------------------------------
+
+
+def test_activation_revenue_formula():
+    day_ahead = _price_rows([100.0] * 3)
+    afrr = _price_rows([30.0])
+    activation = _price_rows([20.0])  # activation_price EUR/MWh
+    db = _db_with_series(day_ahead, afrr=afrr, activation=activation)
+    config = BessConfig(
+        capacity_commit_mw=0.4,
+        capacity_markets=(("aFRR_capacity", "up"),),
+        afrr_activation_participation_rate=0.5,
+    )
+
+    result = run_backtest(db, "DK2", BASE_TIME, BASE_TIME + timedelta(hours=3), config)
+
+    first_tick = result.ticks[0]
+    # commit_per_group = 0.4 (only one group). revenue = price * commit * rate * dt_hours
+    expected = 20.0 * 0.4 * 0.5 * 1.0
+    assert first_tick.afrr_activation_revenue_eur == pytest.approx(expected)
+    assert result.total_afrr_activation_revenue_eur > 0.0
+
+
+def test_activation_revenue_zero_when_rate_is_zero():
+    day_ahead = _price_rows([100.0] * 3)
+    afrr = _price_rows([30.0])
+    activation = _price_rows([20.0])
+    db = _db_with_series(day_ahead, afrr=afrr, activation=activation)
+    config = BessConfig(
+        capacity_commit_mw=0.4,
+        capacity_markets=(("aFRR_capacity", "up"),),
+        afrr_activation_participation_rate=0.0,
+    )
+
+    result = run_backtest(db, "DK2", BASE_TIME, BASE_TIME + timedelta(hours=3), config)
+
+    assert result.total_afrr_activation_revenue_eur == 0.0
+    assert all(t.afrr_activation_revenue_eur == 0.0 for t in result.ticks)
+
+
+def test_activation_revenue_zero_when_no_afrr_capacity_committed():
+    day_ahead = _price_rows([100.0] * 3)
+    activation = _price_rows([20.0])
+    db = _db_with_series(day_ahead, activation=activation)
+    config = BessConfig(capacity_commit_mw=0.0, capacity_markets=())
+
+    result = run_backtest(db, "DK2", BASE_TIME, BASE_TIME + timedelta(hours=3), config)
+
+    assert result.total_afrr_activation_revenue_eur == 0.0
+    # aFRR_energy must never even be queried when aFRR_capacity isn't configured.
+    queried_markets = {call.args[0] for call in db.fetch_series_values.call_args_list}
+    assert "aFRR_energy" not in queried_markets
+
+
+def test_activation_revenue_zero_when_no_activation_price_available():
+    day_ahead = _price_rows([100.0] * 3)
+    afrr = _price_rows([30.0])
+    db = _db_with_series(day_ahead, afrr=afrr, activation=[])
+    config = BessConfig(capacity_commit_mw=0.4, capacity_markets=(("aFRR_capacity", "up"),))
+
+    result = run_backtest(db, "DK2", BASE_TIME, BASE_TIME + timedelta(hours=3), config)
+
+    assert result.total_afrr_activation_revenue_eur == 0.0
+    assert all(t.afrr_activation_revenue_eur == 0.0 for t in result.ticks)
+
+
+def test_afrr_activation_revenue_never_appears_in_total_revenue_dkk():
+    day_ahead = _price_rows([100.0] * 3)
+    afrr = _price_rows([30.0])
+    activation = _price_rows([9999.0])  # deliberately huge, to catch accidental mixing
+    db = _db_with_series(day_ahead, afrr=afrr, activation=activation)
+    config = BessConfig(
+        capacity_commit_mw=0.4,
+        capacity_markets=(("aFRR_capacity", "up"),),
+        afrr_activation_participation_rate=1.0,
+    )
+
+    result = run_backtest(db, "DK2", BASE_TIME, BASE_TIME + timedelta(hours=3), config)
+
+    assert result.total_afrr_activation_revenue_eur > 1000.0  # sanity: not accidentally zero
+    # total_revenue_dkk must equal arbitrage + capacity only, never plus the (huge) EUR figure.
+    assert result.total_revenue_dkk == pytest.approx(
+        result.total_arbitrage_revenue_dkk + result.total_capacity_revenue_dkk
+    )

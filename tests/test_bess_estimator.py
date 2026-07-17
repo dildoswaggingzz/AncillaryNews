@@ -119,3 +119,49 @@ def test_run_illustrative_backtests_summary_shape():
     assert "total_arbitrage_revenue_dkk" in summary
     assert "total_capacity_revenue_dkk" in summary
     assert "full_cycle_equivalents" in summary
+    assert "total_afrr_activation_revenue_eur" in summary
+
+
+# --- DK2 FCR-D vs. DK1 (no FCR-D market) asymmetry --------------------------
+
+
+def test_dk2_configs_include_fcr_d_legs_dk1_does_not():
+    db = MagicMock()
+    db.save_bess_run.return_value = 1
+    captured_configs_by_zone: dict[str, list] = {"DK1": [], "DK2": []}
+
+    with patch("shared.bess_estimator.run_backtest") as mock_run_backtest:
+
+        def fake_run_backtest(db_arg, zone, start, end, config):
+            captured_configs_by_zone[zone].append(config)
+            return _result_with_ticks(zone, config, cap_binding=False)
+
+        mock_run_backtest.side_effect = fake_run_backtest
+        run_illustrative_backtests(db, ("DK1", "DK2"), start_time=START, end_time=END)
+
+    for config in captured_configs_by_zone["DK2"]:
+        assert ("FCR", "up") in config.capacity_markets
+        assert ("FCR", "down") in config.capacity_markets
+
+    for config in captured_configs_by_zone["DK1"]:
+        assert ("FCR", "up") not in config.capacity_markets
+        assert ("FCR", "down") not in config.capacity_markets
+
+
+def test_run_illustrative_backtests_surfaces_total_afrr_activation_revenue_eur():
+    db = MagicMock()
+    db.save_bess_run.return_value = 1
+
+    def _result_with_activation(zone, config, cap_binding):
+        result = _result_with_ticks(zone, config, cap_binding)
+        result.ticks[0].afrr_activation_revenue_eur = 42.0
+        result.ticks[0].cumulative_afrr_activation_revenue_eur = 42.0
+        return result
+
+    with patch("shared.bess_estimator.run_backtest") as mock_run_backtest:
+        mock_run_backtest.side_effect = lambda db_arg, zone, start, end, config: (
+            _result_with_activation(zone, config, cap_binding=False)
+        )
+        summaries = run_illustrative_backtests(db, ("DK2",), start_time=START, end_time=END)
+
+    assert all(s["total_afrr_activation_revenue_eur"] == 42.0 for s in summaries)

@@ -38,7 +38,15 @@
         <td><input type="number" step="any" id="arbitrage_z_threshold" name="arbitrage_z_threshold" value="{{ defaults.arbitrage_z_threshold }}" required></td></tr>
     <tr><td><label for="capacity_commit_mw">Capacity commit (MW)</label></td>
         <td><input type="number" step="any" id="capacity_commit_mw" name="capacity_commit_mw" value="{{ defaults.capacity_commit_mw }}" required></td></tr>
+    <tr><td><label for="afrr_activation_participation_rate">aFRR activation participation rate</label></td>
+        <td><input type="number" step="any" min="0" max="1" id="afrr_activation_participation_rate" name="afrr_activation_participation_rate" value="{{ defaults.afrr_activation_participation_rate }}" required></td></tr>
+    <tr><td><label for="include_fcr_d">Include FCR-D (DK2 only)</label></td>
+        <td><input type="checkbox" id="include_fcr_d" name="include_fcr_d" value="true"></td></tr>
   </table>
+  <p class="muted">
+    FCR-D (fast-disturbance reserve) only exists in DK2 -- checking this box for a DK1 run
+    will simply earn nothing on those legs (empty series, not an error).
+  </p>
   <p><button type="submit">Run backtest</button></p>
 </form>
 {% endblock %}

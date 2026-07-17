@@ -54,6 +54,13 @@ class SeriesConfig:
     # product.
     filter_field: str | None = None
     filter_value: str | None = None
+    # Additional record-level filters, all of which must match (AND'd
+    # together with `filter_field`/`filter_value` above), for datasets that
+    # need more than one categorical field to pin down a single product --
+    # e.g. `FcrNdDK2` (see below) needs both `ProductName` ("FCR-D
+    # ned"/"FCR-D upp"/"FCR-N") and `AuctionType` ("D-1 early"/"Total") to
+    # unambiguously select one series. Empty (default) for the common case.
+    extra_filters: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -243,14 +250,24 @@ DATASETS: list[DatasetConfig] = [
     ),
     # FcrNdDK2 packs three products (FCR-D ned/upp, FCR-N) and two auction
     # views (D-1 early / Total) into one shared `PriceTotalEUR` column,
-    # distinguished only by `ProductName`/`AuctionType` — hence the
-    # `filter_field`/`filter_value` on SeriesConfig. Only the "FCR-N"
-    # product's "Total" (final cleared) auction row is mapped: FCR-N is the
-    # Nordic normal-operation band, the closest DK2 analogue to DK1's single
-    # symmetric FCR price above; FCR-D (disturbance, split up/down) is a
-    # distinct product family left unmapped for now rather than guessing
-    # which of the three FCR-D/FCR-N series a generic BESS estimate should
-    # use.
+    # distinguished only by `ProductName`/`AuctionType` — hence
+    # `filter_field`/`filter_value` (ProductName) plus `extra_filters`
+    # (AuctionType) on each SeriesConfig below. All three products' "Total"
+    # (final cleared) auction row are mapped: FCR-N (the Nordic normal-
+    # operation band, DK2's analogue to DK1's single symmetric FCR price
+    # above) plus both FCR-D legs (disturbance reserve, split up/down --
+    # DK2/Nordic-only, no DK1 equivalent, read by
+    # `shared/bess_simulator.py`'s FCR-D-eligible capacity_markets). Both
+    # `AuctionType` values ("D-1 early" and "Total") actually occur live
+    # (confirmed 2026-07-17 via direct API query) -- every series here is
+    # constrained to "Total" so a D-1 early row never silently gets treated
+    # as the final cleared price.
+    #
+    # `market="FCR"` is kept for all three (not a separate "FCR_D" label):
+    # DK1's FCR is also `market="FCR"`, and shared/bess_simulator.py
+    # addresses capacity series by (market, product), so "FCR"/"up" and
+    # "FCR"/"down" (FCR-D legs) vs. "FCR"/"price" (FCR-N, matching DK1's
+    # single product name) are already unambiguous without a new label.
     DatasetConfig(
         name="fcr_dk2",
         dataset_id="FcrNdDK2",
@@ -263,6 +280,21 @@ DATASETS: list[DatasetConfig] = [
                 value_field="PriceTotalEUR",
                 filter_field="ProductName",
                 filter_value="FCR-N",
+                extra_filters={"AuctionType": "Total"},
+            ),
+            SeriesConfig(
+                product="down",
+                value_field="PriceTotalEUR",
+                filter_field="ProductName",
+                filter_value="FCR-D ned",
+                extra_filters={"AuctionType": "Total"},
+            ),
+            SeriesConfig(
+                product="up",
+                value_field="PriceTotalEUR",
+                filter_field="ProductName",
+                filter_value="FCR-D upp",
+                extra_filters={"AuctionType": "Total"},
             ),
         ],
         is_provisional=True,

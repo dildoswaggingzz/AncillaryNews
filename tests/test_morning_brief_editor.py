@@ -172,3 +172,45 @@ def test_render_for_email_escapes_untrusted_llm_output_in_html():
 def test_bess_jargon_glossary_covers_core_terms():
     assert "full cycle equivalent" in BESS_JARGON_GLOSSARY
     assert "cycle cap" in BESS_JARGON_GLOSSARY
+
+
+# --- aFRR activation EUR clause (never summed into the DKK figure) ---------
+
+
+def test_bess_line_includes_eur_clause_when_activation_revenue_nonzero():
+    estimates_with_activation = [
+        {**BESS_ESTIMATES[0], "total_afrr_activation_revenue_eur": 1234.0},
+        BESS_ESTIMATES[1],
+    ]
+    brief = compose_brief(BRIEF_DATE, PRICE_RECAP, FORECASTS, estimates_with_activation)
+
+    slack_text = render_for_slack(brief)
+    _subject, html_body, plaintext_body = render_for_email(brief)
+
+    for body in (slack_text, html_body, plaintext_body):
+        assert "1,234 EUR aFRR activation" in body
+
+
+def test_bess_line_omits_eur_clause_when_activation_revenue_zero():
+    estimates_without_activation = [
+        {**BESS_ESTIMATES[0], "total_afrr_activation_revenue_eur": 0.0},
+        BESS_ESTIMATES[1],
+    ]
+    brief = compose_brief(BRIEF_DATE, PRICE_RECAP, FORECASTS, estimates_without_activation)
+
+    slack_text = render_for_slack(brief)
+    _subject, html_body, plaintext_body = render_for_email(brief)
+
+    for body in (slack_text, html_body, plaintext_body):
+        assert "EUR aFRR activation" not in body
+
+
+def test_bess_line_omits_eur_clause_when_field_missing():
+    # Estimates predating this feature (or from a DK1 run with no
+    # aFRR_capacity commitment) may simply lack the key -- handled the same
+    # as an explicit 0.0, not a crash.
+    brief = compose_brief(BRIEF_DATE, PRICE_RECAP, FORECASTS, BESS_ESTIMATES)
+
+    slack_text = render_for_slack(brief)
+
+    assert "EUR aFRR activation" not in slack_text

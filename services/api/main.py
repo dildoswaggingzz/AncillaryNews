@@ -343,12 +343,24 @@ class BessBacktestRequest(BaseModel):
     arbitrage_z_threshold: float | None = None
     capacity_commit_mw: float | None = None
     max_cycles_per_day: float | None = None
+    afrr_activation_participation_rate: float | None = None
+    # e.g. [["FCR", "price"], ["FCR", "up"], ["FCR", "down"], ["aFRR_capacity", "up"]]
+    # to opt a DK2 run into FCR-D on top of the defaults -- unset falls back
+    # to BessConfig.capacity_markets' own default (FCR/aFRR_capacity only).
+    capacity_markets: list[tuple[str, str]] | None = None
 
 
 def _build_bess_config(overrides: dict) -> BessConfig:
     """Builds a BessConfig from a dict of possibly-None overrides, keeping BessConfig's own defaults
     for any field left unset (None)."""
     kwargs = {k: v for k, v in overrides.items() if v is not None}
+    # Pydantic deserializes capacity_markets as a list of tuples, but
+    # BessConfig (frozen) declares it as tuple[tuple[str,str],...] -- coerce
+    # the outer container too so a JSON-API-triggered BessConfig matches the
+    # type its own dataclass declares, not just its dashboard-form-triggered
+    # sibling (which already builds a tuple directly).
+    if "capacity_markets" in kwargs:
+        kwargs["capacity_markets"] = tuple(tuple(leg) for leg in kwargs["capacity_markets"])
     return BessConfig(**kwargs)
 
 
@@ -370,6 +382,7 @@ def _run_and_save_bess_backtest(
         "total_capacity_revenue_dkk": result.total_capacity_revenue_dkk,
         "total_revenue_dkk": result.total_revenue_dkk,
         "full_cycle_equivalents": result.full_cycle_equivalents,
+        "total_afrr_activation_revenue_eur": result.total_afrr_activation_revenue_eur,
     }
 
 
@@ -954,10 +967,19 @@ def dashboard_bess_trigger(
     arbitrage_lookback_periods: int = Form(...),
     arbitrage_z_threshold: float = Form(...),
     capacity_commit_mw: float = Form(...),
+    afrr_activation_participation_rate: float = Form(...),
+    # Checkbox rather than asking the user to type raw capacity_markets
+    # tuples -- translated into the two extra FCR-D legs server-side below.
+    # Meaningless for DK1 (no FCR-D market there); left to the user to pick
+    # a DK2 zone alongside it.
+    include_fcr_d: bool = Form(False),
     db: DatabaseManager = Depends(get_db),
 ):
     """Runs the submitted form through the same trigger logic the JSON API uses, then redirects to
     the new run's detail page."""
+    capacity_markets = [("FCR", "price"), ("aFRR_capacity", "up")]
+    if include_fcr_d:
+        capacity_markets += [("FCR", "up"), ("FCR", "down")]
     try:
         config = BessConfig(
             power_mw=power_mw,
@@ -969,6 +991,8 @@ def dashboard_bess_trigger(
             arbitrage_lookback_periods=arbitrage_lookback_periods,
             arbitrage_z_threshold=arbitrage_z_threshold,
             capacity_commit_mw=capacity_commit_mw,
+            afrr_activation_participation_rate=afrr_activation_participation_rate,
+            capacity_markets=tuple(capacity_markets),
         )
         summary = _run_and_save_bess_backtest(db, zone, start_time, end_time, config)
     except ValueError as e:

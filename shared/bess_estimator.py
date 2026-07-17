@@ -44,6 +44,29 @@ def _with_cycle_cap(config: BessConfig, max_cycles_per_day: float | None) -> Bes
     return replace(config, max_cycles_per_day=max_cycles_per_day)
 
 
+def _with_zone_capacity_markets(config: BessConfig, zone: str) -> BessConfig:
+    """
+    `BessConfig` is frozen -- build a copy with `capacity_markets` widened to
+    include the FCR-D up/down legs for DK2 (confirmed product decision: DK2
+    only, since DK1 has no FCR-D market -- see shared/datasets.py's fcr_dk2
+    entry). DK1 keeps `ILLUSTRATIVE_CONFIGS`' own default
+    (`(("FCR", "price"), ("aFRR_capacity", "up"))`) unchanged.
+    """
+    from dataclasses import replace
+
+    if zone != "DK2":
+        return config
+    return replace(
+        config,
+        capacity_markets=(
+            ("FCR", "price"),
+            ("FCR", "up"),
+            ("FCR", "down"),
+            ("aFRR_capacity", "up"),
+        ),
+    )
+
+
 def run_illustrative_backtests(
     db: DatabaseManager,
     zones: tuple[str, ...] = DEFAULT_ZONES,
@@ -60,7 +83,13 @@ def run_illustrative_backtests(
 
     `{config_label, zone, run_id, total_revenue_dkk,
     total_arbitrage_revenue_dkk, total_capacity_revenue_dkk,
-    full_cycle_equivalents, cycle_cap_was_binding}`
+    full_cycle_equivalents, cycle_cap_was_binding,
+    total_afrr_activation_revenue_eur}`
+
+    DK2 runs widen `capacity_markets` to include the FCR-D up/down legs on
+    top of the base config's FCR/aFRR_capacity pair (DK2-only, confirmed
+    product decision -- DK1 has no FCR-D market and keeps the base default
+    unchanged); see `_with_zone_capacity_markets`.
 
     `cycle_cap_was_binding` is `True` if the rolling-24h cycle cap
     (`BessTick.cycle_cap_binding`) was ever the limiting factor across the
@@ -77,8 +106,9 @@ def run_illustrative_backtests(
     """
     summaries = []
     for label, base_config in ILLUSTRATIVE_CONFIGS:
-        config = _with_cycle_cap(base_config, max_cycles_per_day)
+        config_with_cap = _with_cycle_cap(base_config, max_cycles_per_day)
         for zone in zones:
+            config = _with_zone_capacity_markets(config_with_cap, zone)
             result = run_backtest(db, zone, start_time, end_time, config)
             run_id = db.save_bess_run(result, label=MORNING_BRIEF_RUN_LABEL)
             summaries.append(
@@ -91,6 +121,7 @@ def run_illustrative_backtests(
                     "total_capacity_revenue_dkk": result.total_capacity_revenue_dkk,
                     "full_cycle_equivalents": result.full_cycle_equivalents,
                     "cycle_cap_was_binding": any(t.cycle_cap_binding for t in result.ticks),
+                    "total_afrr_activation_revenue_eur": result.total_afrr_activation_revenue_eur,
                 }
             )
     return summaries

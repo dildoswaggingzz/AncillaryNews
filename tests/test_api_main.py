@@ -361,6 +361,7 @@ BESS_RUN_ROW = {
     "full_cycle_equivalents": 0.75,
     "tick_count": 48,
     "created_at": "2026-07-17T09:00:00+00:00",
+    "total_afrr_activation_revenue_eur": 25.0,
 }
 
 BESS_TICK_ROW = {
@@ -373,7 +374,7 @@ BESS_TICK_ROW = {
     "arbitrage_revenue_dkk": 0.0,
     "capacity_reserved_mw": 0.3,
     "capacity_revenue_dkk": 15.0,
-    "capacity_revenue_by_market": {"FCR": 10.0, "aFRR_capacity": 5.0},
+    "capacity_revenue_by_market": {"FCR:price": 10.0, "aFRR_capacity:up": 5.0},
     "cumulative_arbitrage_revenue_dkk": 0.0,
     "cumulative_capacity_revenue_dkk": 15.0,
     "cumulative_total_revenue_dkk": 15.0,
@@ -529,6 +530,7 @@ def test_dashboard_bess_trigger_redirects_to_detail(client, db, monkeypatch):
             "arbitrage_lookback_periods": "30",
             "arbitrage_z_threshold": "0.5",
             "capacity_commit_mw": "0.3",
+            "afrr_activation_participation_rate": "0.3",
         },
         follow_redirects=False,
     )
@@ -553,6 +555,7 @@ def test_dashboard_bess_trigger_shows_error_on_invalid_config(client, db):
             "arbitrage_lookback_periods": "30",
             "arbitrage_z_threshold": "0.5",
             "capacity_commit_mw": "0.3",
+            "afrr_activation_participation_rate": "0.3",
         },
         follow_redirects=False,
     )
@@ -1357,6 +1360,89 @@ def test_trigger_bess_backtest_max_cycles_per_day_defaults_to_config_default(
 
     assert resp.status_code == 200
     assert captured_configs[0].max_cycles_per_day == 1.5  # BessConfig's own default, untouched
+
+
+# --- afrr_activation_participation_rate / capacity_markets passthrough -----
+# (shared/bess_simulator.py FCR-D + aFRR activation revenue additions)
+
+
+def test_trigger_bess_backtest_passes_afrr_activation_participation_rate_override(
+    client, db, monkeypatch
+):
+    captured_configs = []
+
+    def fake_run_backtest(db_arg, zone, start, end, config):
+        captured_configs.append(config)
+        return BacktestResult(zone=zone, start_time=start, end_time=end, config=config, ticks=[])
+
+    monkeypatch.setattr(api_main, "run_backtest", fake_run_backtest)
+    db.save_bess_run.return_value = 7
+
+    resp = client.post(
+        "/bess/backtest",
+        json={
+            "zone": "DK2",
+            "start_time": "2026-07-16T20:00:00Z",
+            "end_time": "2026-07-17T08:00:00Z",
+            "afrr_activation_participation_rate": 0.6,
+        },
+    )
+
+    assert resp.status_code == 200
+    assert captured_configs[0].afrr_activation_participation_rate == 0.6
+
+
+def test_trigger_bess_backtest_passes_capacity_markets_override(client, db, monkeypatch):
+    captured_configs = []
+
+    def fake_run_backtest(db_arg, zone, start, end, config):
+        captured_configs.append(config)
+        return BacktestResult(zone=zone, start_time=start, end_time=end, config=config, ticks=[])
+
+    monkeypatch.setattr(api_main, "run_backtest", fake_run_backtest)
+    db.save_bess_run.return_value = 7
+
+    resp = client.post(
+        "/bess/backtest",
+        json={
+            "zone": "DK2",
+            "start_time": "2026-07-16T20:00:00Z",
+            "end_time": "2026-07-17T08:00:00Z",
+            "capacity_markets": [["FCR", "price"], ["FCR", "up"], ["FCR", "down"]],
+        },
+    )
+
+    assert resp.status_code == 200
+    assert list(captured_configs[0].capacity_markets) == [
+        ("FCR", "price"),
+        ("FCR", "up"),
+        ("FCR", "down"),
+    ]
+
+
+def test_trigger_bess_backtest_response_includes_total_afrr_activation_revenue_eur(
+    client, db, monkeypatch
+):
+    monkeypatch.setattr(
+        api_main,
+        "run_backtest",
+        lambda db_arg, zone, start, end, config: BacktestResult(
+            zone=zone, start_time=start, end_time=end, config=config, ticks=[]
+        ),
+    )
+    db.save_bess_run.return_value = 42
+
+    resp = client.post(
+        "/bess/backtest",
+        json={
+            "zone": "DK1",
+            "start_time": "2026-07-16T20:00:00Z",
+            "end_time": "2026-07-17T08:00:00Z",
+        },
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["total_afrr_activation_revenue_eur"] == 0.0
 
 
 # --- Morning Brief (M5) JSON routes -----------------------------------------

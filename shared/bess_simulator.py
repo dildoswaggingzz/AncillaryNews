@@ -12,14 +12,23 @@ state-of-charge, the action taken, and cumulative revenue.
 
 **Battery participation constraint:** per the current market rules a BESS
 cannot participate in mFRR in these markets, so `mFRR_capacity` and
-`mFRR_EAM` are never read here. Eligible markets are FCR (`FCR`), aFRR
-capacity (`aFRR_capacity`), aFRR energy activation (`aFRR_energy`) — read but
-not used as a revenue stream in this v1 (see module docstring note below),
-day-ahead (`day_ahead`), and imbalance (`imbalance`).
+`mFRR_EAM` are never read here. Eligible markets are FCR (`FCR` — including
+DK2's FCR-D up/down legs, `product="up"`/`"down"`, alongside FCR-N/DK1's
+single `product="price"`), aFRR capacity (`aFRR_capacity`), aFRR energy
+activation (`aFRR_energy` — read and, since this module's aFRR-activation
+addition, turned into its own separately-reported EUR revenue stream; see §3
+below), day-ahead (`day_ahead`), and imbalance (`imbalance`).
 
-Two separate, deliberately simply-modeled revenue streams (README
-"Brainstorming" §: "clearly labelled as an estimate" — both streams here are
-estimates, not a real co-optimized dispatch):
+**Breaking change (capacity-market keys):** `BessTick.capacity_revenue_by_market`
+is keyed by `"{market}:{product}"` (e.g. `"FCR:price"`, `"FCR:up"`,
+`"FCR:down"`, `"aFRR_capacity:up"`), not bare `market`. This was fixed
+alongside adding FCR-D support: two `capacity_markets` entries sharing one
+`market` (e.g. `("FCR", "up")` and `("FCR", "down")`) would otherwise
+silently collide and overwrite each other in that dict.
+
+Three separate, deliberately simply-modeled revenue streams (README
+"Brainstorming" §: "clearly labelled as an estimate" — every stream here is
+an estimate, not a real co-optimized dispatch):
 
 1. **Energy arbitrage** — a rolling mean/stdev threshold on the day-ahead
    price (`shared/rule_engine.py`'s baseline pattern: trailing-window
@@ -30,10 +39,13 @@ estimates, not a real co-optimized dispatch):
    otherwise idle. Every action respects the battery's power limit, usable
    SoC band, and round-trip efficiency.
 
-2. **Capacity reservation revenue** — an *estimate*: each period, the
-   battery holds back `capacity_commit_mw` (split evenly across whichever
-   capacity markets are configured — FCR and aFRR capacity by default) from
-   the power otherwise available for arbitrage, and "earns"
+2. **Capacity reservation revenue** — an *estimate*: each period,
+   `capacity_commit_mw` is split evenly across the distinct *market groups*
+   configured in `capacity_markets` (e.g. `"FCR"` and `"aFRR_capacity"` by
+   default — see `BessConfig.capacity_markets`'s docstring for the two-level
+   group/leg split this implies once a group like `"FCR"` has more than one
+   leg, e.g. DK2's FCR-D up/down pair), held back from the power otherwise
+   available for arbitrage, and "earns"
    `procured_clearing_price * committed_mw * period_duration_hours` using
    the real ingested FCR/aFRR capacity price series for the requested zone.
    This is explicitly **not** a real co-optimized dispatch: it assumes the
@@ -43,20 +55,27 @@ estimates, not a real co-optimized dispatch):
    data) simply earns nothing for that market that period rather than
    guessing a value.
 
-aFRR *energy* activation (`aFRR_energy`) is ingested and eligible per the
-brief, but is deliberately not turned into its own revenue stream here: it
-requires knowing whether/how much the battery's capacity offer was actually
-*activated* (a volume the battery does not control and which isn't captured
-by a simple threshold rule), unlike the day-ahead-price-driven arbitrage
-strategy or the capacity-clears-at-the-published-price estimate above. A
-future iteration could layer aFRR energy revenue on top of the aFRR capacity
-commitment in the same "assume it clears" spirit as the capacity estimate.
+3. **aFRR energy activation revenue** — an *estimate*, reported separately in
+   **EUR** (never summed into the DKK totals above — the ingested
+   `aFRR_energy` dataset has no DKK field, and mixing currencies into one
+   number would be misleading). Real PICASSO activation data
+   (`aFRR_energy`/`activation_price`) is ingested but attributing
+   system-wide activation to one hypothetical asset requires an assumption
+   this module does not try to avoid: a flat configurable
+   `afrr_activation_participation_rate` (default 0.3) is assumed activated
+   out of whatever `aFRR_capacity` MW is committed that period, i.e.
+   `activation_price * committed_aFRR_capacity_mw * participation_rate *
+   period_duration_hours`. This is a directional simplification (real
+   activation volume varies continuously, isn't a flat share of the
+   capacity commitment, and this module does not read the system-wide
+   activation-*volume* signal at all), not a real dispatch — see
+   `BacktestResult.total_afrr_activation_revenue_eur`.
 """
 
 from __future__ import annotations
 
 import statistics
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -99,10 +118,28 @@ class BessConfig:
 
     # --- capacity reservation parameters ---
     # Total MW held back from arbitrage each period and offered across the
-    # capacity markets below (split evenly across however many are
-    # configured with an available price for that period).
+    # capacity markets below. Split in two levels, not evenly across every
+    # raw (market, product) tuple: first evenly across the distinct *market
+    # groups* present (the `market` half of each tuple, e.g. `"FCR"` vs.
+    # `"aFRR_capacity"`), then each group's share evenly across however many
+    # legs (products) that group has. This matters once a group has more
+    # than one leg -- e.g. DK2's FCR-D pair, `(("FCR", "up"), ("FCR",
+    # "down"))` -- since without the group-level split first, adding a
+    # second FCR-D leg would silently dilute every *other* market's share
+    # too (a real bug this two-level split fixes; see module docstring).
+    # Default stays the DK1-safe two-group pair below; FCR-D is opt-in per
+    # run (via extra `("FCR", "up")`/`("FCR", "down")` entries), never a new
+    # default, since it's meaningless for DK1 (no FCR-D market there).
     capacity_commit_mw: float = 0.3
     capacity_markets: tuple[tuple[str, str], ...] = (("FCR", "price"), ("aFRR_capacity", "up"))
+
+    # --- aFRR energy activation parameters ---
+    # Fraction of the committed aFRR_capacity MW assumed activated each
+    # period, driving the separately-reported EUR activation-revenue
+    # estimate (module docstring §3). Only meaningful when "aFRR_capacity"
+    # is one of `capacity_markets`' groups; otherwise activation revenue is
+    # always 0.
+    afrr_activation_participation_rate: float = 0.3
 
     # --- cycle cap ---
     # A contractual/warranty-style limit on how much the battery may
@@ -140,6 +177,8 @@ class BessConfig:
             raise ValueError(f"price market {self.price_market!r} is not eligible for BESS")
         if self.max_cycles_per_day is not None and self.max_cycles_per_day <= 0:
             raise ValueError("max_cycles_per_day must be positive (or None for unconstrained)")
+        if not 0 <= self.afrr_activation_participation_rate <= 1:
+            raise ValueError("afrr_activation_participation_rate must be in [0, 1]")
 
 
 @dataclass
@@ -161,6 +200,11 @@ class BessTick:
     cumulative_total_revenue_dkk: float
     # True when max_cycles_per_day (not power/SoC) capped this tick's discharge
     cycle_cap_binding: bool = False
+    # aFRR energy activation revenue (module docstring §3) -- reported in
+    # EUR, separately from every DKK field above; never summed into
+    # cumulative_total_revenue_dkk.
+    afrr_activation_revenue_eur: float = 0.0
+    cumulative_afrr_activation_revenue_eur: float = 0.0
 
 
 @dataclass
@@ -182,6 +226,17 @@ class BacktestResult:
     @property
     def total_revenue_dkk(self) -> float:
         return self.ticks[-1].cumulative_total_revenue_dkk if self.ticks else 0.0
+
+    @property
+    def total_afrr_activation_revenue_eur(self) -> float:
+        """
+        aFRR energy activation revenue (module docstring §3), in EUR.
+        Deliberately **not** included in `total_revenue_dkk` above -- the
+        ingested aFRR_energy dataset has no DKK field, and mixing EUR into a
+        DKK total would misstate it. Report and compare this figure
+        separately.
+        """
+        return self.ticks[-1].cumulative_afrr_activation_revenue_eur if self.ticks else 0.0
 
     @property
     def total_discharged_mwh(self) -> float:
@@ -286,11 +341,30 @@ def run_backtest(
         db, config.price_market, zone, config.price_product, start_time, end_time
     )
 
-    capacity_series_by_market: dict[str, list[tuple[datetime, float]]] = {}
+    # Two-level split: distinct market groups (the `market` half of each
+    # `capacity_markets` tuple) first, then each group's legs (products) --
+    # see BessConfig.capacity_markets' docstring for why (the commit-
+    # dilution bug this fixes).
+    legs_by_group: dict[str, list[tuple[str, str]]] = defaultdict(list)
     for market, product in config.capacity_markets:
-        capacity_series_by_market[market] = _fetch_series(
-            db, market, zone, product, start_time, end_time
-        )
+        legs_by_group[market].append((market, product))
+
+    capacity_series_by_leg: dict[str, list[tuple[datetime, float]]] = {}
+    for legs in legs_by_group.values():
+        for m, product in legs:
+            capacity_series_by_leg[f"{m}:{product}"] = _fetch_series(
+                db, m, zone, product, start_time, end_time
+            )
+
+    # aFRR energy activation price series -- fetched once per backtest, only
+    # if "aFRR_capacity" is actually a configured group (module docstring
+    # §3); otherwise activation revenue is always 0 and there's no reason to
+    # query it.
+    activation_price_series: list[tuple[datetime, float]] = (
+        _fetch_series(db, "aFRR_energy", zone, "activation_price", start_time, end_time)
+        if "aFRR_capacity" in legs_by_group
+        else []
+    )
 
     soc_min = config.soc_min_fraction * config.capacity_mwh
     soc_max = config.soc_max_fraction * config.capacity_mwh
@@ -302,11 +376,13 @@ def run_backtest(
     # not something Energinet or a datasheet hands us.
     leg_efficiency = config.round_trip_efficiency**0.5
 
-    n_capacity_markets = len(config.capacity_markets)
+    n_groups = len(legs_by_group)
+    commit_per_group = config.capacity_commit_mw / n_groups if n_groups else 0.0
     arbitrage_power_mw = max(config.power_mw - config.capacity_commit_mw, 0.0)
 
     cumulative_arbitrage = 0.0
     cumulative_capacity = 0.0
+    cumulative_afrr_activation = 0.0
     ticks: list[BessTick] = []
     history: list[float] = []
 
@@ -337,18 +413,39 @@ def run_backtest(
         # --- capacity reservation (independent of the arbitrage decision) ---
         capacity_revenue_by_market: dict[str, float] = {}
         capacity_reserved_mw = 0.0
-        if n_capacity_markets:
-            commit_per_market = config.capacity_commit_mw / n_capacity_markets
-            for market, series in capacity_series_by_market.items():
-                clearing_price = _value_at_or_before(series, t)
-                if clearing_price is None:
-                    capacity_revenue_by_market[market] = 0.0
-                    continue
-                revenue = clearing_price * commit_per_market * dt_hours
-                capacity_revenue_by_market[market] = revenue
-                capacity_reserved_mw += commit_per_market
+        commit_per_group_this_tick: dict[str, float] = {}
+        if n_groups:
+            for market, legs in legs_by_group.items():
+                commit_per_leg = commit_per_group / len(legs)
+                commit_per_group_this_tick[market] = commit_per_group
+                for m, product in legs:
+                    key = f"{m}:{product}"
+                    series = capacity_series_by_leg[key]
+                    clearing_price = _value_at_or_before(series, t)
+                    if clearing_price is None:
+                        capacity_revenue_by_market[key] = 0.0
+                        continue
+                    revenue = clearing_price * commit_per_leg * dt_hours
+                    capacity_revenue_by_market[key] = revenue
+                    capacity_reserved_mw += commit_per_leg
         capacity_revenue = sum(capacity_revenue_by_market.values())
         cumulative_capacity += capacity_revenue
+
+        # --- aFRR energy activation revenue (module docstring §3, always EUR,
+        # never mixed into the DKK capacity_revenue above) ---
+        afrr_committed_mw = commit_per_group_this_tick.get("aFRR_capacity", 0.0)
+        activation_price = (
+            _value_at_or_before(activation_price_series, t) if afrr_committed_mw else None
+        )
+        afrr_activation_revenue = (
+            activation_price
+            * afrr_committed_mw
+            * config.afrr_activation_participation_rate
+            * dt_hours
+            if activation_price is not None
+            else 0.0
+        )
+        cumulative_afrr_activation += afrr_activation_revenue
 
         # --- arbitrage decision (causal: baseline excludes the current price) ---
         z = _causal_zscore(history, price)
@@ -411,6 +508,8 @@ def run_backtest(
                 cumulative_capacity_revenue_dkk=cumulative_capacity,
                 cumulative_total_revenue_dkk=cumulative_arbitrage + cumulative_capacity,
                 cycle_cap_binding=cycle_cap_binding,
+                afrr_activation_revenue_eur=afrr_activation_revenue,
+                cumulative_afrr_activation_revenue_eur=cumulative_afrr_activation,
             )
         )
 
