@@ -342,6 +342,7 @@ class BessBacktestRequest(BaseModel):
     arbitrage_lookback_periods: int | None = None
     arbitrage_z_threshold: float | None = None
     capacity_commit_mw: float | None = None
+    max_cycles_per_day: float | None = None
 
 
 def _build_bess_config(overrides: dict) -> BessConfig:
@@ -412,6 +413,52 @@ def get_bess_run(run_id: int, include_ticks: bool = False, db: DatabaseManager =
     if include_ticks:
         row = {**row, "ticks": db.fetch_bess_ticks(run_id)}
     return row
+
+
+# --- Morning Brief (M5) ----------------------------------------------------
+#
+# Read surface + on-demand trigger over the Morning Brief pipeline
+# (shared/morning_brief_editor.py, services/orchestrator/main.py:
+# run_morning_brief, init-db/05-morning-briefs.sql). Like the BESS backtest
+# routes above, there's no scheduled job *here* -- the automatic daily cron
+# trigger lives on the orchestrator service (MORNING_BRIEF_AUTO_RUN_ENABLED);
+# this API service only ever reads persisted briefs and exposes the same
+# on-demand run-now escape hatch as /orchestrator/run-now.
+
+
+@app.get("/morning-briefs", dependencies=[Depends(require_api_key)])
+def list_morning_briefs(
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: DatabaseManager = Depends(get_db),
+):
+    """Persisted Morning Briefs, most-recent-brief_date-first."""
+    rows = db.fetch_morning_briefs(limit=limit, offset=offset)
+    return {"count": len(rows), "limit": limit, "offset": offset, "briefs": rows}
+
+
+@app.get("/morning-briefs/{brief_id}", dependencies=[Depends(require_api_key)])
+def get_morning_brief(brief_id: int, db: DatabaseManager = Depends(get_db)):
+    """Single Morning Brief by id; 404 if unknown."""
+    row = db.fetch_morning_brief(brief_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Morning brief {brief_id} not found")
+    return row
+
+
+@app.post("/morning-briefs/run-now", dependencies=[Depends(require_api_key)])
+async def trigger_morning_brief_run_now(orchestrator_main=Depends(get_orchestrator_main)):
+    """
+    Fires one real Morning Brief run right now: price recap -> forecasts ->
+    illustrative BESS estimates -> compose -> persist -> Slack + email
+    delivery, independent of `MORNING_BRIEF_AUTO_RUN_ENABLED` -- mirrors
+    `trigger_orchestrator_run_now`'s exact on-demand-escape-hatch pattern
+    (calls `orchestrator_main.run_morning_brief()` directly, bypassing the
+    gate). Costs one Claude Opus call per forecast horizon actually
+    refreshed (usually a cache-hit for most horizons) plus the price-recap
+    call. Returns `run_morning_brief`'s own summary dict.
+    """
+    return await orchestrator_main.run_morning_brief()
 
 
 # --- manual article submission (LinkedIn paste-in tool) -------------------
@@ -645,6 +692,7 @@ def dashboard_home(request: Request, db: DatabaseManager = Depends(get_db)):
             "orchestrator_result": None,
             "crawler_result": None,
             "backfill_result": None,
+            "morning_brief_result": None,
         },
     )
 
@@ -677,6 +725,7 @@ async def dashboard_trigger_orchestrator_run_now(
             "orchestrator_result": result,
             "crawler_result": None,
             "backfill_result": None,
+            "morning_brief_result": None,
         },
     )
 
@@ -699,6 +748,7 @@ async def dashboard_trigger_crawler_run_now(
             "orchestrator_result": None,
             "crawler_result": result,
             "backfill_result": None,
+            "morning_brief_result": None,
         },
     )
 
@@ -737,6 +787,7 @@ async def dashboard_trigger_backfill(
             "orchestrator_result": None,
             "crawler_result": None,
             "backfill_result": result,
+            "morning_brief_result": None,
         },
     )
 
@@ -936,3 +987,57 @@ def dashboard_bess_detail(request: Request, run_id: int, db: DatabaseManager = D
         raise HTTPException(status_code=404, detail=f"BESS run {run_id} not found")
     ticks = db.fetch_bess_ticks(run_id)
     return templates.TemplateResponse(request, "bess_detail.html", {"run": run, "ticks": ticks})
+
+
+# --- Morning Brief dashboard -------------------------------------------------
+
+
+@app.get("/dashboard/morning-briefs", response_class=HTMLResponse)
+def dashboard_morning_briefs_list(request: Request, db: DatabaseManager = Depends(get_db)):
+    """Lists recent Morning Briefs, linking to each one's detail page (mirrors
+    `dashboard_bess_list` above)."""
+    briefs = db.fetch_morning_briefs(limit=25)
+    return templates.TemplateResponse(request, "morning_briefs_list.html", {"briefs": briefs})
+
+
+@app.get("/dashboard/morning-briefs/{brief_id}", response_class=HTMLResponse)
+def dashboard_morning_brief_detail(
+    request: Request, brief_id: int, db: DatabaseManager = Depends(get_db)
+):
+    """Full detail for one Morning Brief: price recap, three forecast cards with
+    confidence badges, BESS estimate cards linking to `/dashboard/bess/{run_id}`,
+    and delivery status."""
+    row = db.fetch_morning_brief(brief_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Morning brief {brief_id} not found")
+    return templates.TemplateResponse(request, "morning_brief_detail.html", {"row": row})
+
+
+@app.post("/dashboard/morning-briefs/run-now", response_class=HTMLResponse)
+async def dashboard_trigger_morning_brief_run_now(
+    request: Request,
+    db: DatabaseManager = Depends(get_db),
+    orchestrator_main=Depends(get_orchestrator_main),
+):
+    """
+    Dashboard counterpart to `POST /morning-briefs/run-now` -- same
+    synchronous trigger-and-show-result flow as
+    `dashboard_trigger_orchestrator_run_now` (see that route's docstring for
+    the full rationale). Redirects straight to the new brief's detail page
+    on success, same UX as `dashboard_bess_trigger`.
+    """
+    result = await orchestrator_main.run_morning_brief()
+    if result.get("brief_id") is not None:
+        return RedirectResponse(f"/dashboard/morning-briefs/{result['brief_id']}", status_code=303)
+    reports = db.fetch_event_reports(limit=25, offset=0)
+    return templates.TemplateResponse(
+        request,
+        "index.html",
+        {
+            "reports": reports,
+            "orchestrator_result": None,
+            "crawler_result": None,
+            "backfill_result": None,
+            "morning_brief_result": result,
+        },
+    )

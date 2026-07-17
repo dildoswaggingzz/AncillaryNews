@@ -1305,3 +1305,229 @@ def test_dashboard_series_detail_with_no_data(client, db):
 
     assert resp.status_code == 200
     assert "No data for this series yet." in resp.text
+
+
+# --- max_cycles_per_day passthrough (shared/bess_simulator.py cycle cap) ----
+
+
+def test_trigger_bess_backtest_passes_max_cycles_per_day_override(client, db, monkeypatch):
+    captured_configs = []
+
+    def fake_run_backtest(db_arg, zone, start, end, config):
+        captured_configs.append(config)
+        return BacktestResult(zone=zone, start_time=start, end_time=end, config=config, ticks=[])
+
+    monkeypatch.setattr(api_main, "run_backtest", fake_run_backtest)
+    db.save_bess_run.return_value = 7
+
+    resp = client.post(
+        "/bess/backtest",
+        json={
+            "zone": "DK1",
+            "start_time": "2026-07-16T20:00:00Z",
+            "end_time": "2026-07-17T08:00:00Z",
+            "max_cycles_per_day": 2.5,
+        },
+    )
+
+    assert resp.status_code == 200
+    assert captured_configs[0].max_cycles_per_day == 2.5
+
+
+def test_trigger_bess_backtest_max_cycles_per_day_defaults_to_config_default(
+    client, db, monkeypatch
+):
+    captured_configs = []
+
+    def fake_run_backtest(db_arg, zone, start, end, config):
+        captured_configs.append(config)
+        return BacktestResult(zone=zone, start_time=start, end_time=end, config=config, ticks=[])
+
+    monkeypatch.setattr(api_main, "run_backtest", fake_run_backtest)
+    db.save_bess_run.return_value = 7
+
+    resp = client.post(
+        "/bess/backtest",
+        json={
+            "zone": "DK1",
+            "start_time": "2026-07-16T20:00:00Z",
+            "end_time": "2026-07-17T08:00:00Z",
+        },
+    )
+
+    assert resp.status_code == 200
+    assert captured_configs[0].max_cycles_per_day == 1.5  # BessConfig's own default, untouched
+
+
+# --- Morning Brief (M5) JSON routes -----------------------------------------
+
+MORNING_BRIEF_ROW = {
+    "id": 1,
+    "brief_date": "2026-07-17",
+    "published_at": datetime(2026, 7, 17, 7, 0, tzinfo=UTC),
+    "price_recap": {"headline": "Prices were mild", "zone_summaries": [], "causal_factors": []},
+    "forecast_month_id": 10,
+    "forecast_quarter_id": 11,
+    "forecast_year_id": 12,
+    "bess_estimates": [
+        {
+            "config_label": "Small commercial (1 MW / 2 MWh)",
+            "zone": "DK1",
+            "run_id": 99,
+            "total_revenue_dkk": 1234.5,
+            "full_cycle_equivalents": 12.0,
+            "cycle_cap_was_binding": True,
+        }
+    ],
+    "brief": {
+        "brief_date": "2026-07-17",
+        "headline": "Prices were mild",
+        "zone_summaries": [],
+        "causal_factors": [],
+        "forecasts": {"month": None, "quarter": None, "year": None},
+        "bess_estimates": [],
+        "jargon_glossary": {},
+    },
+    "slack_sent": True,
+    "email_sent": False,
+}
+
+
+def test_list_morning_briefs(client, db):
+    db.fetch_morning_briefs.return_value = [MORNING_BRIEF_ROW]
+
+    resp = client.get("/morning-briefs")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["count"] == 1
+    assert body["briefs"][0]["id"] == 1
+
+
+def test_get_morning_brief_found(client, db):
+    db.fetch_morning_brief.return_value = MORNING_BRIEF_ROW
+
+    resp = client.get("/morning-briefs/1")
+
+    assert resp.status_code == 200
+    assert resp.json()["id"] == 1
+
+
+def test_get_morning_brief_not_found(client, db):
+    db.fetch_morning_brief.return_value = None
+
+    resp = client.get("/morning-briefs/999")
+
+    assert resp.status_code == 404
+
+
+def test_morning_brief_routes_gated_by_api_key(client, db, monkeypatch):
+    monkeypatch.setenv("API_KEY", "s3cret")
+    db.fetch_morning_briefs.return_value = []
+
+    resp = client.get("/morning-briefs")
+
+    assert resp.status_code == 401
+
+
+@pytest.fixture
+def morning_brief_orchestrator_mock():
+    module = MagicMock()
+    module.run_morning_brief = AsyncMock(
+        return_value={
+            "brief_date": "2026-07-17",
+            "brief_id": 1,
+            "slack_sent": True,
+            "email_sent": False,
+            "bess_estimates_count": 4,
+        }
+    )
+    return module
+
+
+def test_trigger_morning_brief_run_now_calls_real_pipeline(
+    client, monkeypatch, morning_brief_orchestrator_mock
+):
+    monkeypatch.delenv("API_KEY", raising=False)
+    api_main.app.dependency_overrides[api_main.get_orchestrator_main] = lambda: (
+        morning_brief_orchestrator_mock
+    )
+    try:
+        resp = client.post("/morning-briefs/run-now")
+    finally:
+        del api_main.app.dependency_overrides[api_main.get_orchestrator_main]
+
+    assert resp.status_code == 200
+    assert resp.json()["brief_id"] == 1
+    morning_brief_orchestrator_mock.run_morning_brief.assert_awaited_once()
+
+
+def test_trigger_morning_brief_run_now_gated_by_api_key(
+    client, monkeypatch, morning_brief_orchestrator_mock
+):
+    monkeypatch.setenv("API_KEY", "s3cret")
+    api_main.app.dependency_overrides[api_main.get_orchestrator_main] = lambda: (
+        morning_brief_orchestrator_mock
+    )
+    try:
+        resp = client.post("/morning-briefs/run-now")
+    finally:
+        del api_main.app.dependency_overrides[api_main.get_orchestrator_main]
+
+    assert resp.status_code == 401
+    morning_brief_orchestrator_mock.run_morning_brief.assert_not_awaited()
+
+
+# --- Morning Brief dashboard --------------------------------------------------
+
+
+def test_dashboard_morning_briefs_list(client, db):
+    db.fetch_morning_briefs.return_value = [MORNING_BRIEF_ROW]
+
+    resp = client.get("/dashboard/morning-briefs")
+
+    assert resp.status_code == 200
+    assert "/dashboard/morning-briefs/1" in resp.text
+
+
+def test_dashboard_morning_brief_detail_found(client, db):
+    db.fetch_morning_brief.return_value = MORNING_BRIEF_ROW
+
+    resp = client.get("/dashboard/morning-briefs/1")
+
+    assert resp.status_code == 200
+    assert "Prices were mild" in resp.text
+
+
+def test_dashboard_morning_brief_detail_not_found(client, db):
+    db.fetch_morning_brief.return_value = None
+
+    resp = client.get("/dashboard/morning-briefs/999")
+
+    assert resp.status_code == 404
+
+
+def test_dashboard_trigger_morning_brief_run_now_redirects_to_detail(
+    client, db, monkeypatch, morning_brief_orchestrator_mock
+):
+    monkeypatch.delenv("API_KEY", raising=False)
+    api_main.app.dependency_overrides[api_main.get_orchestrator_main] = lambda: (
+        morning_brief_orchestrator_mock
+    )
+    try:
+        resp = client.post("/dashboard/morning-briefs/run-now", follow_redirects=False)
+    finally:
+        del api_main.app.dependency_overrides[api_main.get_orchestrator_main]
+
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/dashboard/morning-briefs/1"
+    morning_brief_orchestrator_mock.run_morning_brief.assert_awaited_once()
+
+
+def test_dashboard_home_shows_morning_brief_run_now_button(client, db):
+    db.fetch_event_reports.return_value = []
+
+    resp = client.get("/")
+
+    assert resp.status_code == 200
+    assert "/dashboard/morning-briefs/run-now" in resp.text

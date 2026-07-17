@@ -294,3 +294,120 @@ def test_mfrr_markets_never_queried():
     queried_markets = {call.args[0] for call in db.fetch_series_values.call_args_list}
     assert "mFRR_capacity" not in queried_markets
     assert "mFRR_EAM" not in queried_markets
+
+
+# --- max_cycles_per_day cycle cap -----------------------------------------------
+#
+# These tests force every tick to *want* to discharge, by monkeypatching
+# `_causal_zscore` to always return a large positive value -- this isolates
+# the cycle-cap enforcement mechanism itself (the thing under test) from the
+# arbitrage strategy's z-score baseline dynamics (already covered by the
+# tests above), which would otherwise make a long run of identical/near-
+# identical high prices eventually collapse to zero variance (z=None,
+# action=idle) purely as an artifact of the rolling lookback window, not
+# anything to do with the cycle cap.
+
+
+def test_max_cycles_per_day_rejects_non_positive():
+    with pytest.raises(ValueError, match="max_cycles_per_day"):
+        BessConfig(max_cycles_per_day=0)
+    with pytest.raises(ValueError, match="max_cycles_per_day"):
+        BessConfig(max_cycles_per_day=-1.0)
+
+
+def test_max_cycles_per_day_none_is_unconstrained():
+    BessConfig(max_cycles_per_day=None)  # must not raise
+
+
+def _force_always_discharge(monkeypatch):
+    """Forces `_causal_zscore` to always return a large positive value, so
+    the arbitrage strategy always attempts a discharge regardless of the
+    actual price series content."""
+    monkeypatch.setattr("shared.bess_simulator._causal_zscore", lambda history, current: 10.0)
+
+
+def test_cycle_cap_not_binding_when_max_cycles_per_day_is_none(monkeypatch):
+    _force_always_discharge(monkeypatch)
+    rows = _price_rows([100.0] * 30)
+    db = _db_with_series(rows)
+    config = BessConfig(
+        power_mw=10.0,
+        capacity_mwh=100000.0,  # SoC never remotely close to limiting
+        capacity_commit_mw=0.0,
+        capacity_markets=(),
+        max_cycles_per_day=None,
+        soc_min_fraction=0.0,
+        soc_max_fraction=1.0,
+        starting_soc_fraction=1.0,
+    )
+
+    result = run_backtest(db, "DK1", BASE_TIME, BASE_TIME + timedelta(hours=30), config)
+
+    assert all(t.action == "discharge" for t in result.ticks)
+    assert not any(t.cycle_cap_binding for t in result.ticks)
+
+
+def test_cycle_cap_binds_when_repeated_discharges_exceed_it(monkeypatch):
+    _force_always_discharge(monkeypatch)
+    rows = _price_rows([100.0] * 10)
+    db = _db_with_series(rows)
+    max_cycles_per_day = 0.5  # 100000 * 0.5 = 50,000 MWh cap per rolling 24h
+    config = BessConfig(
+        power_mw=10000.0,  # each tick alone could exceed the cap
+        capacity_mwh=100000.0,
+        capacity_commit_mw=0.0,
+        capacity_markets=(),
+        max_cycles_per_day=max_cycles_per_day,
+        soc_min_fraction=0.0,
+        soc_max_fraction=1.0,
+        starting_soc_fraction=1.0,
+    )
+    cap_mwh = config.capacity_mwh * max_cycles_per_day
+
+    result = run_backtest(db, "DK1", BASE_TIME, BASE_TIME + timedelta(hours=10), config)
+
+    assert any(t.cycle_cap_binding for t in result.ticks)
+    # The rolling 24h window here spans the entire (10-tick) run, so total
+    # discharge across the whole run must never exceed the cap.
+    assert result.total_discharged_mwh <= cap_mwh + 1e-6
+
+
+def test_cycle_cap_is_a_rolling_24h_window_not_a_calendar_day_reset(monkeypatch):
+    _force_always_discharge(monkeypatch)
+    # 27 hourly ticks: enough to fill the cap on tick 0, stay fully capped
+    # through tick 23 (< 24h since tick 0), and free back up once tick 0's
+    # discharge ages out of the rolling 24h window.
+    rows = _price_rows([100.0] * 27)
+    db = _db_with_series(rows)
+    max_cycles_per_day = 0.05  # 100000 * 0.05 = 5,000 MWh cap per rolling 24h
+    config = BessConfig(
+        power_mw=10000.0,  # one tick's max discharge (10,000 MWh) exceeds the 5,000 MWh cap
+        capacity_mwh=100000.0,  # SoC never remotely close to limiting
+        capacity_commit_mw=0.0,
+        capacity_markets=(),
+        max_cycles_per_day=max_cycles_per_day,
+        soc_min_fraction=0.0,
+        soc_max_fraction=1.0,
+        starting_soc_fraction=1.0,
+    )
+    cap_mwh = config.capacity_mwh * max_cycles_per_day
+
+    result = run_backtest(db, "DK1", BASE_TIME, BASE_TIME + timedelta(hours=27), config)
+
+    first_tick = result.ticks[0]
+    assert first_tick.energy_discharged_mwh == pytest.approx(cap_mwh)
+    assert first_tick.cycle_cap_binding is True  # attempted far more than the cap allowed
+
+    # Every tick strictly less than 24h after the first discharge is fully
+    # capped to zero -- the whole cap was already consumed by tick 0, and a
+    # calendar-day reset would incorrectly free it up at the next midnight
+    # (well before the 24h mark) instead.
+    within_24h = [t for t in result.ticks[1:] if t.time < first_tick.time + timedelta(hours=24)]
+    assert within_24h  # sanity: the window actually covers >1 subsequent tick
+    assert all(t.energy_discharged_mwh == pytest.approx(0.0, abs=1e-9) for t in within_24h)
+
+    # Once a tick is >= 24h after the first discharge, that first discharge
+    # has aged out of the rolling window and the cap is available again.
+    at_or_after_24h = [t for t in result.ticks if t.time >= first_tick.time + timedelta(hours=24)]
+    assert at_or_after_24h  # sanity: the run extends past the 24h mark
+    assert any(t.energy_discharged_mwh > 0 for t in at_or_after_24h)

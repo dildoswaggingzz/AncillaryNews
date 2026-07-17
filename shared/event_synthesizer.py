@@ -170,7 +170,7 @@ def _known_numbers(trigger: Trigger, context_window: list[dict]) -> list[float]:
     return known
 
 
-def _extract_numbers(text: str) -> list[float]:
+def extract_numbers(text: str) -> list[float]:
     numbers = []
     for match in _NUMBER_RE.findall(text or ""):
         try:
@@ -180,7 +180,7 @@ def _extract_numbers(text: str) -> list[float]:
     return numbers
 
 
-def _number_is_traceable(number: float, known_numbers: list[float]) -> bool:
+def number_is_traceable(number: float, known_numbers: list[float]) -> bool:
     for k in known_numbers:
         tolerance = max(NUMBER_MATCH_ABS_TOLERANCE, NUMBER_MATCH_REL_TOLERANCE * abs(k))
         if abs(number - k) <= tolerance:
@@ -212,8 +212,8 @@ def _validate_report(report: dict, trigger: Trigger, context_window: list[dict])
     for i, correlate in enumerate(hard_data_correlates):
         if not isinstance(correlate, dict) or not correlate.get("source"):
             return f"hard_data_correlates[{i}] is missing a source"
-        for number in _extract_numbers(correlate.get("value", "")):
-            if not _number_is_traceable(number, known_numbers):
+        for number in extract_numbers(correlate.get("value", "")):
+            if not number_is_traceable(number, known_numbers):
                 return (
                     f"hard_data_correlates[{i}] cites number {number} not traceable to the "
                     "pulled context window"

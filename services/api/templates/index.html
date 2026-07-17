@@ -31,6 +31,29 @@
 </div>
 
 <div class="card">
+  <h3>Morning Brief</h3>
+  <p class="muted">
+    The Morning Brief pipeline (recap of yesterday's prices, month/quarter/year forecasts, and
+    illustrative BESS earnings estimates, delivered to Slack and email) defaults to
+    <code>MORNING_BRIEF_AUTO_RUN_ENABLED=false</code> -- a scheduled 07:00 Europe/Copenhagen run is
+    opt-in. Use this button to fire one real run right now regardless of that setting. Costs a
+    handful of Claude Opus calls (recap + any stale forecast horizons).
+  </p>
+  <form method="post" action="/dashboard/morning-briefs/run-now" style="display:inline;">
+    <button type="submit">Run morning brief now</button>
+  </form>
+  <p><a href="/dashboard/morning-briefs">View past Morning Briefs &rarr;</a></p>
+
+  {% if morning_brief_result is not none %}
+  <p><strong>Morning brief run result:</strong>
+    brief_date={{ morning_brief_result.brief_date }},
+    slack_sent={{ morning_brief_result.slack_sent }},
+    email_sent={{ morning_brief_result.email_sent }},
+    {{ morning_brief_result.bess_estimates_count }} BESS estimate(s).</p>
+  {% endif %}
+</div>
+
+<div class="card">
   <h3>Historical backfill</h3>
   <p class="muted">
     The ingestor's scheduled poller only ever fetches the most recent handful of records per

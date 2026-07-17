@@ -98,6 +98,36 @@ async def send_event_report_alert(report: dict) -> bool:
     return True
 
 
+async def send_morning_brief_alert(brief_text: str) -> bool:
+    """
+    Posts one already-rendered Morning Brief (M5,
+    `shared.morning_brief_editor.render_for_slack`) to the same Slack
+    webhook as the other two senders. Doesn't reuse `send_event_report_alert`'s
+    dict-shaped payload -- a brief's `text` is already the fully rendered
+    `mrkdwn` a Slack reader wants, so the payload here is simpler: just the
+    text plus a `message_type` discriminator, no separate structured
+    sub-object the way an Event Report's `report` dict is attached.
+
+    Same missing-webhook precedent as the other two senders: logs a warning
+    and returns `False` rather than raising.
+    """
+    webhook_url = os.getenv("SLACK_WEBHOOK_URL")
+    if not webhook_url:
+        logger.warning("SLACK_WEBHOOK_URL not set; skipping Slack alert for the Morning Brief")
+        return False
+
+    payload = {"text": brief_text, "message_type": "morning_brief"}
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            response = await client.post(webhook_url, json=payload)
+            response.raise_for_status()
+        except httpx.HTTPError:
+            logger.exception("Failed to send Slack alert for the Morning Brief")
+            return False
+
+    return True
+
+
 def _format_event_report_summary(report: dict) -> str:
     """
     Renders a synthesized Event Report (README §2) as a readable Slack

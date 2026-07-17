@@ -470,3 +470,210 @@ def test_metrics_are_registered_and_exposition_includes_expected_names():
     assert "rule_engine_trigger_fired_total" in output
     assert "orchestrator_llm_calls_total" in output
     assert "orchestrator_citation_rejected_total" in output
+
+
+# --- Morning Brief (M5) --------------------------------------------------------
+
+
+def _morning_brief_patches(
+    price_recap_result=None,
+    forecast_result=None,
+    bess_result=None,
+    brief_id=1,
+    slack_sent=True,
+    email_sent=True,
+    price_recap_raises=False,
+    forecast_raises=False,
+    bess_raises=False,
+    save_raises=False,
+):
+    price_recap_result = price_recap_result or {
+        "headline": "Prices were mild.",
+        "zone_summaries": ["DK1: ..."],
+        "causal_factors": [],
+        "jargon_glossary": {},
+    }
+    forecast_result = forecast_result or {
+        "id": 10,
+        "forecast": {"narrative": "flat", "confidence": "medium", "swing_factors": ["wind"]},
+    }
+    bess_result = bess_result if bess_result is not None else [
+        {"config_label": "Small", "zone": "DK1", "run_id": 1, "cycle_cap_was_binding": False}
+    ]
+
+    mock_db = MagicMock()
+    mock_db.save_morning_brief.return_value = brief_id
+    if save_raises:
+        mock_db.save_morning_brief.side_effect = RuntimeError("db down")
+
+    price_recap_mock = AsyncMock(
+        side_effect=RuntimeError("recap failed") if price_recap_raises else None,
+        return_value=price_recap_result,
+    )
+    forecast_mock = AsyncMock(
+        side_effect=RuntimeError("forecast failed") if forecast_raises else None,
+        return_value=forecast_result,
+    )
+
+    return {
+        "DatabaseManager": patch.object(orchestrator_main, "DatabaseManager", return_value=mock_db),
+        "synthesize_price_recap": patch.object(
+            orchestrator_main, "synthesize_price_recap", price_recap_mock
+        ),
+        "get_or_refresh_forecast": patch.object(
+            orchestrator_main, "get_or_refresh_forecast", forecast_mock
+        ),
+        "run_illustrative_backtests": patch.object(
+            orchestrator_main,
+            "run_illustrative_backtests",
+            MagicMock(
+                side_effect=RuntimeError("bess failed") if bess_raises else None,
+                return_value=bess_result,
+            ),
+        ),
+        "send_morning_brief_alert": patch.object(
+            orchestrator_main, "send_morning_brief_alert", AsyncMock(return_value=slack_sent)
+        ),
+        "send_morning_brief_email": patch.object(
+            orchestrator_main, "send_morning_brief_email", AsyncMock(return_value=email_sent)
+        ),
+    }, mock_db
+
+
+async def test_run_morning_brief_happy_path():
+    patches, mock_db = _morning_brief_patches()
+
+    with (
+        patches["DatabaseManager"],
+        patches["synthesize_price_recap"],
+        patches["get_or_refresh_forecast"],
+        patches["run_illustrative_backtests"],
+        patches["send_morning_brief_alert"],
+        patches["send_morning_brief_email"],
+    ):
+        result = await orchestrator_main.run_morning_brief()
+
+    assert result["brief_id"] == 1
+    assert result["slack_sent"] is True
+    assert result["email_sent"] is True
+    assert result["bess_estimates_count"] == 1
+    mock_db.save_morning_brief.assert_called_once()
+    mock_db.mark_morning_brief_delivery.assert_called_once_with(1, slack_sent=True, email_sent=True)
+    mock_db.close.assert_called_once()
+
+
+async def test_run_morning_brief_recap_failure_does_not_block_forecasts_or_bess():
+    patches, mock_db = _morning_brief_patches(price_recap_raises=True)
+
+    with (
+        patches["DatabaseManager"],
+        patches["synthesize_price_recap"],
+        patches["get_or_refresh_forecast"],
+        patches["run_illustrative_backtests"],
+        patches["send_morning_brief_alert"],
+        patches["send_morning_brief_email"],
+    ):
+        result = await orchestrator_main.run_morning_brief()
+
+    # Forecasts/BESS/persistence/delivery still all happened despite the
+    # recap failing.
+    assert result["brief_id"] == 1
+    assert result["bess_estimates_count"] == 1
+    mock_db.save_morning_brief.assert_called_once()
+
+
+async def test_run_morning_brief_slack_failure_does_not_block_email():
+    patches, mock_db = _morning_brief_patches()
+    patches["send_morning_brief_alert"] = patch.object(
+        orchestrator_main,
+        "send_morning_brief_alert",
+        AsyncMock(side_effect=RuntimeError("slack down")),
+    )
+
+    with (
+        patches["DatabaseManager"],
+        patches["synthesize_price_recap"],
+        patches["get_or_refresh_forecast"],
+        patches["run_illustrative_backtests"],
+        patches["send_morning_brief_alert"],
+        patches["send_morning_brief_email"],
+    ):
+        result = await orchestrator_main.run_morning_brief()
+
+    assert result["slack_sent"] is False
+    assert result["email_sent"] is True
+    mock_db.mark_morning_brief_delivery.assert_called_once_with(
+        1, slack_sent=False, email_sent=True
+    )
+
+
+async def test_run_morning_brief_persistence_failure_does_not_block_delivery():
+    patches, mock_db = _morning_brief_patches(save_raises=True)
+
+    with (
+        patches["DatabaseManager"],
+        patches["synthesize_price_recap"],
+        patches["get_or_refresh_forecast"],
+        patches["run_illustrative_backtests"],
+        patches["send_morning_brief_alert"],
+        patches["send_morning_brief_email"],
+    ):
+        result = await orchestrator_main.run_morning_brief()
+
+    assert result["brief_id"] is None
+    assert result["slack_sent"] is True
+    assert result["email_sent"] is True
+    # No brief_id -> delivery status can't be marked against a persisted row.
+    mock_db.mark_morning_brief_delivery.assert_not_called()
+    mock_db.close.assert_called_once()
+
+
+async def test_run_morning_brief_never_raises_even_on_bess_failure():
+    patches, mock_db = _morning_brief_patches(bess_raises=True)
+
+    with (
+        patches["DatabaseManager"],
+        patches["synthesize_price_recap"],
+        patches["get_or_refresh_forecast"],
+        patches["run_illustrative_backtests"],
+        patches["send_morning_brief_alert"],
+        patches["send_morning_brief_email"],
+    ):
+        result = await orchestrator_main.run_morning_brief()
+
+    assert result["bess_estimates_count"] == 0
+    assert result["brief_id"] == 1
+
+
+# --- MORNING_BRIEF_AUTO_RUN_ENABLED (independent cost-control gate) -----------
+
+
+async def test_scheduled_morning_brief_no_ops_when_auto_run_disabled(monkeypatch):
+    monkeypatch.delenv("MORNING_BRIEF_AUTO_RUN_ENABLED", raising=False)
+    with patch.object(orchestrator_main, "run_morning_brief", new=AsyncMock()) as mock_run:
+        await orchestrator_main.scheduled_morning_brief()
+    mock_run.assert_not_awaited()
+
+
+async def test_scheduled_morning_brief_no_ops_when_auto_run_explicitly_false(monkeypatch):
+    monkeypatch.setenv("MORNING_BRIEF_AUTO_RUN_ENABLED", "false")
+    with patch.object(orchestrator_main, "run_morning_brief", new=AsyncMock()) as mock_run:
+        await orchestrator_main.scheduled_morning_brief()
+    mock_run.assert_not_awaited()
+
+
+async def test_scheduled_morning_brief_runs_when_auto_run_enabled(monkeypatch):
+    monkeypatch.setenv("MORNING_BRIEF_AUTO_RUN_ENABLED", "true")
+    with patch.object(orchestrator_main, "run_morning_brief", new=AsyncMock()) as mock_run:
+        await orchestrator_main.scheduled_morning_brief()
+    mock_run.assert_awaited_once()
+
+
+def test_morning_brief_auto_run_enabled_is_independent_of_auto_run_enabled(monkeypatch):
+    monkeypatch.setenv("AUTO_RUN_ENABLED", "true")
+    monkeypatch.delenv("MORNING_BRIEF_AUTO_RUN_ENABLED", raising=False)
+    assert orchestrator_main._morning_brief_auto_run_enabled() is False
+
+    monkeypatch.setenv("MORNING_BRIEF_AUTO_RUN_ENABLED", "true")
+    monkeypatch.setenv("AUTO_RUN_ENABLED", "false")
+    assert orchestrator_main._morning_brief_auto_run_enabled() is True

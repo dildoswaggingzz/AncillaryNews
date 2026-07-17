@@ -4,7 +4,11 @@ import httpx
 import pytest
 import respx
 
-from shared.slack_notifier import send_event_report_alert, send_slack_alert
+from shared.slack_notifier import (
+    send_event_report_alert,
+    send_morning_brief_alert,
+    send_slack_alert,
+)
 
 TRIGGER = {
     "trigger_type": "price_spike",
@@ -174,3 +178,40 @@ async def test_send_event_report_alert_condenses_long_hard_data_list(monkeypatch
     # ...and the later entries are summarized rather than individually listed.
     assert "signal-9" not in text
     assert "more" in text.lower()
+
+
+# --- send_morning_brief_alert (M5) -------------------------------------------
+
+MORNING_BRIEF_TEXT = "*Morning Brief — 2026-07-17*\n\nPrices were mild yesterday."
+
+
+async def test_send_morning_brief_alert_skips_when_webhook_not_configured(caplog):
+    with caplog.at_level("WARNING"):
+        sent = await send_morning_brief_alert(MORNING_BRIEF_TEXT)
+
+    assert sent is False
+    assert "SLACK_WEBHOOK_URL not set" in caplog.text
+
+
+@respx.mock
+async def test_send_morning_brief_alert_posts_structured_payload(monkeypatch):
+    monkeypatch.setenv("SLACK_WEBHOOK_URL", WEBHOOK_URL)
+    route = respx.post(WEBHOOK_URL).mock(return_value=httpx.Response(200, json={"ok": True}))
+
+    sent = await send_morning_brief_alert(MORNING_BRIEF_TEXT)
+
+    assert sent is True
+    assert route.called
+    body = json.loads(route.calls[0].request.content)
+    assert body["text"] == MORNING_BRIEF_TEXT
+    assert body["message_type"] == "morning_brief"
+
+
+@respx.mock
+async def test_send_morning_brief_alert_returns_false_on_http_error(monkeypatch):
+    monkeypatch.setenv("SLACK_WEBHOOK_URL", WEBHOOK_URL)
+    respx.post(WEBHOOK_URL).mock(return_value=httpx.Response(500, text="internal error"))
+
+    sent = await send_morning_brief_alert(MORNING_BRIEF_TEXT)
+
+    assert sent is False

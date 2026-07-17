@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+{% block title %}Morning Brief {{ row.brief_date }} — AncillaryNews{% endblock %}
+{% block content %}
+{% set brief = row.brief %}
+{% set recap = row.price_recap %}
+<h1>Morning Brief — {{ row.brief_date }}</h1>
+<p class="muted">Published {{ row.published_at }}</p>
+
+<div class="card">
+  <p>
+    <strong>Delivery:</strong>
+    Slack {{ "✅ sent" if row.slack_sent else "❌ not sent" }}
+    &middot;
+    Email {{ "✅ sent" if row.email_sent else "❌ not sent" }}
+  </p>
+</div>
+
+<div class="card">
+  <h2>Price recap (yesterday)</h2>
+  <h3>{{ recap.get('headline', '') }}</h3>
+  {% if recap.get('zone_summaries') %}
+  <ul>
+    {% for line in recap.zone_summaries %}
+    <li>{{ line }}</li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+  {% if recap.get('causal_factors') %}
+  <h4>Why prices moved</h4>
+  {% for factor in recap.causal_factors %}
+  <p>{{ factor }}</p>
+  {% endfor %}
+  {% else %}
+  <p class="muted">No causal-factor explanation available for this brief.</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Outlook</h2>
+  {% for horizon in ["month", "quarter", "year"] %}
+  {% set forecast = brief.forecasts.get(horizon) if brief and brief.forecasts else None %}
+  <div style="margin-bottom: 1rem;">
+    <h3>
+      {{ horizon | capitalize }}
+      {% if forecast %}
+      <span class="badge badge-confidence-{{ forecast.get('confidence', 'medium') }}">
+        confidence: {{ forecast.get('confidence', 'n/a') }}
+      </span>
+      {% endif %}
+    </h3>
+    {% if forecast %}
+    <p>{{ forecast.get('narrative', '') }}</p>
+    {% if forecast.get('swing_factors') %}
+    <p class="muted">Swing factors: {{ forecast.swing_factors | join(', ') }}</p>
+    {% endif %}
+    {% else %}
+    <p class="muted">Forecast unavailable for this horizon.</p>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+
+<div class="card">
+  <h2>Illustrative BESS estimates (past month, ~1.5 cycles/day cap)</h2>
+  <p class="muted">
+    Two illustrative battery sizes, not a specific real asset — see
+    <code>shared/bess_estimator.py</code>. Both revenue streams are estimates, not a real
+    co-optimized dispatch.
+  </p>
+  {% if row.bess_estimates %}
+  <table>
+    <tr>
+      <th>Config</th><th>Zone</th><th>Run</th><th>Total revenue (DKK)</th>
+      <th>Full cycle equivalents</th><th>Cycle cap binding?</th>
+    </tr>
+    {% for estimate in row.bess_estimates %}
+    <tr>
+      <td>{{ estimate.config_label }}</td>
+      <td>{{ estimate.zone }}</td>
+      <td><a href="/dashboard/bess/{{ estimate.run_id }}">#{{ estimate.run_id }}</a></td>
+      <td>{{ "%.2f"|format(estimate.total_revenue_dkk) }}</td>
+      <td>{{ "%.3f"|format(estimate.full_cycle_equivalents) }}</td>
+      <td>{{ "yes" if estimate.cycle_cap_was_binding else "no" }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="muted">No BESS estimates recorded for this brief.</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Glossary</h2>
+  {% if recap.get('jargon_glossary') or (brief and brief.jargon_glossary) %}
+  {% set glossary = brief.jargon_glossary if brief and brief.jargon_glossary else recap.jargon_glossary %}
+  <dl>
+    {% for term, definition in glossary.items() %}
+    <dt><strong>{{ term }}</strong></dt>
+    <dd>{{ definition }}</dd>
+    {% endfor %}
+  </dl>
+  {% else %}
+  <p class="muted">No glossary recorded for this brief.</p>
+  {% endif %}
+</div>
+{% endblock %}

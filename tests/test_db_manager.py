@@ -1,5 +1,5 @@
 import json
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -820,6 +820,7 @@ def test_fetch_bess_runs_returns_mapped_rows(db, pooled_conn):
             0.5,
             48,
             datetime(2026, 7, 17, 9, tzinfo=UTC),
+            None,
         )
     ]
     conn.cursor.return_value.__enter__.return_value = cursor
@@ -829,6 +830,7 @@ def test_fetch_bess_runs_returns_mapped_rows(db, pooled_conn):
     assert result[0]["id"] == 1
     assert result[0]["zone"] == "DK1"
     assert result[0]["config"] == {"power_mw": 1.0}
+    assert result[0]["label"] is None
     query, params = cursor.execute.call_args.args
     assert "zone = %s" in query
     assert params == ["DK1", 10, 0]
@@ -850,6 +852,7 @@ def test_fetch_bess_runs_decodes_json_string_config(db, pooled_conn):
             0.5,
             48,
             datetime(2026, 7, 17, 9, tzinfo=UTC),
+            "morning_brief",
         )
     ]
     conn.cursor.return_value.__enter__.return_value = cursor
@@ -857,6 +860,7 @@ def test_fetch_bess_runs_decodes_json_string_config(db, pooled_conn):
     result = db.fetch_bess_runs()
 
     assert result[0]["config"] == {"power_mw": 1.0}
+    assert result[0]["label"] == "morning_brief"
 
 
 def test_fetch_bess_run_returns_none_when_absent(db, pooled_conn):
@@ -969,3 +973,230 @@ def test_save_market_data_applies_series_filter_field(mock_execute, db):
     assert saved == 1
     values = mock_execute.call_args.args[2]
     assert values[0][4] == 20.0  # only the FCR-N row's price is mapped
+
+
+# --- save_bess_run label (M5) -------------------------------------------------
+
+
+def test_save_bess_run_persists_label(db, pooled_conn):
+    from shared.bess_simulator import BacktestResult, BessConfig
+
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (9,)
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    result = BacktestResult(
+        zone="DK1",
+        start_time=datetime(2026, 7, 16, tzinfo=UTC),
+        end_time=datetime(2026, 7, 17, tzinfo=UTC),
+        config=BessConfig(),
+        ticks=[],
+    )
+
+    with patch("shared.db_manager.execute_values"):
+        run_id = db.save_bess_run(result, label="morning_brief")
+
+    assert run_id == 9
+    insert_run_call = cursor.execute.call_args_list[0]
+    assert insert_run_call.args[1][-1] == "morning_brief"
+
+
+# --- Morning Brief (M5) persistence -------------------------------------------
+
+
+def test_save_forecast_inserts_and_returns_id(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (5,)
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    valid_until = datetime(2026, 7, 24, tzinfo=UTC)
+    forecast_id = db.save_forecast("month", {"narrative": "flat"}, valid_until)
+
+    assert forecast_id == 5
+    query, params = cursor.execute.call_args.args
+    assert "INSERT INTO forecast_cache" in query
+    assert params[0] == "month"
+    assert params[1] == valid_until
+    conn.commit.assert_called_once()
+
+
+def test_save_forecast_rolls_back_and_reraises_on_failure(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.execute.side_effect = RuntimeError("insert failed")
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    with pytest.raises(RuntimeError):
+        db.save_forecast("month", {"narrative": "flat"}, datetime(2026, 7, 24, tzinfo=UTC))
+
+    conn.rollback.assert_called_once()
+
+
+def test_fetch_latest_forecast_returns_none_when_absent(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.fetchone.return_value = None
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    assert db.fetch_latest_forecast("month") is None
+
+
+def test_fetch_latest_forecast_maps_row_and_decodes_json_string(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (
+        5,
+        "month",
+        datetime(2026, 7, 17, tzinfo=UTC),
+        datetime(2026, 7, 24, tzinfo=UTC),
+        json.dumps({"narrative": "flat"}),
+    )
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    result = db.fetch_latest_forecast("month")
+
+    assert result["id"] == 5
+    assert result["forecast"] == {"narrative": "flat"}
+
+
+def test_save_morning_brief_upserts_on_conflict(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (1,)
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    brief_id = db.save_morning_brief(
+        date(2026, 7, 17),
+        {"headline": "mild"},
+        10,
+        11,
+        12,
+        [{"config_label": "Small", "zone": "DK1"}],
+        {"headline": "mild"},
+    )
+
+    assert brief_id == 1
+    query = cursor.execute.call_args.args[0]
+    assert "ON CONFLICT (brief_date) DO UPDATE" in query
+    conn.commit.assert_called_once()
+
+
+def test_save_morning_brief_rolls_back_and_reraises_on_failure(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.execute.side_effect = RuntimeError("insert failed")
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    with pytest.raises(RuntimeError):
+        db.save_morning_brief(date(2026, 7, 17), {}, None, None, None, [], {})
+
+    conn.rollback.assert_called_once()
+
+
+def test_fetch_morning_briefs_returns_mapped_rows(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [
+        (
+            1,
+            date(2026, 7, 17),
+            datetime(2026, 7, 17, 7, 0, tzinfo=UTC),
+            {"headline": "mild"},
+            10,
+            11,
+            12,
+            [{"config_label": "Small"}],
+            {"headline": "mild"},
+            True,
+            False,
+        )
+    ]
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    result = db.fetch_morning_briefs(limit=10, offset=0)
+
+    assert result[0]["id"] == 1
+    assert result[0]["slack_sent"] is True
+    assert result[0]["email_sent"] is False
+    assert result[0]["price_recap"] == {"headline": "mild"}
+
+
+def test_fetch_morning_brief_returns_none_when_absent(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.fetchone.return_value = None
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    assert db.fetch_morning_brief(999) is None
+
+
+def test_fetch_morning_brief_by_date_maps_row(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (
+        1,
+        date(2026, 7, 17),
+        datetime(2026, 7, 17, 7, 0, tzinfo=UTC),
+        json.dumps({"headline": "mild"}),
+        10,
+        11,
+        12,
+        json.dumps([{"config_label": "Small"}]),
+        json.dumps({"headline": "mild"}),
+        True,
+        False,
+    )
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    result = db.fetch_morning_brief_by_date(date(2026, 7, 17))
+
+    assert result["id"] == 1
+    assert result["bess_estimates"] == [{"config_label": "Small"}]
+
+
+def test_mark_morning_brief_delivery_updates_only_given_fields(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    db.mark_morning_brief_delivery(1, slack_sent=True)
+
+    query, params = cursor.execute.call_args.args
+    assert "slack_sent = %s" in query
+    assert "email_sent" not in query
+    assert params == [True, 1]
+    conn.commit.assert_called_once()
+
+
+def test_mark_morning_brief_delivery_noop_when_nothing_given(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    db.mark_morning_brief_delivery(1)
+
+    cursor.execute.assert_not_called()
+
+
+def test_fetch_daily_aggregates_returns_mapped_rows(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [
+        (datetime(2026, 7, 16, tzinfo=UTC), 450.0, 400.0, 500.0, 24),
+    ]
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    result = db.fetch_daily_aggregates(
+        "day_ahead",
+        "DK1",
+        "price",
+        datetime(2026, 7, 1, tzinfo=UTC),
+        datetime(2026, 7, 17, tzinfo=UTC),
+    )
+
+    assert result[0]["mean_value"] == 450.0
+    assert result[0]["sample_count"] == 24
+    query = cursor.execute.call_args.args[0]
+    assert "GROUP BY day" in query

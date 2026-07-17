@@ -19,18 +19,24 @@ import asyncio
 import logging
 import os
 import time
-from datetime import datetime, timedelta
+from dataclasses import asdict
+from datetime import UTC, datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from prometheus_client import Histogram
 from qdrant_client import AsyncQdrantClient
 
+from shared.bess_estimator import run_illustrative_backtests
 from shared.db_manager import DatabaseManager
+from shared.email_notifier import send_morning_brief_email
 from shared.event_synthesizer import infer_direction, synthesize_event_report
+from shared.forecast_synthesizer import get_or_refresh_forecast
 from shared.logging_config import configure_logging
 from shared.metrics import start_metrics_server
+from shared.morning_brief_editor import compose_brief, render_for_email, render_for_slack
+from shared.price_recap_synthesizer import synthesize_price_recap
 from shared.rule_engine import Trigger, run_rule_engine
-from shared.slack_notifier import send_event_report_alert
+from shared.slack_notifier import send_event_report_alert, send_morning_brief_alert
 from shared.vector_store import QdrantStore
 
 configure_logging()
@@ -64,6 +70,12 @@ CONTEXT_WINDOW_HOURS_AFTER = 6.0
 # trigger time, so the search window is generous, not exact.
 RAG_SEARCH_LIMIT = 5
 RAG_TIME_WINDOW_HOURS = 48.0
+
+# Morning Brief (M5): the illustrative BESS estimates look back over the
+# trailing 30 days ending "now" -- README "Brainstorming" §'s "what a
+# representative BESS would have earned in the past month".
+MORNING_BRIEF_BESS_WINDOW_DAYS = 30
+MORNING_BRIEF_FORECAST_HORIZONS = ("month", "quarter", "year")
 
 
 def _rag_query(trigger: Trigger, direction: str) -> str:
@@ -235,6 +247,140 @@ async def run_synthesis_cycle() -> dict:
     return {"triggers_fired": len(triggers), "reports_published": reports_published}
 
 
+async def run_morning_brief() -> dict:
+    """
+    Orchestrates the full Morning Brief (M5) pipeline: price recap ->
+    month/quarter/year forecasts (usually cache-hits, see
+    `shared/forecast_synthesizer.py`) -> illustrative BESS estimates (both
+    zones) -> `compose_brief` -> persist -> deliver to Slack and email ->
+    mark delivery status.
+
+    Every stage is wrapped in its own try/except so one stage's failure
+    (e.g. a Claude API outage during forecast synthesis, or email being
+    unconfigured) never blocks persistence of what *did* succeed, nor the
+    other delivery channel -- this function itself never raises. Returns a
+    summary dict for the on-demand `POST /morning-briefs/run-now` route
+    (`services/api/main.py`) and its dashboard button counterpart.
+    """
+    db = DatabaseManager()
+    brief_date = datetime.now(UTC).date()
+    brief_id = None
+    slack_sent = False
+    email_sent = False
+    bess_estimates: list = []
+
+    try:
+        try:
+            price_recap = await synthesize_price_recap(db, brief_date)
+        except Exception:
+            logger.exception("Price recap synthesis failed for brief_date=%s", brief_date)
+            price_recap = {
+                "headline": f"Price recap unavailable for {brief_date}.",
+                "zone_summaries": [],
+                "causal_factors": [],
+                "jargon_glossary": {},
+            }
+
+        forecasts: dict[str, dict | None] = {}
+        forecast_ids: dict[str, int | None] = {}
+        for horizon in MORNING_BRIEF_FORECAST_HORIZONS:
+            try:
+                cached_or_fresh = await get_or_refresh_forecast(db, horizon)
+            except Exception:
+                logger.exception("Forecast synthesis failed for horizon=%s", horizon)
+                cached_or_fresh = None
+            forecasts[horizon] = cached_or_fresh["forecast"] if cached_or_fresh else None
+            forecast_ids[horizon] = cached_or_fresh["id"] if cached_or_fresh else None
+
+        try:
+            end_time = datetime.now(UTC)
+            start_time = end_time - timedelta(days=MORNING_BRIEF_BESS_WINDOW_DAYS)
+            bess_estimates = run_illustrative_backtests(
+                db, start_time=start_time, end_time=end_time
+            )
+        except Exception:
+            logger.exception("Illustrative BESS backtests failed for brief_date=%s", brief_date)
+            bess_estimates = []
+
+        brief = compose_brief(brief_date, price_recap, forecasts, bess_estimates)
+        brief_payload = asdict(brief)
+        brief_payload["brief_date"] = str(brief_date)
+
+        try:
+            brief_id = db.save_morning_brief(
+                brief_date,
+                price_recap,
+                forecast_ids.get("month"),
+                forecast_ids.get("quarter"),
+                forecast_ids.get("year"),
+                bess_estimates,
+                brief_payload,
+            )
+        except Exception:
+            logger.exception("Failed to persist Morning Brief for brief_date=%s", brief_date)
+
+        try:
+            slack_sent = await send_morning_brief_alert(render_for_slack(brief))
+        except Exception:
+            logger.exception("Failed to send Slack alert for the Morning Brief")
+
+        try:
+            subject, html_body, plaintext_body = render_for_email(brief)
+            email_sent = await send_morning_brief_email(subject, html_body, plaintext_body)
+        except Exception:
+            logger.exception("Failed to send email for the Morning Brief")
+
+        if brief_id is not None:
+            try:
+                db.mark_morning_brief_delivery(
+                    brief_id, slack_sent=slack_sent, email_sent=email_sent
+                )
+            except Exception:
+                logger.exception("Failed to mark delivery status for Morning Brief id=%s", brief_id)
+    finally:
+        db.close()
+
+    return {
+        "brief_date": str(brief_date),
+        "brief_id": brief_id,
+        "slack_sent": slack_sent,
+        "email_sent": email_sent,
+        "bess_estimates_count": len(bess_estimates),
+    }
+
+
+def _morning_brief_auto_run_enabled() -> bool:
+    """
+    Reads `MORNING_BRIEF_AUTO_RUN_ENABLED` fresh on every call (same
+    live-env-var-read convention as `_auto_run_enabled` below) -- its own,
+    independent env var from `AUTO_RUN_ENABLED`, since the Morning Brief has
+    a completely different cost/cadence profile (once/day vs every 15
+    minutes) and an operator may want one enabled without the other.
+    Defaults to `False`: automatic scheduled morning briefs are opt-in, same
+    "opt-in, not opt-out" cost-control posture as the synthesis cycle.
+    """
+    return os.getenv("MORNING_BRIEF_AUTO_RUN_ENABLED", "false").strip().lower() == "true"
+
+
+async def scheduled_morning_brief() -> None:
+    """
+    The APScheduler cron job entrypoint (see `main` below) -- wraps
+    `run_morning_brief` behind the `MORNING_BRIEF_AUTO_RUN_ENABLED` gate, same
+    no-op-but-stay-up pattern as `scheduled_synthesis_cycle`. Firing one real
+    brief on demand, independent of this gate, is always available via
+    `POST /morning-briefs/run-now` on the API service.
+    """
+    if not _morning_brief_auto_run_enabled():
+        logger.info(
+            "MORNING_BRIEF_AUTO_RUN_ENABLED is unset/false; skipping this scheduled Morning Brief "
+            "run (no Claude Opus calls made, no email/Slack sent). POST /morning-briefs/run-now on "
+            "the API service to run one on demand, or set MORNING_BRIEF_AUTO_RUN_ENABLED=true for "
+            "automatic daily briefs."
+        )
+        return
+    await run_morning_brief()
+
+
 def _auto_run_enabled() -> bool:
     """
     Reads `AUTO_RUN_ENABLED` fresh on every call (same "read the env var live,
@@ -279,6 +425,17 @@ async def main():
         "interval",
         minutes=TRIGGER_EVALUATION_INTERVAL_MINUTES,
         next_run_time=datetime.now(),
+    )
+    # First "cron" job in this codebase (everything else above is "interval")
+    # -- a Morning Brief is a once-a-day-at-a-fixed-local-time thing, not a
+    # fixed-period cadence, and `timezone="Europe/Copenhagen"` makes the
+    # 07:00 delivery target DST-aware (see the M5 plan's confirmed product
+    # decision). Deliberately WITHOUT `next_run_time=datetime.now()` (unlike
+    # the interval job above) -- that would fire a brief on every deploy;
+    # `brief_date UNIQUE`/`save_morning_brief`'s upsert is the backstop if
+    # this job somehow fires twice for the same day regardless.
+    scheduler.add_job(
+        scheduled_morning_brief, "cron", hour=7, minute=0, timezone="Europe/Copenhagen"
     )
     scheduler.start()
     await asyncio.Event().wait()

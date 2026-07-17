@@ -56,8 +56,9 @@ commitment in the same "assume it clears" spirit as the capacity estimate.
 from __future__ import annotations
 
 import statistics
+from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from shared.db_manager import DatabaseManager
 
@@ -103,6 +104,17 @@ class BessConfig:
     capacity_commit_mw: float = 0.3
     capacity_markets: tuple[tuple[str, str], ...] = (("FCR", "price"), ("aFRR_capacity", "up"))
 
+    # --- cycle cap ---
+    # A contractual/warranty-style limit on how much the battery may
+    # *discharge* (only discharge MWh counts, consistent with
+    # `full_cycle_equivalents`'s definition) within any rolling 24-hour
+    # window, expressed in full-capacity-equivalent cycles/day. `None` means
+    # unconstrained (the theoretical-max mode the simulator ran in before
+    # this field existed). Defaults to 1.5 -- a realistic illustrative
+    # figure, not a hard physical constant -- since the morning-brief BESS
+    # estimates (shared/bess_estimator.py) want a capped-by-default result.
+    max_cycles_per_day: float | None = 1.5
+
     def __post_init__(self):
         if self.power_mw <= 0:
             raise ValueError("power_mw must be positive")
@@ -126,6 +138,8 @@ class BessConfig:
                 )
         if self.price_market in EXCLUDED_MARKETS:
             raise ValueError(f"price market {self.price_market!r} is not eligible for BESS")
+        if self.max_cycles_per_day is not None and self.max_cycles_per_day <= 0:
+            raise ValueError("max_cycles_per_day must be positive (or None for unconstrained)")
 
 
 @dataclass
@@ -145,6 +159,8 @@ class BessTick:
     cumulative_arbitrage_revenue_dkk: float
     cumulative_capacity_revenue_dkk: float
     cumulative_total_revenue_dkk: float
+    # True when max_cycles_per_day (not power/SoC) capped this tick's discharge
+    cycle_cap_binding: bool = False
 
 
 @dataclass
@@ -294,6 +310,18 @@ def run_backtest(
     ticks: list[BessTick] = []
     history: list[float] = []
 
+    # Rolling 24-hour discharge window for the cycle cap (see BessConfig's
+    # `max_cycles_per_day` docstring for why this is rolling, not a
+    # calendar-day reset): each entry is (time, discharged_mwh) for a tick
+    # that discharged; entries older than `t - 24h` are pruned every tick
+    # before the cap is applied.
+    discharge_window: deque[tuple[datetime, float]] = deque()
+    cap_mwh_per_window = (
+        config.capacity_mwh * config.max_cycles_per_day
+        if config.max_cycles_per_day is not None
+        else None
+    )
+
     for i, (t, price) in enumerate(price_series):
         # Period duration: gap to the next tick, or the gap from the
         # previous tick if this is the last one (falls back to 1 hour if
@@ -327,6 +355,7 @@ def run_backtest(
         action = "idle"
         arbitrage_revenue = 0.0
         energy_discharged_mwh = 0.0
+        cycle_cap_binding = False
 
         if z is not None and z <= -config.arbitrage_z_threshold:
             # Charge: draw energy from the grid, limited by available power,
@@ -340,15 +369,29 @@ def run_backtest(
                 action = "charge"
         elif z is not None and z >= config.arbitrage_z_threshold:
             # Discharge: deliver energy to the grid, limited by available
-            # power, remaining usable SoC, and the discharge-leg efficiency.
+            # power, remaining usable SoC, the discharge-leg efficiency, and
+            # (if configured) the rolling-24h cycle cap.
             max_energy_out_mwh = arbitrage_power_mw * dt_hours
             available_mwh = (soc_mwh - soc_min) * leg_efficiency
             grid_energy_mwh = max(min(max_energy_out_mwh, available_mwh), 0.0)
+
+            if cap_mwh_per_window is not None:
+                window_start = t - timedelta(hours=24)
+                while discharge_window and discharge_window[0][0] < window_start:
+                    discharge_window.popleft()
+                discharged_in_window = sum(mwh for _, mwh in discharge_window)
+                remaining_cap_mwh = max(cap_mwh_per_window - discharged_in_window, 0.0)
+                if grid_energy_mwh > remaining_cap_mwh:
+                    grid_energy_mwh = remaining_cap_mwh
+                    cycle_cap_binding = True
+
             if grid_energy_mwh > 0:
                 soc_mwh -= grid_energy_mwh / leg_efficiency if leg_efficiency else 0.0
                 arbitrage_revenue = price * grid_energy_mwh
                 energy_discharged_mwh = grid_energy_mwh
                 action = "discharge"
+                if cap_mwh_per_window is not None:
+                    discharge_window.append((t, grid_energy_mwh))
 
         cumulative_arbitrage += arbitrage_revenue
 
@@ -367,6 +410,7 @@ def run_backtest(
                 cumulative_arbitrage_revenue_dkk=cumulative_arbitrage,
                 cumulative_capacity_revenue_dkk=cumulative_capacity,
                 cumulative_total_revenue_dkk=cumulative_arbitrage + cumulative_capacity,
+                cycle_cap_binding=cycle_cap_binding,
             )
         )
 

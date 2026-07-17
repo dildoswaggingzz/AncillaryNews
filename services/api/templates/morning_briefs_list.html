@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Morning Briefs — AncillaryNews{% endblock %}
+{% block content %}
+<h1>Morning Briefs</h1>
+<p class="muted">
+  Daily plain-language brief: yesterday's prices and why they moved, month/quarter/year forecasts,
+  and illustrative BESS earnings estimates (<code>shared/morning_brief_editor.py</code>). Delivered
+  to Slack and email — see <code>/dashboard/morning-briefs/&lt;id&gt;/</code> for delivery status.
+</p>
+<p><a href="/">&larr; Back to dashboard (run a new brief now)</a></p>
+
+{% if not briefs %}
+<p>No Morning Briefs published yet.</p>
+{% endif %}
+
+{% if briefs %}
+<table>
+  <tr>
+    <th>Brief</th><th>Date</th><th>Headline</th><th>Slack sent</th><th>Email sent</th><th>Published</th>
+  </tr>
+  {% for row in briefs %}
+  <tr>
+    <td><a href="/dashboard/morning-briefs/{{ row.id }}">#{{ row.id }}</a></td>
+    <td>{{ row.brief_date }}</td>
+    <td>{{ row.price_recap.get('headline', '') }}</td>
+    <td>{{ "✅" if row.slack_sent else "—" }}</td>
+    <td>{{ "✅" if row.email_sent else "—" }}</td>
+    <td>{{ row.published_at }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% endblock %}
