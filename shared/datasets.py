@@ -12,16 +12,23 @@ on `api.energidataservice.dk`) and how its JSON records map onto the
   mFRR capacity record carries both `UpPriceDKK` and `DownPriceDKK`), so each
   dataset can declare multiple `SeriesConfig` entries.
 
-Field names are taken verbatim from `docs/dataset-catalogue.md` (the M0 audit),
-not invented. Known gaps from that audit, carried forward here:
+Field names are taken verbatim from `docs/dataset-catalogue.md` (the M0 audit)
+and `docs/dataset-catalogue-addendum.md` (the M0 addendum, which confirmed
+several datasets M0 could not, by querying `api.energidataservice.dk`
+directly rather than the JS-rendered marketing site), not invented. Known
+gaps carried forward here:
 
-- No dataset exposes an explicit `PublishedTime`/`RevisedTime` field, so
-  `is_provisional` is a static, catalogue-derived best guess per dataset, not
-  something Energinet tells us per-record.
-- The exact "mFRR EAM energy activation" dataset the README treats as the
-  primary focus could not be confirmed to exist (catalogue §8.1) and is
-  therefore *not* included below. `mFRRCapacityMarket` (reservation/capacity
-  payments) is included as the closest confirmed substitute.
+- No dataset exposes an explicit `PublishedTime`/`RevisedTime` field for
+  *most* series, so `is_provisional` is a static, catalogue-derived best
+  guess per dataset, not something Energinet tells us per-record. See the
+  `afrr_picasso_corrections` entry below for the one dataset investigated as
+  a possible exception (it turned out not to be one — see its comment).
+- The "mFRR EAM energy activation" dataset the README treats as the primary
+  focus — `MfrrEnergyActivationMarket` — **is now confirmed and ingested**
+  (`mfrr_eam` below), closing the gap the original M0 audit (catalogue §8.1)
+  flagged and every milestone since M1 worked around via `mFRRCapacityMarket`
+  (a *capacity/reservation* market, still ingested separately as
+  `mfrr_capacity` below — the two are distinct products and are not merged).
 """
 
 from dataclasses import dataclass, field
@@ -83,6 +90,90 @@ DATASETS: list[DatasetConfig] = [
         zone_field="PriceArea",
         series=[
             SeriesConfig(product="activation_price", value_field="aFRR_ActivatedEUR"),
+            # aFRR_Activated (MW): confirmed live via the dataset's own API
+            # metadata (`meta/dataset/AfrrEnergyActivation`) — "Activation in
+            # MW. Positive value is up regulation, negative value is down
+            # regulation." A single signed field, not an up/down pair, so one
+            # product (not "up_volume"/"down_volume") is enough to carry it.
+            SeriesConfig(product="activation_volume", value_field="aFRR_Activated"),
+        ],
+        is_provisional=True,
+        params={"limit": 100, "sort": "TimeMsUTC DESC"},
+    ),
+    # High priority — mFRR Energy Activation Market (EAM), Nordic, 15-minute
+    # MTU. This is the dataset the README's primary focus (mFRR EAM) refers
+    # to; confirmed live (see docs/dataset-catalogue-addendum.md) after the
+    # original M0 audit (catalogue §8.1) could not find it. `mFRRSAUp/DownEUR`
+    # ("SA" = shared/standard activation) is the real Nordic EAM clearing
+    # price — distinct from `mFRRCapacityMarket`'s capacity/reservation price
+    # (`mfrr_capacity` above), hence the separate `mFRR_EAM` market label so
+    # the two are never conflated in a chart or a rule-engine baseline.
+    #
+    # `market_data_history` stores one `value DOUBLE PRECISION` per row
+    # (init-db/01-init.sql), so — rather than a schema migration — volumes
+    # get their own `product` names (`*_volume`) alongside the price
+    # products (`up`/`down`), consistent with how this whole registry
+    # already distinguishes products within one dataset via `SeriesConfig`.
+    # `mFRRSAUpReqMW`/`mFRRSADownReqMW` (requested volume) is mapped as
+    # `up_volume`/`down_volume` since it's the closest analogue to the
+    # `up`/`down` price pair; `TotalmFRRUpMW`/`TotalmFRRDownMW` (total
+    # regulation, i.e. requested + local + special) and
+    # `mFRROfferedUpMW`/`mFRROfferedDownMW` (offered/available volume) are
+    # also live and useful context, so both are ingested too.
+    #
+    # `mFRRDAUpEUR`/`mFRRDADownEUR` ("DA" = a second, currently-unused
+    # activation price path) and `mFRRLocalUp/DownMW`/`mFRRSpecialUp/DownMW`
+    # were null across every sample pulled during this audit (~200 DK1
+    # records) — left unmapped rather than ingesting an always-null series;
+    # revisit if Energinet starts populating them.
+    DatasetConfig(
+        name="mfrr_eam",
+        dataset_id="MfrrEnergyActivationMarket",
+        market="mFRR_EAM",
+        time_field="TimeUTC",
+        zone_field="PriceArea",
+        series=[
+            SeriesConfig(product="up", value_field="mFRRSAUpEUR"),
+            SeriesConfig(product="down", value_field="mFRRSADownEUR"),
+            SeriesConfig(product="up_volume", value_field="mFRRSAUpReqMW"),
+            SeriesConfig(product="down_volume", value_field="mFRRSADownReqMW"),
+            SeriesConfig(product="up_total_volume", value_field="TotalmFRRUpMW"),
+            SeriesConfig(product="down_total_volume", value_field="TotalmFRRDownMW"),
+            SeriesConfig(product="up_offered_volume", value_field="mFRROfferedUpMW"),
+            SeriesConfig(product="down_offered_volume", value_field="mFRROfferedDownMW"),
+        ],
+        is_provisional=True,
+        params={"limit": 100, "sort": "TimeUTC DESC"},
+    ),
+    # Medium priority — aFRR PICASSO "corrections". Investigated as a
+    # candidate real revision signal (every milestone since M1 has flagged
+    # that no dataset exposes a true publish/revision timestamp, forcing
+    # `fetched_at` as a proxy — see init-db/01-init.sql). It is NOT that:
+    # per the dataset's own API metadata (`meta/dataset/AfrrPicassoCorrections`),
+    # `Correction` is documented as "The correction itself. Positive value is
+    # upwards adjustment, negative value is downwards adjustment." with
+    # **unit MW** — i.e. a real-time correction *volume* PICASSO applies,
+    # analogous to `aFRR_Activated` above, not a revised/superseding price
+    # value and not a flag. `TimeMsUTC` is also the dataset's primary key
+    # (alongside `PriceArea`) with second-level resolution — each row is a
+    # distinct real-time observation, not a later correction of an earlier
+    # `TimeMsUTC` row already in the dataset. A 100-row live sample (sorted
+    # `TimeMsUTC DESC`) confirmed this: `Correction` values change from row
+    # to row largely independently of `PriceUpEUR`/`PriceDownEUR`, and no two
+    # rows shared a `TimeMsUTC`. So this dataset is ingested for its own
+    # (volume, price) content — useful context in its own right — but it
+    # does NOT give `shared/rule_engine.py:check_revisions` a better signal
+    # than `fetched_at`; that rule-engine gap remains open.
+    DatasetConfig(
+        name="afrr_picasso_corrections",
+        dataset_id="AfrrPicassoCorrections",
+        market="aFRR_correction",
+        time_field="TimeMsUTC",
+        zone_field="PriceArea",
+        series=[
+            SeriesConfig(product="correction_volume", value_field="Correction"),
+            SeriesConfig(product="up", value_field="PriceUpEUR"),
+            SeriesConfig(product="down", value_field="PriceDownEUR"),
         ],
         is_provisional=True,
         params={"limit": 100, "sort": "TimeMsUTC DESC"},

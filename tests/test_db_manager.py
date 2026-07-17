@@ -9,6 +9,9 @@ from shared.db_manager import DatabaseManager
 
 MFRR_CAPACITY = next(d for d in DATASETS if d.name == "mfrr_capacity")
 POWER_SYSTEM = next(d for d in DATASETS if d.name == "power_system_right_now")
+MFRR_EAM = next(d for d in DATASETS if d.name == "mfrr_eam")
+AFRR_ENERGY_ACTIVATION = next(d for d in DATASETS if d.name == "afrr_energy_activation")
+AFRR_PICASSO_CORRECTIONS = next(d for d in DATASETS if d.name == "afrr_picasso_corrections")
 
 RECORDS = [
     {
@@ -181,6 +184,95 @@ def test_dataset_config_series_are_declarative():
         "imbalance_price",
         "afrr_vwa_up",
         "afrr_vwa_down",
+    }
+
+
+@patch("shared.db_manager.execute_values")
+def test_save_market_data_maps_mfrr_eam_price_and_volume_products(mock_execute, db):
+    """MfrrEnergyActivationMarket carries both price (up/down) and volume
+    (*_volume) products from a single record, distinct from mFRR_capacity."""
+    records = [
+        {
+            "TimeUTC": "2026-07-17T06:15:00",
+            "PriceArea": "DK1",
+            "mFRRSAUpReqMW": 38,
+            "mFRRSAUpEUR": 165.24,
+            "mFRRSADownReqMW": None,
+            "mFRRSADownEUR": 132.5,
+            "TotalmFRRUpMW": 38,
+            "TotalmFRRDownMW": 0,
+            "mFRROfferedUpMW": 525,
+            "mFRROfferedDownMW": 1011,
+        }
+    ]
+
+    saved = db.save_market_data(records, MFRR_EAM)
+
+    _, _, values = mock_execute.call_args.args
+    # up, down, up_volume (down_volume omitted: None), up_total_volume,
+    # down_total_volume (0, not omitted -- 0 is a valid volume, not missing),
+    # up_offered_volume, down_offered_volume
+    assert saved == 7
+    rows_without_fetched_at = {(v[1], v[2], v[3], v[4]) for v in values}
+    assert rows_without_fetched_at == {
+        ("mFRR_EAM", "DK1", "up", 165.24),
+        ("mFRR_EAM", "DK1", "down", 132.5),
+        ("mFRR_EAM", "DK1", "up_volume", 38),
+        ("mFRR_EAM", "DK1", "up_total_volume", 38),
+        ("mFRR_EAM", "DK1", "down_total_volume", 0),
+        ("mFRR_EAM", "DK1", "up_offered_volume", 525),
+        ("mFRR_EAM", "DK1", "down_offered_volume", 1011),
+    }
+    assert ("mFRR_EAM", "DK1", "down_volume", None) not in rows_without_fetched_at
+
+
+@patch("shared.db_manager.execute_values")
+def test_save_market_data_maps_afrr_energy_activation_volume(mock_execute, db):
+    """aFRR_Activated (MW, signed) maps to a new 'activation_volume' product
+    alongside the pre-existing 'activation_price' product."""
+    records = [
+        {
+            "TimeMsUTC": "2026-07-16T13:06:09.901",
+            "PriceArea": "DK2",
+            "aFRR_Activated": 12.6,
+            "aFRR_ActivatedEUR": 194.07,
+        }
+    ]
+
+    saved = db.save_market_data(records, AFRR_ENERGY_ACTIVATION)
+
+    _, _, values = mock_execute.call_args.args
+    assert saved == 2
+    rows = {(v[1], v[2], v[3], v[4]) for v in values}
+    assert rows == {
+        ("aFRR_energy", "DK2", "activation_price", 194.07),
+        ("aFRR_energy", "DK2", "activation_volume", 12.6),
+    }
+
+
+@patch("shared.db_manager.execute_values")
+def test_save_market_data_maps_afrr_picasso_corrections(mock_execute, db):
+    """Correction (MW) and PriceUp/DownEUR map to their own aFRR_correction
+    market, distinct from aFRR_energy and mFRR_EAM."""
+    records = [
+        {
+            "TimeMsUTC": "2026-07-16T13:06:03.983",
+            "PriceArea": "DK1",
+            "Correction": 126.88699,
+            "PriceUpEUR": 150.0,
+            "PriceDownEUR": None,
+        }
+    ]
+
+    saved = db.save_market_data(records, AFRR_PICASSO_CORRECTIONS)
+
+    _, _, values = mock_execute.call_args.args
+    # PriceDownEUR is None, so only correction_volume + up are saved.
+    assert saved == 2
+    rows = {(v[1], v[2], v[3], v[4]) for v in values}
+    assert rows == {
+        ("aFRR_correction", "DK1", "correction_volume", 126.88699),
+        ("aFRR_correction", "DK1", "up", 150.0),
     }
 
 

@@ -9,6 +9,29 @@
 
 ## 1. Core Balancing Market Datasets
 
+### 1.0 mFRR Energy Activation Market (EAM) — RESOLVED, now confirmed and ingested
+
+> **Update (2026-07-17, M0 addendum follow-up):** This dataset — the
+> README's primary-focus market, flagged as §8.1 "not yet confirmed" below —
+> **is confirmed live and now ingested** as `mfrr_eam` in
+> `shared/datasets.py`. The original audit's static-HTML/marketing-site
+> discovery method produced a false negative; querying
+> `api.energidataservice.dk/dataset/MfrrEnergyActivationMarket` directly
+> (and its `meta/dataset/...` companion) confirms it. See
+> `docs/dataset-catalogue-addendum.md` for the discovery notes this section
+> folds in. §8.1 and §12's "mFRR EAM Energy" row are left below as the
+> historical record of the original (incorrect) gap, not as current status.
+
+| Field | Value |
+|-------|-------|
+| **Dataset ID** | `MfrrEnergyActivationMarket` |
+| **Market/Zone Mapping** | Nordic mFRR Energy Activation Market — DK1, DK2 |
+| **Description** | 15-minute MTU clearing prices and volumes for mFRR up/down *energy activation* (as opposed to `mFRRCapacityMarket`'s capacity/reservation payments) |
+| **Key Fields** | `TimeUTC`, `PriceArea` (DK1/DK2), `mFRRSAUpEUR`/`mFRRSADownEUR` (SA = shared/standard activation — the real EAM clearing price), `mFRRSAUpReqMW`/`mFRRSADownReqMW` (requested volume), `TotalmFRRUpMW`/`TotalmFRRDownMW`, `mFRROfferedUpMW`/`mFRROfferedDownMW`. Also present but null across ~200 live sample records: `mFRRDAUpEUR`/`mFRRDADownEUR` (a second, apparently-unused activation price path), `mFRRLocalUp/DownMW`, `mFRRSpecialUp/DownMW`. |
+| **Revision Field** | None observed |
+| **Data Maturity** | Provisional (15-minute figures) |
+| **Notes** | Ingested as `mfrr_eam` (`shared/datasets.py`), market label `mFRR_EAM` — kept distinct from `mFRRCapacityMarket`'s `mFRR_capacity` market so capacity/reservation and energy/activation prices are never conflated. Live-verified: real rows landed in `market_data_history` and the rule engine's `check_price_spike` fires on real `mFRR_EAM` data (seeded + live-verified 2026-07-17). |
+
 ### 1.1 mFRR (Minute Reserves) — Capacity Market
 
 | Field | Value |
@@ -55,7 +78,19 @@
 | **Key Fields** | `TimeMsUTC`, `TimeMsDK`, `PriceArea` (DK1/DK2), `aFRR_Activated` (MWh), `aFRR_ActivatedEUR` (price/MWh) |
 | **Revision Field** | None observed; data is published in near-real-time with millisecond precision |
 | **Data Maturity** | Real-time provisional; Energinet should clarify if/when these figures are finalized |
-| **Notes** | This is a high-frequency dataset (update frequency likely 5–15 seconds). Represents the actual activation energy market (PICASSO). No DKK prices observed; only EUR. |
+| **Notes** | This is a high-frequency dataset (update frequency likely 5–15 seconds). Represents the actual activation energy market (PICASSO). No DKK prices observed; only EUR. **Update (2026-07-17):** the volume field `aFRR_Activated` is now also ingested (`shared/datasets.py`, product `activation_volume`, alongside the pre-existing `activation_price`) — confirmed via the dataset's own API metadata: "Activation in MW. Positive value is up regulation, negative value is down regulation." |
+
+### 1.5 aFRR PICASSO Corrections — newly confirmed and ingested
+
+| Field | Value |
+|-------|-------|
+| **Dataset ID** | `AfrrPicassoCorrections` |
+| **Market/Zone Mapping** | aFRR real-time correction volume + PICASSO-calculated price — DK1, DK2 |
+| **Description** | "Combined corrections received from PICASSO and the calculated price" (Energinet's own dataset description). ~1-second resolution. |
+| **Key Fields** | `TimeMsUTC` (primary key alongside `PriceArea`), `PriceArea`, `Correction` (MW; positive = upwards adjustment, negative = downwards), `PriceUpEUR`, `PriceDownEUR` |
+| **Revision Field** | None — investigated as a candidate real revision signal (see below) and ruled out |
+| **Data Maturity** | Real-time provisional |
+| **Notes** | Ingested as `afrr_picasso_corrections` (`shared/datasets.py`), market label `aFRR_correction`, products `correction_volume`/`up`/`down`. **`Correction` field semantics, confirmed via `meta/dataset/AfrrPicassoCorrections` and a 100-row live sample:** it is documented by Energinet as a signed correction *volume in MW* — analogous to `aFRR_Activated` above — not a corrected/superseding price value and not a boolean flag. `TimeMsUTC` is part of the dataset's primary key with no two sampled rows sharing a timestamp, so it is not "the same time unit revised later" either. **This means it is NOT the true `published_at`/revision signal every milestone since M1 has been looking for** — that gap (`shared/rule_engine.py:check_revisions` still uses `fetched_at` as a proxy, per `init-db/01-init.sql`) remains open. The dataset is still worth ingesting for its own (volume, price) content. |
 
 ---
 
@@ -243,7 +278,15 @@
 
 ### 8.1 Potential mFRR EAM Energy Activation Dataset
 
-**Status:** Not yet confirmed in API discovery.
+**Status:** ~~Not yet confirmed in API discovery.~~ **RESOLVED 2026-07-17 — see
+§1.0 above.** `MfrrEnergyActivationMarket` exists and is now ingested; the
+"not found" result below was a false negative from querying the JS-rendered
+marketing site rather than the API directly (same root cause as the
+EnergyWatch RSS discovery issue elsewhere in this catalogue). The rest of
+this subsection is left as-is as the historical record of the original
+(incorrect) M0 finding.
+
+**Original status (incorrect, kept for record):** Not yet confirmed in API discovery.
 
 **Context:** The README mentions "mFRR Energy Activation Market (EAM)" as the primary focus, replacing older regulating-power datasets post-March 2025. The dataset `mFRRCapacityMarket` covers *capacity* clearing; however, **there should be a separate dataset for mFRR EAM energy activation volumes and prices** (analogous to `aFRREnergyActivation`).
 
@@ -416,6 +459,8 @@ This allows:
 
 | Dataset ID | Market | Zone(s) | Granularity | Key Field | Status | Priority |
 |------------|--------|---------|-------------|-----------|--------|----------|
+| `MfrrEnergyActivationMarket` | mFRR energy (EAM) | DK1, DK2 | 15 min | `mFRRSAUpEUR`, `mFRRSADownEUR` | ✓ Confirmed & ingested (2026-07-17) | **CRITICAL** |
+| `AfrrPicassoCorrections` | aFRR correction volume + price | DK1, DK2 | ~1 sec | `Correction`, `PriceUpEUR` | ✓ Confirmed & ingested (2026-07-17) | Medium |
 | `mFRRCapacityMarket` | mFRR capacity | DK1, DK2 | Hourly | `UpPriceDKK`, `DownPriceDKK` | ✓ Confirmed | **High** |
 | `mFrrReservesDK1`, `mFrrReservesDK2` | mFRR capacity (legacy) | DK1, DK2 | Hourly | `mFRR_UpPriceDKK`, `mFRR_DownPriceDKK` | ✓ Confirmed (rate-limited) | Medium |
 | `aFrrReservesDK1` | aFRR capacity | DK1 | Hourly | `aFRR_UpPriceDKK`, `aFRR_DownPriceDKK` | ✓ Confirmed (rate-limited) | Medium |
@@ -424,7 +469,7 @@ This allows:
 | `FCRReservesDK1` | FCR (Cooperation) | DK1 | Hourly | `FCR_UpPriceDKK`, `FCR_DownPriceDKK` | ✓ Confirmed (rate-limited) | Medium |
 | `FCRReservesDK2` | FCR (Nordic) | DK2 | Hourly | `FCR_N_PriceDKK`, `FCR_D_UpPriceDKK` | ✓ Confirmed (rate-limited) | Medium |
 | `FcrNdDK2` | FCR-D (detail) | DK2 | Hourly | `PriceTotalEUR` | ✓ Confirmed | Low (detail view) |
-| **mFRR EAM Energy** | **mFRR energy (EAM)** | **DK1, DK2** | **~15 min** | **`mFRR_ActivationPrice`** | **✗ Not found** | **CRITICAL** |
+| **mFRR EAM Energy** *(original, incorrect finding — see §1.0 / §8.1)* | **mFRR energy (EAM)** | **DK1, DK2** | **~15 min** | **`mFRR_ActivationPrice`** | **✗ Not found → ✓ RESOLVED, see row above** | **CRITICAL** |
 | `ImbalancePrice` | Imbalance settlement + aFRR/mFRR VWA | DK1, DK2 | 15 min | `ImbalancePriceDKK`, `aFRRVWAUpDKK` | ✓ Confirmed | **High** |
 | `DayAheadPrices` | Day-ahead spot (NordPool) | All zones | Hourly | `DayAheadPriceDKK` | ✓ Confirmed | High |
 | `PowerSystemRightNow` | System state (generation, wind, exchange) | DK1, DK2 | 5 min | `OnshoreWindPower`, `Exchange_DK1_DE` | ✓ Confirmed | High |
