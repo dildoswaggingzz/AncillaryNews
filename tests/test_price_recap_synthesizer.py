@@ -5,7 +5,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from shared.price_recap_synthesizer import _pull_recap_data, synthesize_price_recap
+from shared.price_recap_synthesizer import (
+    TRAILING_WINDOW_DAYS,
+    _pull_recap_data,
+    synthesize_price_recap,
+)
 
 BRIEF_DATE = date(2026, 7, 17)
 YESTERDAY = BRIEF_DATE - timedelta(days=1)
@@ -98,6 +102,30 @@ async def test_synthesize_price_recap_accepts_valid_causal_factors(db):
     recap = await synthesize_price_recap(db, BRIEF_DATE, client=client)
 
     assert recap["headline"] == "Prices rose yesterday."
+    assert len(recap["causal_factors"]) == 1
+
+
+async def test_synthesize_price_recap_accepts_window_length_reference(db):
+    # TRAILING_WINDOW_DAYS here refers to the trailing-window length (a known
+    # structural constant the model was told about), not a fabricated data
+    # figure -- this must NOT be rejected as an untraceable citation.
+    payload = json.dumps(
+        {
+            "headline": f"Prices rose yesterday versus the trailing {TRAILING_WINDOW_DAYS}-day "
+            "average.",
+            "causal_factors": [
+                f"The day-ahead price averaged 500.0 DKK/MWh, up from its trailing "
+                f"{TRAILING_WINDOW_DAYS}-day average of 400.0 DKK/MWh."
+            ],
+        }
+    )
+    client = _mock_client(payload)
+
+    recap = await synthesize_price_recap(db, BRIEF_DATE, client=client)
+
+    assert recap["headline"] == (
+        f"Prices rose yesterday versus the trailing {TRAILING_WINDOW_DAYS}-day average."
+    )
     assert len(recap["causal_factors"]) == 1
 
 

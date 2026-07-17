@@ -145,7 +145,11 @@ def _pull_recap_data(db: DatabaseManager, brief_date: date) -> dict:
 
 
 def _known_numbers(recap_data: dict) -> list[float]:
-    known: list[float] = []
+    # TRAILING_WINDOW_DAYS itself is a known structural constant the prompt
+    # explicitly tells the model about ("trailing 30-day average") -- without
+    # it, any narrative that mentions the window length (not a data figure)
+    # gets falsely rejected as an untraceable citation.
+    known: list[float] = [float(TRAILING_WINDOW_DAYS)]
     all_stats = [s for stats in recap_data["zone_stats"].values() for s in stats]
     all_stats += recap_data["system_state_stats"]
     for stat in all_stats:

@@ -95,6 +95,16 @@ services:
       # defaults to off. `POST /orchestrator/run-now` on the api service
       # always works regardless. See .env.example / DEPLOYMENT.md.
       - AUTO_RUN_ENABLED=${AUTO_RUN_ENABLED:-false}
+      # Morning Brief (M5): opt-in gate on the 07:00 Europe/Copenhagen cron
+      # job. `POST /morning-briefs/run-now` on the api service always works
+      # regardless. See .env.example.
+      - MORNING_BRIEF_AUTO_RUN_ENABLED=${MORNING_BRIEF_AUTO_RUN_ENABLED:-false}
+      - SMTP_HOST=${SMTP_HOST:-}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-}
+      - SMTP_FROM=${SMTP_FROM:-}
+      - MORNING_BRIEF_EMAIL_TO=${MORNING_BRIEF_EMAIL_TO:-}
     ports:
       - "9102:9102"
     volumes:
@@ -128,6 +138,15 @@ services:
       # cycle does) -- same graceful-skip-if-unset behavior as everywhere
       # else this is read (shared/slack_notifier.py).
       - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
+      # Morning Brief (M5) email delivery -- read by shared/email_notifier.py
+      # via run_morning_brief() when POST /morning-briefs/run-now is called
+      # in-process, same as SLACK_WEBHOOK_URL above.
+      - SMTP_HOST=${SMTP_HOST:-}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-}
+      - SMTP_FROM=${SMTP_FROM:-}
+      - MORNING_BRIEF_EMAIL_TO=${MORNING_BRIEF_EMAIL_TO:-}
     ports:
       - "8080:8000"
     volumes:
