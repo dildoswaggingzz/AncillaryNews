@@ -30,6 +30,44 @@
   {% endif %}
 </div>
 
+<div class="card">
+  <h3>Historical backfill</h3>
+  <p class="muted">
+    The ingestor's scheduled poller only ever fetches the most recent handful of records per
+    dataset, so <code>market_data_history</code> only has real depth back to whenever it was
+    first brought up. Use this to backfill weeks of real history for the datasets the BESS
+    backtest simulator (<code>/dashboard/bess/new</code>) reads, via Energinet's public
+    <code>start</code>/<code>end</code> date-range API. Free -- pure Energinet HTTP polling +
+    Postgres writes, no Anthropic API calls. Safe to re-run (see
+    <code>shared/backfill.py</code>).
+  </p>
+  <form method="post" action="/dashboard/ingestor/backfill">
+    <label>Days back: <input type="number" name="days" value="30" min="1" style="width:5em;"></label>
+    <label>Datasets (comma-separated, blank = all):
+      <input type="text" name="datasets" placeholder="fcr_dk1,day_ahead_prices" style="width:20em;">
+    </label>
+    <button type="submit">Run backfill now</button>
+  </form>
+
+  {% if backfill_result is not none %}
+    {% if backfill_result.error is defined %}
+    <p><strong>Backfill failed:</strong> {{ backfill_result.error }}</p>
+    {% else %}
+    <p><strong>Backfill result:</strong>
+      {{ backfill_result.total_rows_saved }} row(s) saved across
+      {{ backfill_result.datasets|length }} dataset(s), window
+      {{ backfill_result.start }} &ndash; {{ backfill_result.end }}.</p>
+    <ul>
+      {% for r in backfill_result.datasets %}
+      <li>{{ r.dataset }}: {{ r.rows_saved }} row(s) saved
+        ({{ r.chunks_fetched }} chunk(s), {{ r.chunks_failed }} failed),
+        span [{{ r.earliest_record_time }}, {{ r.latest_record_time }}]</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  {% endif %}
+</div>
+
 <h1>Recent Event Reports</h1>
 <p class="muted">Most recently published first.</p>
 

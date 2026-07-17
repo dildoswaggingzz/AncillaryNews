@@ -33,7 +33,7 @@ import os
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Form, Header, HTTPException, Query, Request
@@ -43,6 +43,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_
 from pydantic import BaseModel
 from qdrant_client import AsyncQdrantClient
 
+from shared.backfill import DEFAULT_BACKFILL_DAYS, DEFAULT_CHUNK_DAYS, run_backfill
 from shared.bess_simulator import BessConfig, run_backtest
 from shared.claim_extractor import extract_claims
 from shared.db_manager import DatabaseManager
@@ -579,6 +580,54 @@ async def trigger_crawler_run_now(crawler_main=Depends(get_crawler_main)):
     return await crawler_main.run_crawl_cycle()
 
 
+# --- on-demand historical backfill (shared/backfill.py) --------------------
+#
+# Unlike the orchestrator/crawler run-now routes above, this makes zero
+# Anthropic API calls -- pure Energinet HTTP polling + Postgres writes, the
+# same free, always-on nature as services/ingestor/main.py's scheduled
+# poller (see DEPLOYMENT.md's "Cost control: AUTO_RUN_ENABLED" -- ingestor
+# has no such gate and never needs one). So this route is always available,
+# with no LLM-spend concern to gate on; it's still gated behind API_KEY like
+# every other mutating route, since triggering database writes is at least
+# as sensitive as the read-only JSON routes above.
+
+
+class BackfillRequest(BaseModel):
+    start_time: datetime | None = None
+    end_time: datetime | None = None
+    # Subset of shared.backfill.bess_datasets() names, e.g. ["fcr_dk1"].
+    # Unset (None) backfills every BESS-relevant dataset.
+    datasets: list[str] | None = None
+    chunk_days: int = DEFAULT_CHUNK_DAYS
+
+
+@app.post("/ingestor/backfill", dependencies=[Depends(require_api_key)])
+async def trigger_backfill(req: BackfillRequest, db: DatabaseManager = Depends(get_db)):
+    """
+    Fires a one-time/on-demand historical backfill (shared/backfill.py) of
+    the datasets shared/bess_simulator.py reads, paging through
+    api.energidataservice.dk's start/end date-range query params rather than
+    the live ingestor's "most recent N records" pattern -- see
+    shared/backfill.py's module docstring for the full mechanism and its
+    idempotency/safe-to-re-run notes. Defaults to the trailing 30 days
+    ending now if start_time/end_time are omitted. Reuses this process's own
+    pooled DatabaseManager (`db`) rather than opening a second connection
+    pool the way the standalone scripts/backfill_history.py script does.
+    """
+    end_time = req.end_time or datetime.now(UTC)
+    start_time = req.start_time or (end_time - timedelta(days=DEFAULT_BACKFILL_DAYS))
+    try:
+        return await run_backfill(
+            start_time,
+            end_time,
+            dataset_names=req.datasets,
+            chunk_days=req.chunk_days,
+            db=db,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+
+
 # --- dashboard (server-rendered Jinja2 HTML, no JS build toolchain) ------
 
 
@@ -591,7 +640,12 @@ def dashboard_home(request: Request, db: DatabaseManager = Depends(get_db)):
     return templates.TemplateResponse(
         request,
         "index.html",
-        {"reports": reports, "orchestrator_result": None, "crawler_result": None},
+        {
+            "reports": reports,
+            "orchestrator_result": None,
+            "crawler_result": None,
+            "backfill_result": None,
+        },
     )
 
 
@@ -618,7 +672,12 @@ async def dashboard_trigger_orchestrator_run_now(
     return templates.TemplateResponse(
         request,
         "index.html",
-        {"reports": reports, "orchestrator_result": result, "crawler_result": None},
+        {
+            "reports": reports,
+            "orchestrator_result": result,
+            "crawler_result": None,
+            "backfill_result": None,
+        },
     )
 
 
@@ -635,7 +694,50 @@ async def dashboard_trigger_crawler_run_now(
     return templates.TemplateResponse(
         request,
         "index.html",
-        {"reports": reports, "orchestrator_result": None, "crawler_result": result},
+        {
+            "reports": reports,
+            "orchestrator_result": None,
+            "crawler_result": result,
+            "backfill_result": None,
+        },
+    )
+
+
+@app.post("/dashboard/ingestor/backfill", response_class=HTMLResponse)
+async def dashboard_trigger_backfill(
+    request: Request,
+    days: int = Form(DEFAULT_BACKFILL_DAYS),
+    datasets: str = Form(""),
+    db: DatabaseManager = Depends(get_db),
+):
+    """
+    Dashboard counterpart to `POST /ingestor/backfill` -- fires a real
+    historical backfill for the trailing `days` days (optionally restricted
+    to a comma-separated `datasets` subset) across the BESS-relevant
+    datasets (shared/backfill.py), then re-renders the dashboard home with
+    the run's summary shown inline. Stays open regardless of `API_KEY` (same
+    "dashboard HTML is for humans clicking around a browser" exception as
+    every other dashboard route). Unlike the orchestrator/crawler buttons
+    above, this makes zero Anthropic API calls, so there's no LLM-spend
+    warning here -- see shared/backfill.py's module docstring.
+    """
+    end_time = datetime.now(UTC)
+    start_time = end_time - timedelta(days=days)
+    dataset_names = [n.strip() for n in datasets.split(",") if n.strip()] or None
+    try:
+        result = await run_backfill(start_time, end_time, dataset_names=dataset_names, db=db)
+    except ValueError as e:
+        result = {"error": str(e)}
+    reports = db.fetch_event_reports(limit=25, offset=0)
+    return templates.TemplateResponse(
+        request,
+        "index.html",
+        {
+            "reports": reports,
+            "orchestrator_result": None,
+            "crawler_result": None,
+            "backfill_result": result,
+        },
     )
 
 

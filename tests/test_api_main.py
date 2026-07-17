@@ -929,8 +929,8 @@ def test_trigger_orchestrator_run_now_calls_real_cycle_function(
     client, monkeypatch, orchestrator_main_mock
 ):
     monkeypatch.delenv("API_KEY", raising=False)
-    api_main.app.dependency_overrides[api_main.get_orchestrator_main] = (
-        lambda: orchestrator_main_mock
+    api_main.app.dependency_overrides[api_main.get_orchestrator_main] = lambda: (
+        orchestrator_main_mock
     )
     try:
         resp = client.post("/orchestrator/run-now")
@@ -944,8 +944,8 @@ def test_trigger_orchestrator_run_now_calls_real_cycle_function(
 
 def test_trigger_orchestrator_run_now_gated_by_api_key(client, monkeypatch, orchestrator_main_mock):
     monkeypatch.setenv("API_KEY", "s3cret")
-    api_main.app.dependency_overrides[api_main.get_orchestrator_main] = (
-        lambda: orchestrator_main_mock
+    api_main.app.dependency_overrides[api_main.get_orchestrator_main] = lambda: (
+        orchestrator_main_mock
     )
     try:
         resp = client.post("/orchestrator/run-now")
@@ -960,8 +960,8 @@ def test_trigger_orchestrator_run_now_accepts_correct_api_key(
     client, monkeypatch, orchestrator_main_mock
 ):
     monkeypatch.setenv("API_KEY", "s3cret")
-    api_main.app.dependency_overrides[api_main.get_orchestrator_main] = (
-        lambda: orchestrator_main_mock
+    api_main.app.dependency_overrides[api_main.get_orchestrator_main] = lambda: (
+        orchestrator_main_mock
     )
     try:
         resp = client.post("/orchestrator/run-now", headers={"X-API-Key": "s3cret"})
@@ -1002,8 +1002,8 @@ def test_dashboard_trigger_orchestrator_run_now_renders_summary(
 ):
     monkeypatch.delenv("API_KEY", raising=False)
     db.fetch_event_reports.return_value = []
-    api_main.app.dependency_overrides[api_main.get_orchestrator_main] = (
-        lambda: orchestrator_main_mock
+    api_main.app.dependency_overrides[api_main.get_orchestrator_main] = lambda: (
+        orchestrator_main_mock
     )
     try:
         resp = client.post("/dashboard/orchestrator/run-now")
@@ -1021,8 +1021,8 @@ def test_dashboard_trigger_orchestrator_run_now_stays_open_regardless_of_api_key
 ):
     monkeypatch.setenv("API_KEY", "s3cret")
     db.fetch_event_reports.return_value = []
-    api_main.app.dependency_overrides[api_main.get_orchestrator_main] = (
-        lambda: orchestrator_main_mock
+    api_main.app.dependency_overrides[api_main.get_orchestrator_main] = lambda: (
+        orchestrator_main_mock
     )
     try:
         resp = client.post("/dashboard/orchestrator/run-now")
@@ -1058,6 +1058,163 @@ def test_dashboard_home_run_now_buttons_present(client, db):
     assert resp.status_code == 200
     assert "/dashboard/orchestrator/run-now" in resp.text
     assert "/dashboard/crawler/run-now" in resp.text
+
+
+# --- on-demand historical backfill (shared/backfill.py) ---------------------
+
+
+@pytest.fixture
+def backfill_mock():
+    return AsyncMock(
+        return_value={
+            "start": datetime(2026, 6, 1, tzinfo=UTC),
+            "end": datetime(2026, 7, 1, tzinfo=UTC),
+            "datasets": [
+                {
+                    "dataset": "fcr_dk1",
+                    "dataset_id": "FcrDK1",
+                    "chunks_fetched": 5,
+                    "chunks_failed": 0,
+                    "records_fetched": 10,
+                    "rows_saved": 10,
+                    "earliest_record_time": "2026-06-01T00:00:00",
+                    "latest_record_time": "2026-06-30T23:00:00",
+                }
+            ],
+            "total_rows_saved": 10,
+        }
+    )
+
+
+def test_trigger_backfill_calls_run_backfill(client, monkeypatch, backfill_mock):
+    monkeypatch.delenv("API_KEY", raising=False)
+    monkeypatch.setattr(api_main, "run_backfill", backfill_mock)
+
+    resp = client.post("/ingestor/backfill", json={})
+
+    assert resp.status_code == 200
+    assert resp.json()["total_rows_saved"] == 10
+    backfill_mock.assert_awaited_once()
+
+
+def test_trigger_backfill_gated_by_api_key(client, monkeypatch, backfill_mock):
+    monkeypatch.setenv("API_KEY", "s3cret")
+    monkeypatch.setattr(api_main, "run_backfill", backfill_mock)
+
+    resp = client.post("/ingestor/backfill", json={})
+
+    assert resp.status_code == 401
+    backfill_mock.assert_not_awaited()
+
+
+def test_trigger_backfill_accepts_correct_api_key(client, monkeypatch, backfill_mock):
+    monkeypatch.setenv("API_KEY", "s3cret")
+    monkeypatch.setattr(api_main, "run_backfill", backfill_mock)
+
+    resp = client.post("/ingestor/backfill", json={}, headers={"X-API-Key": "s3cret"})
+
+    assert resp.status_code == 200
+    backfill_mock.assert_awaited_once()
+
+
+def test_trigger_backfill_defaults_to_trailing_30_days(client, monkeypatch, backfill_mock):
+    monkeypatch.delenv("API_KEY", raising=False)
+    monkeypatch.setattr(api_main, "run_backfill", backfill_mock)
+
+    client.post("/ingestor/backfill", json={})
+
+    start_time, end_time = backfill_mock.call_args.args[:2]
+    assert (end_time - start_time).days == 30
+
+
+def test_trigger_backfill_passes_through_explicit_window_and_datasets(
+    client, monkeypatch, backfill_mock
+):
+    monkeypatch.delenv("API_KEY", raising=False)
+    monkeypatch.setattr(api_main, "run_backfill", backfill_mock)
+
+    resp = client.post(
+        "/ingestor/backfill",
+        json={
+            "start_time": "2025-10-01T00:00:00Z",
+            "end_time": "2025-11-01T00:00:00Z",
+            "datasets": ["fcr_dk1", "day_ahead_prices"],
+        },
+    )
+
+    assert resp.status_code == 200
+    start_time, end_time = backfill_mock.call_args.args[:2]
+    assert start_time == datetime(2025, 10, 1, tzinfo=UTC)
+    assert end_time == datetime(2025, 11, 1, tzinfo=UTC)
+    assert backfill_mock.call_args.kwargs["dataset_names"] == ["fcr_dk1", "day_ahead_prices"]
+
+
+def test_trigger_backfill_rejects_invalid_window_with_422(client, monkeypatch):
+    monkeypatch.delenv("API_KEY", raising=False)
+
+    async def _raise(*_args, **_kwargs):
+        raise ValueError("start must be before end")
+
+    monkeypatch.setattr(api_main, "run_backfill", _raise)
+
+    resp = client.post(
+        "/ingestor/backfill",
+        json={
+            "start_time": "2026-07-01T00:00:00Z",
+            "end_time": "2026-06-01T00:00:00Z",
+        },
+    )
+
+    assert resp.status_code == 422
+
+
+def test_dashboard_trigger_backfill_renders_summary(client, db, monkeypatch, backfill_mock):
+    monkeypatch.delenv("API_KEY", raising=False)
+    db.fetch_event_reports.return_value = []
+    monkeypatch.setattr(api_main, "run_backfill", backfill_mock)
+
+    resp = client.post("/dashboard/ingestor/backfill", data={"days": "30", "datasets": ""})
+
+    assert resp.status_code == 200
+    assert "10 row(s) saved" in resp.text
+    backfill_mock.assert_awaited_once()
+    assert backfill_mock.call_args.kwargs["dataset_names"] is None
+
+
+def test_dashboard_trigger_backfill_parses_dataset_list(client, db, monkeypatch, backfill_mock):
+    monkeypatch.delenv("API_KEY", raising=False)
+    db.fetch_event_reports.return_value = []
+    monkeypatch.setattr(api_main, "run_backfill", backfill_mock)
+
+    resp = client.post(
+        "/dashboard/ingestor/backfill",
+        data={"days": "90", "datasets": "fcr_dk1, day_ahead_prices"},
+    )
+
+    assert resp.status_code == 200
+    assert backfill_mock.call_args.kwargs["dataset_names"] == ["fcr_dk1", "day_ahead_prices"]
+
+
+def test_dashboard_trigger_backfill_stays_open_regardless_of_api_key(
+    client, db, monkeypatch, backfill_mock
+):
+    monkeypatch.setenv("API_KEY", "s3cret")
+    db.fetch_event_reports.return_value = []
+    monkeypatch.setattr(api_main, "run_backfill", backfill_mock)
+
+    resp = client.post("/dashboard/ingestor/backfill", data={"days": "30", "datasets": ""})
+
+    assert resp.status_code == 200
+    backfill_mock.assert_awaited_once()
+
+
+def test_dashboard_home_backfill_form_present(client, db):
+    db.fetch_event_reports.return_value = []
+
+    resp = client.get("/")
+
+    assert resp.status_code == 200
+    assert "/dashboard/ingestor/backfill" in resp.text
 
 
 # --- dashboard pages -------------------------------------------------------

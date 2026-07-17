@@ -89,6 +89,89 @@ does mean an on-demand run happens synchronously inside the API request
 background task/queue if cycles ever grew large enough to risk request
 timeouts).
 
+## Historical backfill for the BESS backtest simulator
+
+`services/ingestor/main.py`'s scheduled cycle only ever fetches the most
+recent handful of records per dataset (`shared/datasets.py`'s
+`limit`/`sort`-based `params`), so `market_data_history` only has real depth
+back to whenever the stack was first brought up. The BESS backtest simulator
+(`shared/bess_simulator.py`, `POST /bess/backtest`) needs weeks of price
+history to build a meaningful rolling baseline and see varied market
+conditions, so `shared/backfill.py` adds a separate, occasional/manual
+mechanism that pages through Energinet's `start`/`end` date-range query
+params (confirmed live against `api.energidataservice.dk`; not documented in
+`docs/dataset-catalogue.md`) instead of the live poller's "most recent N
+records" pattern. Unlike `ingestor`, this makes **zero** Anthropic API
+calls -- pure Energinet HTTP polling + Postgres writes -- so there's no
+LLM-spend concern to gate here, and it's always available.
+
+Two ways to run it:
+
+- **Standalone script** (`scripts/backfill_history.py`) -- for a one-off
+  local backfill, e.g. against docker-compose's mapped Postgres port:
+
+  ```bash
+  DATABASE_URL=postgresql://postgres:secret@localhost:5433/energy \
+      poetry run python scripts/backfill_history.py --days 30
+  ```
+
+  `--start`/`--end` (ISO 8601) for an explicit window instead of `--days`,
+  `--datasets fcr_dk1,day_ahead_prices` to restrict to a subset, `--chunk-days`
+  to change the per-request date-range chunk size. Not part of any
+  `docker-compose.yml` service or scheduled job -- run it manually whenever a
+  wider window is needed.
+
+- **`POST /ingestor/backfill`** on the `api` service -- same on-demand
+  pattern as `/orchestrator/run-now`/`/crawler/run-now` above (runs
+  `shared.backfill.run_backfill` in-process against the `api` service's own
+  pooled `DatabaseManager`), gated behind `API_KEY` like the other mutating
+  routes. Body: `{"start_time": ..., "end_time": ..., "datasets": [...],
+  "chunk_days": ...}`, all optional (defaults to the trailing 30 days ending
+  now, every BESS-relevant dataset). The dashboard homepage (`/`) has a
+  matching "Run backfill now" form (days + optional comma-separated dataset
+  list) that stays open regardless of `API_KEY`, same exception as every
+  other dashboard HTML route.
+
+Both backfill the exact datasets `shared/bess_simulator.py` reads --
+`shared.backfill.BESS_DATASET_NAMES` (`fcr_dk1`, `fcr_dk2`,
+`afrr_reserves_nordic`, `afrr_energy_activation`, `day_ahead_prices`,
+`imbalance_price`) -- never `mfrr_capacity`/`mfrr_eam` (excluded by the
+battery market-participation constraint, same as the simulator itself).
+
+**Idempotent / safe to re-run**: every chunk's records are saved via the
+exact same `DatabaseManager.save_market_data` the live ingestor uses, tagged
+with a fresh `fetched_at`, `ON CONFLICT (time, market, zone, product,
+fetched_at) DO NOTHING`. Re-running a backfill over an overlapping or
+identical window does **not** dedupe against the live ingestor's earlier
+fetches of the same `time`/`market`/`zone`/`product` -- it adds new rows with
+their own `fetched_at`, exactly like any other independent fetch of
+already-known data. This is consistent with (not a bug in)
+`market_data_history`'s deliberately append-only, revision-preserving
+design; nothing here mutates or dedupes existing rows, and it never
+disturbs/duplicates the live ingestor's own data in a destructive way.
+
+**Real Energinet data depth (observed 2026-07-17, will drift over time)**:
+retention varies a lot per dataset and isn't documented anywhere --
+discovered empirically by querying the live API. At the time this was built:
+`day_ahead_prices`/`imbalance_price`/`afrr_reserves_nordic`/`fcr_dk1`/`fcr_dk2`
+each had multiple months to 4+ years of real history available; `afrr_energy_activation`
+(sub-second `TimeMsUTC` resolution) only had a few months. A 30-day default
+window comfortably fits every one of them.
+
+**Rate limiting**: `docs/dataset-catalogue.md` documents ~1 request/second
+observed during the original M0 bulk discovery; a live backfill run while
+building this found the real limit noticeably stricter in short bursts
+(repeated HTTP 429s), and the `FcrDK1`/`FcrNdDK2` endpoints specifically
+appeared to tolerate even less request volume than the others in practice.
+`BaseIngestor.fetch_data` already retries `429`s with exponential backoff (5
+attempts, 2-10s), so an occasional 429 self-heals and a failed chunk is
+logged and skipped (not fatal to the rest of that dataset's backfill or any
+other dataset's) rather than aborting the whole run -- but a wide backfill
+over several datasets can still end up with some chunks (particularly for
+the FCR datasets) failing to fetch within the retry budget. Re-run the
+script/route for just the affected dataset(s) (`--datasets fcr_dk1`) to fill
+in any gaps -- safe per the idempotency note above.
+
 ## What each service needs to run
 
 | Service | Requires | Optional |
