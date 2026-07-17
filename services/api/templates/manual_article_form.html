@@ -3,8 +3,8 @@
 {% block content %}
 <h1>Submit a LinkedIn Post</h1>
 <p class="muted">
-  Paste in a post's URL, author, and text. It runs through the same Claude
-  Haiku claim-extraction pipeline used for RSS articles, always as a
+  Paste in a post's URL, author, and content below. It runs through the same
+  Claude Haiku claim-extraction pipeline used for RSS articles, always as a
   Tier 2 source — any claim Claude classifies as "fact" is downgraded to
   "theory" (README §6: an individual's LinkedIn commentary is never citable
   as bare fact).
@@ -24,7 +24,13 @@
     <input type="text" id="title" name="title" style="width: 100%;" value="{{ result.title if result else '' }}">
   </p>
   <p>
-    <label for="text"><strong>Post text</strong></label><br>
+    <label for="text"><strong>Post content</strong></label><br>
+    <span class="muted">
+      Paste any of: the <code>&lt;iframe&gt;</code> code from LinkedIn's own "Embed this post"
+      button, a LinkedIn embed URL, a regular LinkedIn post URL, or just plain text. Embed/post
+      URLs are auto-detected and the real post text + canonical URL are fetched automatically
+      (overriding the URL field above); anything else is used as-is.
+    </span><br>
     <textarea id="text" name="text" rows="8" style="width: 100%;" required></textarea>
   </p>
   <button type="submit">Extract Claims</button>

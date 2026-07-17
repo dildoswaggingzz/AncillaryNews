@@ -44,6 +44,7 @@ from qdrant_client import AsyncQdrantClient
 from shared.bess_simulator import BessConfig, run_backtest
 from shared.claim_extractor import extract_claims
 from shared.db_manager import DatabaseManager
+from shared.linkedin_embed import resolve_linkedin_content
 from shared.logging_config import configure_logging
 from shared.rss_reader import ArticleRef
 from shared.vector_store import QdrantStore
@@ -379,6 +380,16 @@ def get_bess_run(run_id: int, include_ticks: bool = False, db: DatabaseManager =
 # commentary is never citable as bare fact regardless of what Claude
 # classifies it as -- this reuses shared/claim_extractor.py's existing
 # fact->theory downgrade rather than building a new mechanism.
+#
+# `text` also doubles as an auto-detecting input (shared/linkedin_embed.py):
+# a human can paste LinkedIn's own "Embed this post" iframe HTML, a bare
+# embed URL, or a regular post URL into it instead of plain text, and
+# `_process_manual_article` will fetch+use the real post content and its
+# canonical URL (overriding whatever's in `url` -- the canonical URL is the
+# real, stable dedup key) rather than treating the pasted markup as the
+# post body itself. Anything that doesn't match one of those shapes, or any
+# fetch failure, falls back to today's plain-pasted-text behavior --
+# `resolve_linkedin_content` never raises.
 
 
 class ManualArticleSubmission(BaseModel):
@@ -395,13 +406,29 @@ async def _process_manual_article(submission: ManualArticleSubmission, store: Qd
     services/crawler/main.py's `process_article`). Unlike the crawler's
     fire-and-forget background cycle, this returns the outcome directly --
     a human is actively submitting and wants to see what was captured.
+
+    `submission.text` is first run through `resolve_linkedin_content`
+    (shared/linkedin_embed.py) in case it's LinkedIn embed iframe HTML/URL
+    rather than plain text; when that resolves, the fetched post text and
+    its canonical URL are used in place of `submission.text`/`submission.url`
+    for everything below.
     """
+    text = submission.text
+    url = submission.url
+    author = submission.author
+
+    linkedin_content = await resolve_linkedin_content(submission.text)
+    if linkedin_content is not None:
+        text = linkedin_content.text
+        url = linkedin_content.canonical_url
+        author = author or linkedin_content.author
+
     await store.ensure_collection()
 
     article = ArticleRef(
-        url=submission.url,
+        url=url,
         title=submission.title or "",
-        author=submission.author,
+        author=author,
         published=None,
         feed_name=MANUAL_SUBMISSION_SOURCE,
         feed_tier="tier2",
@@ -420,12 +447,12 @@ async def _process_manual_article(submission: ManualArticleSubmission, store: Qd
             "claims": [],
         }
 
-    extraction = await extract_claims(submission.text, article)
+    extraction = await extract_claims(text, article)
     if extraction is None:
         # No ANTHROPIC_API_KEY (or the call/parse failed outright): store the
         # raw pasted text without derived claims -- same fallback precedent
         # as services/crawler/main.py's process_article.
-        await store.upsert_raw_article(article, submission.text)
+        await store.upsert_raw_article(article, text)
         return {
             "url": article.url,
             "title": article.title,
@@ -519,10 +546,12 @@ def dashboard_series_detail(
 
 @app.get("/dashboard/manual-articles", response_class=HTMLResponse)
 def dashboard_manual_article_form(request: Request):
-    """The LinkedIn paste-in form -- URL, author, title, and post text,
-    posting to the handler below. Stays open regardless of `API_KEY` (same
-    "dashboard HTML is for humans clicking around a browser" exception as
-    every other dashboard route, see module docstring); the underlying JSON
+    """The LinkedIn paste-in form -- URL, author, title, and a content field
+    that auto-detects embed iframe HTML/URL vs. plain text (see
+    shared/linkedin_embed.py, `_process_manual_article`), posting to the
+    handler below. Stays open regardless of `API_KEY` (same "dashboard HTML
+    is for humans clicking around a browser" exception as every other
+    dashboard route, see module docstring); the underlying JSON
     `/manual-articles` route this shares logic with is what's gated."""
     return templates.TemplateResponse(request, "manual_article_form.html", {"result": None})
 

@@ -656,6 +656,137 @@ def test_submit_manual_article_requires_url(client, vector_store, monkeypatch):
     assert resp.status_code == 422
 
 
+# --- /manual-articles LinkedIn embed auto-detection (shared/linkedin_embed.py) ---
+#
+# `text` doubles as an auto-detecting input: iframe HTML/embed URLs/regular
+# post URLs are resolved via `resolve_linkedin_content` (mocked here --
+# shared/linkedin_embed.py's own tests cover the real HTTP fetch/parse) and,
+# when that resolves, override both the submitted text and the submitted
+# `url` (with the fetched canonical URL). Plain text -- and any fetch
+# failure -- fall back to today's raw-pasted-text behavior untouched.
+
+LINKEDIN_IFRAME_SUBMISSION = {
+    "url": "https://example.test/placeholder-not-used",
+    "author": None,
+    "title": None,
+    "text": (
+        '<iframe src="https://www.linkedin.com/embed/feed/update/'
+        'urn:li:share:7479918035902959616?collapsed=1" height="647" width="504" '
+        'frameborder="0" allowfullscreen title="Embedded post"></iframe>'
+    ),
+}
+
+
+def test_submit_manual_article_resolves_linkedin_embed_iframe(client, vector_store, monkeypatch):
+    """A pasted embed iframe is fetched+parsed, and the *canonical* URL --
+    not the submitted placeholder `url` -- is what's used for dedup/storage."""
+    monkeypatch.delenv("API_KEY", raising=False)
+
+    from shared.linkedin_embed import LinkedInEmbedContent
+
+    fetched = LinkedInEmbedContent(
+        text="The aFRR capacity market (CM) and energy activation market (EAM) prices in DK2 "
+        "are set to drop significantly due to a sharp decline in aFRR demand.",
+        canonical_url="https://www.linkedin.com/feed/update/urn:li:activity:7479918037115047936",
+        author="Andreas Barnekov Thingvad",
+    )
+    monkeypatch.setattr(api_main, "resolve_linkedin_content", AsyncMock(return_value=fetched))
+
+    extraction = ExtractionResult(
+        summary="DK2 aFRR prices set to drop due to lower demand.",
+        claims=[
+            ExtractedClaim(
+                claim="DK2 aFRR capacity/energy prices will drop significantly.",
+                claim_type="forecast",
+            )
+        ],
+    )
+    monkeypatch.setattr(api_main, "extract_claims", AsyncMock(return_value=extraction))
+
+    resp = client.post("/manual-articles", json=LINKEDIN_IFRAME_SUBMISSION)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["url"] == "https://www.linkedin.com/feed/update/urn:li:activity:7479918037115047936"
+    assert body["author"] == "Andreas Barnekov Thingvad"
+    assert body["claims"][0]["claim_type"] == "forecast"
+
+    article_arg = vector_store.upsert_claims.call_args.args[0]
+    assert (
+        article_arg.url
+        == "https://www.linkedin.com/feed/update/urn:li:activity:7479918037115047936"
+    )
+
+    claims_arg = api_main.extract_claims.call_args.args[0]
+    assert "DK2" in claims_arg
+    assert "iframe" not in claims_arg
+
+
+def test_submit_manual_article_prefers_submitted_author_over_fetched(
+    client, vector_store, monkeypatch
+):
+    """The human-typed `author` form field wins over whatever the embed page's
+    title-tag heuristic produced."""
+    monkeypatch.delenv("API_KEY", raising=False)
+
+    from shared.linkedin_embed import LinkedInEmbedContent
+
+    fetched = LinkedInEmbedContent(
+        text="Some fetched post text.",
+        canonical_url="https://www.linkedin.com/feed/update/urn:li:activity:111",
+        author="Fetched Author",
+    )
+    monkeypatch.setattr(api_main, "resolve_linkedin_content", AsyncMock(return_value=fetched))
+    monkeypatch.setattr(
+        api_main, "extract_claims", AsyncMock(return_value=ExtractionResult(summary="s", claims=[]))
+    )
+
+    submission = dict(LINKEDIN_IFRAME_SUBMISSION, author="Explicit Human Author")
+    resp = client.post("/manual-articles", json=submission)
+
+    assert resp.status_code == 200
+    assert resp.json()["author"] == "Explicit Human Author"
+
+
+def test_submit_manual_article_falls_back_to_raw_text_when_no_linkedin_content_detected(
+    client, vector_store, monkeypatch
+):
+    """Plain text (the pre-existing behavior) never touches `resolve_linkedin_content`'s
+    HTTP fetch path -- it just returns None and the submitted text/url pass through as-is."""
+    monkeypatch.delenv("API_KEY", raising=False)
+
+    fake_extract = AsyncMock(return_value=ExtractionResult(summary="s", claims=[]))
+    monkeypatch.setattr(api_main, "extract_claims", fake_extract)
+
+    resp = client.post("/manual-articles", json=MANUAL_SUBMISSION)
+
+    assert resp.status_code == 200
+    assert resp.json()["url"] == MANUAL_SUBMISSION["url"]
+    fake_extract.assert_awaited_once()
+    claims_arg = fake_extract.call_args.args[0]
+    assert claims_arg == MANUAL_SUBMISSION["text"]
+
+
+def test_submit_manual_article_falls_back_to_raw_text_when_linkedin_fetch_fails(
+    client, vector_store, monkeypatch
+):
+    """A recognized LinkedIn URL whose fetch fails (network error, private/deleted post,
+    etc) degrades gracefully to the submitted text/url -- never a 500."""
+    monkeypatch.delenv("API_KEY", raising=False)
+    monkeypatch.setattr(api_main, "resolve_linkedin_content", AsyncMock(return_value=None))
+
+    fake_extract = AsyncMock(return_value=ExtractionResult(summary="s", claims=[]))
+    monkeypatch.setattr(api_main, "extract_claims", fake_extract)
+
+    resp = client.post("/manual-articles", json=LINKEDIN_IFRAME_SUBMISSION)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["url"] == LINKEDIN_IFRAME_SUBMISSION["url"]
+    claims_arg = fake_extract.call_args.args[0]
+    assert claims_arg == LINKEDIN_IFRAME_SUBMISSION["text"]
+
+
 # --- dashboard manual-article form ------------------------------------------
 
 
