@@ -112,6 +112,28 @@ This also matters commercially: if the supplier warranty genuinely is a rolling-
 than an annual count, the backtest quantifies what that clause costs — a number to negotiate
 with, and worth more on config A.
 
+### 2.2b Warranty terms vary — parameterise, do not hardcode
+
+Operator input 2026-07-20: warranty specifics are not settled and **vary by supplier**; 550
+cyc/yr against the current setup is fine to design against. That is not a "revisit later" note
+— it is a design requirement, and it is the third instance of the same pattern in this
+milestone (cf. the zone registry §2b.2 and the D-1/intraday seam §2c.4). The decision stays
+open; the seam goes in now while it is free.
+
+Two concrete requirements:
+
+1. **The annual budget is a `BessConfig` field**, alongside the existing `max_cycles_per_day`
+   — never a constant. Real supplier terms should be a config change and a re-run, not a code
+   change.
+2. **The cycle-accounting convention is an explicit switch**, not an implicit assumption. The
+   code counts an FCE as `discharge_MWh / capacity_mwh` (nameplate). The alternative — usable-
+   band traverses — differs by a factor of **1.32** (§1.2), i.e. ~24% of the budget. Today that
+   choice is buried in `full_cycle_equivalents`; it should be named and swappable.
+
+Neither is speculative generality: both are single fields backing a decision already known to
+be pending, and the 1.32 factor is large enough that discovering the convention late would
+invalidate every backtest run before it.
+
 ### 2.3 λ — the cycle budget is a reservoir
 
 With an annual budget, the shadow price of a cycle is time-varying. Write **λ_t** = DKK per MWh
@@ -414,6 +436,9 @@ versus both ceiling and baseline.
    comparison case for §2.2. Add an annual budget field and a λ-driven policy as an alternative
    mode. Persisted configs must keep reproducing their stored numbers, consistent with the
    existing `capacity_allocation` precedent (`:216-224`).
+1b. **Cycle-accounting convention as an explicit config switch** (§2.2b) — nameplate (today's
+   behaviour, the default) versus usable-band traverses, a 1.32x difference. Name it rather
+   than leaving it implicit in `full_cycle_equivalents` (`:395-404`).
 2. **Cycle reporting** per §2.4 on `BacktestResult`.
 3. **Replace the static aFRR participation rate** with a forecast-driven activation-energy
    draw (§4.3), keeping the static rate as the default so existing runs reproduce.
@@ -425,16 +450,21 @@ versus both ceiling and baseline.
 
 ## 7. Open questions
 
-1. **Warranty cycle definition** — §1.2, gates the 550 figure.
-2. **Is 550 a hard ceiling or a budget with an overrun price?** If exceeding it costs warranty
-   coverage rather than being forbidden, λ acquires a natural upper bound and the optimisation
-   changes shape.
-3. **When does regelleistung.net ingestion get scoped?** §2b.3 — the only thing gating DK1 FCR,
+1. **When does regelleistung.net ingestion get scoped?** §2b.3 — the only thing gating DK1 FCR,
    and the trigger for revisiting §2b.4.
-4. **Which multi-market benchmark, specifically?** §2c.5 assumes comparison against
+2. **Which multi-market benchmark, specifically?** §2c.5 assumes comparison against
    perfect-foresight ceiling and P2 baseline. If a named external model or vendor figure is the
    intended comparator, its stacking convention needs checking against §2c.1 before any
    headline number is put beside it.
+3. **Is 550 a hard ceiling or a budget with an overrun price?** Deferred with the rest of the
+   warranty terms (§2.2b). If exceeding it costs warranty coverage rather than being forbidden,
+   λ acquires a natural upper bound and the optimisation changes shape — so this one is a
+   *model-shape* question, not just a parameter, and should be revisited when real terms land
+   rather than assumed to fall out of §2.2b's parameterisation.
+
+*Deferred by operator decision 2026-07-20:* warranty cycle definition and terms — vary by
+supplier, current setup is fine to design against, handled by parameterisation (§2.2b) rather
+than by blocking.
 
 *Resolved 2026-07-20:* scope §5 Q1 (asset — §1), Q2 (zone — §2b), Q3 (horizon — §2c). No open
 question now gates P0 or P1.
