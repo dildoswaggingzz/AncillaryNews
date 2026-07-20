@@ -18,6 +18,7 @@
   <tr>
     <th>Run</th><th>Zone</th><th>Period</th><th>Arbitrage revenue (DKK)</th>
     <th>Capacity revenue (DKK)</th><th>Total revenue (DKK)</th><th>Full cycle equivalents</th>
+    <th>Capacity revenue (EUR)</th>
     <th>aFRR activation revenue (EUR)</th>
     <th>Created</th>
   </tr>
@@ -30,6 +31,11 @@
     <td>{{ "%.2f"|format(run.total_capacity_revenue_dkk) }}</td>
     <td>{{ "%.2f"|format(run.total_revenue_dkk) }}</td>
     <td>{{ "%.3f"|format(run.full_cycle_equivalents) }}</td>
+    <td>{{ "%.2f"|format(run.get('total_capacity_revenue_eur', 0.0)) }}
+      {% if run.total_capacity_revenue_dkk and run.get('total_capacity_revenue_eur', 0.0) %}
+      <span class="muted">(not summable with the DKK total)</span>
+      {% endif %}
+    </td>
     <td>{{ "%.2f"|format(run.total_afrr_activation_revenue_eur) }}</td>
     <td>{{ run.created_at }}</td>
   </tr>

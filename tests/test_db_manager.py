@@ -72,7 +72,8 @@ def test_save_market_data_maps_records_to_rows(mock_execute, db, pooled_conn):
     saved = db.save_market_data(RECORDS, MFRR_CAPACITY)
 
     _, _, values = mock_execute.call_args.args
-    assert saved == 4  # 2 records x 2 series (up/down)
+    assert saved.total == 4  # 2 records x 2 series (up/down)
+    assert saved.by_series == {"mFRR_capacity:up": 2, "mFRR_capacity:down": 2}
     fetched_ats = {v[7] for v in values}
     assert len(fetched_ats) == 1  # single fetched_at for the whole batch
     rows_without_fetched_at = [v[:7] for v in values]
@@ -94,7 +95,7 @@ def test_save_market_data_omits_missing_series_field(mock_execute, db):
     saved = db.save_market_data(partial_records, MFRR_CAPACITY)
 
     _, _, values = mock_execute.call_args.args
-    assert saved == 1
+    assert saved.total == 1
     assert values[0][:7] == (
         "2026-07-16T10:00:00",
         "mFRR_capacity",
@@ -104,6 +105,28 @@ def test_save_market_data_omits_missing_series_field(mock_execute, db):
         "Energinet",
         True,
     )
+    # "down" is a configured series that got zero rows this batch -- it must
+    # still show up in by_series at 0, not be absent, so a genuinely-typo'd
+    # series (which would *always* be 0, batch after batch) is distinguishable
+    # from a series simply not exercised in this one test's fixture data.
+    assert saved.by_series == {"mFRR_capacity:up": 1, "mFRR_capacity:down": 0}
+
+
+@patch("shared.db_manager.execute_values")
+def test_save_market_data_by_series_starts_every_configured_series_at_zero(mock_execute, db):
+    """
+    The Stage 2 guardrail's whole point: a series that never maps a single
+    row across an entire batch (indistinguishable, from inside this one
+    call, from a typo'd value_field) still gets a `by_series` entry at 0 --
+    never simply absent from the dict.
+    """
+    records = [{"TimeUTC": "2026-07-16T10:00:00", "PriceArea": "DK1"}]  # no Up/DownPriceDKK at all
+
+    saved = db.save_market_data(records, MFRR_CAPACITY)
+
+    assert saved.total == 0
+    assert saved.by_series == {"mFRR_capacity:up": 0, "mFRR_capacity:down": 0}
+    mock_execute.assert_not_called()
 
 
 def test_save_market_data_falls_back_to_configured_zone_when_no_zone_field(db):
@@ -145,7 +168,7 @@ def test_save_market_data_returns_zero_when_no_series_map(db):
             [{"TimeUTC": "2026-07-16T10:00:00", "PriceArea": "DK1"}], MFRR_CAPACITY
         )
 
-        assert saved == 0
+        assert saved.total == 0
         mock_execute.assert_not_called()
 
 
@@ -212,7 +235,7 @@ def test_save_market_data_maps_mfrr_eam_price_and_volume_products(mock_execute, 
     # up, down, up_volume (down_volume omitted: None), up_total_volume,
     # down_total_volume (0, not omitted -- 0 is a valid volume, not missing),
     # up_offered_volume, down_offered_volume
-    assert saved == 7
+    assert saved.total == 7
     rows_without_fetched_at = {(v[1], v[2], v[3], v[4]) for v in values}
     assert rows_without_fetched_at == {
         ("mFRR_EAM", "DK1", "up", 165.24),
@@ -242,7 +265,7 @@ def test_save_market_data_maps_afrr_energy_activation_volume(mock_execute, db):
     saved = db.save_market_data(records, AFRR_ENERGY_ACTIVATION)
 
     _, _, values = mock_execute.call_args.args
-    assert saved == 2
+    assert saved.total == 2
     rows = {(v[1], v[2], v[3], v[4]) for v in values}
     assert rows == {
         ("aFRR_energy", "DK2", "activation_price", 194.07),
@@ -268,7 +291,7 @@ def test_save_market_data_maps_afrr_picasso_corrections(mock_execute, db):
 
     _, _, values = mock_execute.call_args.args
     # PriceDownEUR is None, so only correction_volume + up are saved.
-    assert saved == 2
+    assert saved.total == 2
     rows = {(v[1], v[2], v[3], v[4]) for v in values}
     assert rows == {
         ("aFRR_correction", "DK1", "correction_volume", 126.88699),
@@ -822,6 +845,7 @@ def test_fetch_bess_runs_returns_mapped_rows(db, pooled_conn):
             datetime(2026, 7, 17, 9, tzinfo=UTC),
             None,
             25.0,
+            10.0,
         )
     ]
     conn.cursor.return_value.__enter__.return_value = cursor
@@ -833,6 +857,7 @@ def test_fetch_bess_runs_returns_mapped_rows(db, pooled_conn):
     assert result[0]["config"] == {"power_mw": 1.0}
     assert result[0]["label"] is None
     assert result[0]["total_afrr_activation_revenue_eur"] == 25.0
+    assert result[0]["total_capacity_revenue_eur"] == 10.0
     query, params = cursor.execute.call_args.args
     assert "zone = %s" in query
     assert params == ["DK1", 10, 0]
@@ -855,6 +880,7 @@ def test_fetch_bess_runs_decodes_json_string_config(db, pooled_conn):
             48,
             datetime(2026, 7, 17, 9, tzinfo=UTC),
             "morning_brief",
+            0.0,
             0.0,
         )
     ]
@@ -895,6 +921,8 @@ def test_fetch_bess_ticks_returns_mapped_rows(db, pooled_conn):
             15.0,
             2.0,
             2.0,
+            3.0,
+            3.0,
         )
     ]
     conn.cursor.return_value.__enter__.return_value = cursor
@@ -905,6 +933,8 @@ def test_fetch_bess_ticks_returns_mapped_rows(db, pooled_conn):
     assert result[0]["capacity_revenue_by_market"] == {"FCR": 10.0, "aFRR_capacity": 5.0}
     assert result[0]["afrr_activation_revenue_eur"] == 2.0
     assert result[0]["cumulative_afrr_activation_revenue_eur"] == 2.0
+    assert result[0]["capacity_revenue_eur"] == 3.0
+    assert result[0]["cumulative_capacity_revenue_eur"] == 3.0
     query, params = cursor.execute.call_args.args
     assert "run_id = %s" in query
     assert params == (1,)
@@ -940,7 +970,193 @@ def test_afrr_reserves_nordic_dataset_is_registered():
     afrr_capacity = next(d for d in DATASETS if d.name == "afrr_reserves_nordic")
     assert afrr_capacity.market == "aFRR_capacity"
     products = {s.product for s in afrr_capacity.series}
-    assert products == {"up", "down"}
+    assert products == {
+        "up",
+        "down",
+        "up_demand_volume",
+        "down_demand_volume",
+        "up_procured_volume",
+        "down_procured_volume",
+        "up_eur",
+        "down_eur",
+    }
+
+
+# --- Stage 3 registry expansion --------------------------------------------
+
+
+def test_ffr_dk2_dataset_is_registered():
+    ffr = next(d for d in DATASETS if d.name == "ffr_dk2")
+    assert ffr.market == "FFR"
+    assert ffr.zone_field is None
+    assert ffr.zone == "DK2"
+    products = {s.product for s in ffr.series}
+    assert products == {"price", "price_eur", "demand_volume", "purchased_volume"}
+    price_series = next(s for s in ffr.series if s.product == "price")
+    assert price_series.value_field == "FFR_PriceDKK"  # DKK primary -- stacks with aFRR (DKK)
+    assert price_series.unit == "DKK/MW/h"
+
+
+def test_ffr_demand_dk2_has_eight_lowercase_demand_steps():
+    """Field names are lowercase (`ffrupdemandd0`..`d7`), unlike every other
+    dataset in this registry -- must not get "fixed" to PascalCase."""
+    ffr_demand = next(d for d in DATASETS if d.name == "ffr_demand_dk2")
+    assert ffr_demand.market == "FFR"
+    assert ffr_demand.zone == "DK2"
+    value_fields = sorted(s.value_field for s in ffr_demand.series)
+    assert value_fields == [f"ffrupdemandd{i}" for i in range(8)]
+    products = {s.product for s in ffr_demand.series}
+    assert products == {f"demand_step_{i}" for i in range(8)}
+
+
+def test_mfrr_capacity_extra_dataset_uses_its_own_market_label():
+    """Deliberately NOT merged into mfrr_capacity -- see shared/datasets.py's
+    comment on why (corrupting the main auction's rule-engine baseline)."""
+    extra = next(d for d in DATASETS if d.name == "mfrr_capacity_extra")
+    assert extra.market == "mFRR_capacity_extra"
+    assert extra.market != "mFRR_capacity"
+    products = {s.product for s in extra.series}
+    assert products == {
+        "up",
+        "down",
+        "up_demand_volume",
+        "down_demand_volume",
+        "up_procured_volume",
+        "down_procured_volume",
+    }
+
+
+def test_fcr_dk2_includes_volume_and_d1_early_products():
+    fcr_dk2 = next(d for d in DATASETS if d.name == "fcr_dk2")
+    products = {s.product for s in fcr_dk2.series}
+    assert products == {
+        "price",
+        "up",
+        "down",
+        "volume",
+        "up_volume",
+        "down_volume",
+        "volume_local",
+        "up_volume_local",
+        "down_volume_local",
+        "d1_price",
+        "d1_up",
+        "d1_down",
+    }
+    d1_price = next(s for s in fcr_dk2.series if s.product == "d1_price")
+    assert d1_price.value_field == "PriceTotalEUR"
+    assert d1_price.extra_filters == {"AuctionType": "D-1 early"}
+    total_price = next(s for s in fcr_dk2.series if s.product == "price")
+    assert total_price.extra_filters == {"AuctionType": "Total"}
+
+
+def test_inertia_nordic_dataset_is_zone_heterogeneous():
+    inertia = next(d for d in DATASETS if d.name == "inertia_nordic")
+    assert inertia.market == "inertia"
+    assert inertia.zone_field is None
+    assert inertia.zone == "ALL"  # the Nordic-wide "nordic" product's own zone
+    zones_by_product = {s.product: s.zone for s in inertia.series}
+    assert zones_by_product == {
+        "nordic": None,  # None -> falls back to the dataset's own zone ("ALL")
+        "dk2": "DK2",
+        "no": "NO",
+        "se": "SE",
+        "fi": "FI",
+    }
+
+
+@patch("shared.db_manager.execute_values")
+def test_save_market_data_maps_ffr_demand_lowercase_fields(mock_execute, db):
+    ffr_demand = next(d for d in DATASETS if d.name == "ffr_demand_dk2")
+    records = [
+        {
+            "HourUTC": "2026-07-21T21:00:00",
+            "ffrupdemandd0": 0.0,
+            "ffrupdemandd1": 2.087,
+            "ffrupdemandd2": 0.0,
+            "ffrupdemandd3": 2.72,
+            "ffrupdemandd4": 1.707,
+            "ffrupdemandd5": 0.0,
+            "ffrupdemandd6": 0.0,
+            "ffrupdemandd7": 0.0,
+        }
+    ]
+
+    saved = db.save_market_data(records, ffr_demand)
+
+    # Every step ingests, including the 0.0 ones -- 0.0 is a real value, not
+    # a missing one.
+    assert saved.total == 8
+    _, _, values = mock_execute.call_args.args
+    rows = {(v[1], v[2], v[3], v[4]) for v in values}
+    assert ("FFR", "DK2", "demand_step_1", 2.087) in rows
+    assert ("FFR", "DK2", "demand_step_0", 0.0) in rows
+
+
+@patch("shared.db_manager.execute_values")
+def test_save_market_data_maps_mfrr_capacity_extra_null_price_but_real_volume(mock_execute, db):
+    """The exact live shape (confirmed 2026-07-21): prices null, volumes
+    0.0 -- volumes must ingest even though the prices in the same record
+    don't."""
+    extra = next(d for d in DATASETS if d.name == "mfrr_capacity_extra")
+    records = [
+        {
+            "TimeUTC": "2026-07-21T23:00:00",
+            "PriceArea": "DK1",
+            "UpDemandMW": 0.0,
+            "UpProcuredMW": 0.0,
+            "UpPriceEUR": None,
+            "UpPriceDKK": None,
+            "DownDemandMW": 0.0,
+            "DownProcuredMW": 0.0,
+            "DownPriceEUR": None,
+            "DownPriceDKK": None,
+        }
+    ]
+
+    saved = db.save_market_data(records, extra)
+
+    assert saved.total == 4  # up/down demand + up/down procured; both prices are null
+    assert saved.by_series == {
+        "mFRR_capacity_extra:up": 0,
+        "mFRR_capacity_extra:down": 0,
+        "mFRR_capacity_extra:up_demand_volume": 1,
+        "mFRR_capacity_extra:down_demand_volume": 1,
+        "mFRR_capacity_extra:up_procured_volume": 1,
+        "mFRR_capacity_extra:down_procured_volume": 1,
+    }
+
+
+@patch("shared.db_manager.execute_values")
+def test_save_market_data_maps_inertia_nordic_zone_heterogeneous_record(mock_execute, db):
+    """End-to-end via the real registry entry (not a synthetic stand-in
+    dataset): one record carries both the Nordic-wide figure (zone="ALL",
+    the dataset's own default) and per-zone figures (each series' own
+    `zone` override)."""
+    inertia = next(d for d in DATASETS if d.name == "inertia_nordic")
+    records = [
+        {
+            "HourUTC": "2026-07-19T23:00:00",
+            "InertiaNordicGWs": 160.494778,
+            "InertiaDK2GWs": 4.051791,
+            "InertiaNOGWs": 45.383817,
+            "InertiaSEGWs": 64.852658,
+            "InertiaFIGWs": 46.203951,
+        }
+    ]
+
+    saved = db.save_market_data(records, inertia)
+
+    assert saved.total == 5
+    _, _, values = mock_execute.call_args.args
+    rows = {(v[1], v[2], v[3], v[4]) for v in values}
+    assert rows == {
+        ("inertia", "ALL", "nordic", 160.494778),
+        ("inertia", "DK2", "dk2", 4.051791),
+        ("inertia", "NO", "no", 45.383817),
+        ("inertia", "SE", "se", 64.852658),
+        ("inertia", "FI", "fi", 46.203951),
+    }
 
 
 @patch("shared.db_manager.execute_values")
@@ -977,9 +1193,43 @@ def test_save_market_data_applies_series_filter_field(mock_execute, db):
 
     saved = db.save_market_data(records, dataset)
 
-    assert saved == 1
+    assert saved.total == 1
     values = mock_execute.call_args.args[2]
     assert values[0][4] == 20.0  # only the FCR-N row's price is mapped
+
+
+@patch("shared.db_manager.execute_values")
+def test_save_market_data_series_zone_override_wins_over_record_zone(mock_execute, db):
+    """
+    `SeriesConfig.zone` (needed for a zone-heterogeneous dataset like a
+    future `InertiaNordicSyncharea` -- see shared/datasets.py's docstring)
+    must override the record-level zone resolution when set, while a
+    series left at the default `zone=None` keeps using the record's own
+    zone -- both in the same dataset, to prove one series' override doesn't
+    leak onto a sibling series.
+    """
+    dataset = DatasetConfig(
+        name="zone_override_test",
+        dataset_id="TestZoneOverride",
+        market="inertia",
+        time_field="HourUTC",
+        zone_field=None,
+        zone="ALL",
+        series=[
+            SeriesConfig(product="nordic", value_field="InertiaNordicGWs"),
+            SeriesConfig(product="dk2", value_field="InertiaDK2GWs", zone="DK2"),
+        ],
+    )
+    records = [{"HourUTC": "2026-07-18T21:00:00", "InertiaNordicGWs": 150.0, "InertiaDK2GWs": 12.0}]
+
+    db.save_market_data(records, dataset)
+
+    _, _, values = mock_execute.call_args.args
+    rows = {(v[1], v[2], v[3], v[4]) for v in values}
+    assert rows == {
+        ("inertia", "ALL", "nordic", 150.0),  # no series-level zone -> dataset's own zone
+        ("inertia", "DK2", "dk2", 12.0),  # series-level zone override wins
+    }
 
 
 @patch("shared.db_manager.execute_values")
@@ -1019,7 +1269,7 @@ def test_save_market_data_applies_extra_filters(mock_execute, db):
 
     saved = db.save_market_data(records, dataset)
 
-    assert saved == 1
+    assert saved.total == 1
     values = mock_execute.call_args.args[2]
     assert values[0][4] == 20.0  # only the "Total" auction row is mapped
 
@@ -1048,8 +1298,9 @@ def test_save_bess_run_persists_label(db, pooled_conn):
 
     assert run_id == 9
     insert_run_call = cursor.execute.call_args_list[0]
-    # label is second-to-last (total_afrr_activation_revenue_eur is last).
-    assert insert_run_call.args[1][-2] == "morning_brief"
+    # label is third-to-last (total_afrr_activation_revenue_eur,
+    # total_capacity_revenue_eur follow it, in that order).
+    assert insert_run_call.args[1][-3] == "morning_brief"
 
 
 # --- Morning Brief (M5) persistence -------------------------------------------
@@ -1228,6 +1479,36 @@ def test_mark_morning_brief_delivery_noop_when_nothing_given(db, pooled_conn):
     db.mark_morning_brief_delivery(1)
 
     cursor.execute.assert_not_called()
+
+
+# --- check_expected_columns (Stage 0 startup schema check) -------------------
+
+
+def test_check_expected_columns_returns_only_missing_pairs(db, pooled_conn):
+    from shared.db_manager import EXPECTED_SCHEMA_COLUMNS
+
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    # Every expected column present except one.
+    present = set(EXPECTED_SCHEMA_COLUMNS) - {("bess_simulation_ticks", "capacity_revenue_eur")}
+    cursor.fetchall.return_value = list(present)
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    missing = db.check_expected_columns()
+
+    assert missing == [("bess_simulation_ticks", "capacity_revenue_eur")]
+    mock_pool.putconn.assert_called_once_with(conn)
+
+
+def test_check_expected_columns_empty_when_all_present(db, pooled_conn):
+    from shared.db_manager import EXPECTED_SCHEMA_COLUMNS
+
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.fetchall.return_value = list(EXPECTED_SCHEMA_COLUMNS)
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    assert db.check_expected_columns() == []
 
 
 def test_fetch_daily_aggregates_returns_mapped_rows(db, pooled_conn):

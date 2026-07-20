@@ -497,9 +497,11 @@ def _morning_brief_patches(
         "id": 10,
         "forecast": {"narrative": "flat", "confidence": "medium", "swing_factors": ["wind"]},
     }
-    bess_result = bess_result if bess_result is not None else [
-        {"config_label": "Small", "zone": "DK1", "run_id": 1, "cycle_cap_was_binding": False}
-    ]
+    bess_result = (
+        bess_result
+        if bess_result is not None
+        else [{"config_label": "Small", "zone": "DK1", "run_id": 1, "cycle_cap_was_binding": False}]
+    )
 
     mock_db = MagicMock()
     mock_db.save_morning_brief.return_value = brief_id
@@ -677,3 +679,31 @@ def test_morning_brief_auto_run_enabled_is_independent_of_auto_run_enabled(monke
     monkeypatch.setenv("MORNING_BRIEF_AUTO_RUN_ENABLED", "true")
     monkeypatch.setenv("AUTO_RUN_ENABLED", "false")
     assert orchestrator_main._morning_brief_auto_run_enabled() is True
+
+
+# --- schema-completeness startup check (Stage 0) ----------------------------
+
+
+def test_warn_on_missing_schema_columns_logs_warning(caplog):
+    db_mock = MagicMock()
+    db_mock.check_expected_columns.return_value = [
+        ("bess_simulation_ticks", "capacity_revenue_eur")
+    ]
+    with patch.object(orchestrator_main, "DatabaseManager", return_value=db_mock):
+        with caplog.at_level("WARNING"):
+            orchestrator_main._warn_on_missing_schema_columns()
+
+    assert "missing 1 expected column" in caplog.text
+    assert "scripts/migrate.py" in caplog.text
+    db_mock.close.assert_called_once()
+
+
+def test_warn_on_missing_schema_columns_silent_when_complete(caplog):
+    db_mock = MagicMock()
+    db_mock.check_expected_columns.return_value = []
+    with patch.object(orchestrator_main, "DatabaseManager", return_value=db_mock):
+        with caplog.at_level("WARNING"):
+            orchestrator_main._warn_on_missing_schema_columns()
+
+    assert caplog.text == ""
+    db_mock.close.assert_called_once()

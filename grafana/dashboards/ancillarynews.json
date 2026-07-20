@@ -97,6 +97,22 @@
         }
       ],
       "fieldConfig": { "defaults": {}, "overrides": [] }
+    },
+    {
+      "id": 7,
+      "title": "Series with zero new rows in the last 6h (typo / silently-null detector)",
+      "description": "shared/dataset_validation.py's Stage 2 guardrail. A series that flatlines at 0 for 6h straight is either a typo'd `value_field` in shared/datasets.py (never ingests, ever) or a column that's genuinely gone quiet -- either way, worth a look. See services/ingestor/main.py's SERIES_ROWS_TOTAL comment.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "targets": [
+        {
+          "expr": "increase(ingestor_series_rows_total[6h]) == 0",
+          "legendFormat": "{{dataset}}/{{market}}/{{product}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": {}, "overrides": [] }
     }
   ]
 }

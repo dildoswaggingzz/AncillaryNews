@@ -16,6 +16,7 @@ from shared.backfill import (
 )
 from shared.base_ingestor import BaseIngestor
 from shared.datasets import DATASETS
+from shared.db_manager import SaveResult
 
 FCR_DK1 = next(d for d in DATASETS if d.name == "fcr_dk1")
 DAY_AHEAD = next(d for d in DATASETS if d.name == "day_ahead_prices")
@@ -30,12 +31,34 @@ def test_bess_datasets_matches_bess_dataset_names():
     assert {d.name for d in bess_datasets()} == BESS_DATASET_NAMES
 
 
+def test_bess_dataset_names_exact_membership():
+    """
+    Literal exact-membership assertion (not just self-referential against
+    BESS_DATASET_NAMES like the test above) -- fails loudly if a future
+    registry change adds/removes a name from the allowlist without a
+    conscious edit here too. Update this set deliberately, in the same
+    change that edits shared/backfill.py:BESS_DATASET_NAMES.
+    """
+    assert BESS_DATASET_NAMES == {
+        "fcr_dk1",
+        "fcr_dk2",
+        "afrr_reserves_nordic",
+        "afrr_energy_activation",
+        "day_ahead_prices",
+        "imbalance_price",
+        "ffr_dk2",
+        "ffr_demand_dk2",
+        "inertia_nordic",
+    }
+
+
 def test_bess_datasets_excludes_mfrr_markets():
-    """mFRR capacity/EAM are never read by shared/bess_simulator.py (battery
+    """mFRR capacity/EAM/capacity-extra are never read by shared/bess_simulator.py (battery
     market-participation constraint) -- must never be backfilled either."""
     names = {d.name for d in bess_datasets()}
     assert "mfrr_capacity" not in names
     assert "mfrr_eam" not in names
+    assert "mfrr_capacity_extra" not in names
 
 
 def test_bess_datasets_excludes_non_bess_ingested_datasets():
@@ -107,7 +130,9 @@ def ingestor():
 @pytest.fixture
 def db():
     d = MagicMock()
-    d.save_market_data.side_effect = lambda records, dataset: len(records)
+    d.save_market_data.side_effect = lambda records, dataset: SaveResult(
+        total=len(records), by_series={}
+    )
     return d
 
 
@@ -192,7 +217,7 @@ async def test_backfill_dataset_skips_failed_save_chunk_without_aborting(ingesto
             ),
         ]
     )
-    db.save_market_data.side_effect = [Exception("db down"), 1]
+    db.save_market_data.side_effect = [Exception("db down"), SaveResult(total=1, by_series={})]
 
     result = await backfill_dataset(
         ingestor, db, FCR_DK1, start, end, chunk_days=7, rate_limit_seconds=0

@@ -67,13 +67,22 @@ ENERGINET_BASE_URL = "https://api.energidataservice.dk"
 # 429s rare across a real 30-day/3-dataset backfill run.
 RATE_LIMIT_SECONDS = 3.0
 
-# The exact shared/datasets.py entries shared/bess_simulator.py reads (see
-# its module docstring: FCR via fcr_dk1/fcr_dk2, aFRR capacity via
+# The shared/datasets.py entries shared/bess_simulator.py reads today, plus
+# the ones a near-term BESS-stacking change is expected to read (see its
+# module docstring: FCR via fcr_dk1/fcr_dk2, aFRR capacity via
 # afrr_reserves_nordic, aFRR energy activation via afrr_energy_activation
 # (ingested/eligible but not yet its own revenue stream -- see that
-# docstring), day-ahead via day_ahead_prices, imbalance via
-# imbalance_price). mfrr_capacity/mfrr_eam are never read by the BESS
-# simulator (battery market-participation constraint) and
+# docstring), day-ahead via day_ahead_prices, imbalance via imbalance_price).
+# `ffr_dk2`/`ffr_demand_dk2` (FFR capacity, a genuinely BESS-addressable
+# market not yet wired into the simulator's `capacity_markets`) and
+# `inertia_nordic` (causal context for FCR-D/FFR demand, read by
+# `shared/price_recap_synthesizer.py`) are included here ahead of that
+# wiring landing, so historical depth is already backfillable the day it
+# does -- a backtest is useless without weeks of prior history, and there's
+# no reason to make that a blocking dependency of the wiring change itself.
+# mfrr_capacity/mfrr_eam/mfrr_capacity_extra are never read by the BESS
+# simulator (battery market-participation constraint --
+# `shared/bess_simulator.py:EXCLUDED_MARKETS`) and
 # power_system_right_now/afrr_picasso_corrections are ingested for other
 # purposes (system-state context, revision-signal investigation) but not
 # read by it either. Kept as an explicit name list -- not "every
@@ -88,6 +97,9 @@ BESS_DATASET_NAMES = frozenset(
         "afrr_energy_activation",
         "day_ahead_prices",
         "imbalance_price",
+        "ffr_dk2",
+        "ffr_demand_dk2",
+        "inertia_nordic",
     }
 )
 
@@ -117,8 +129,9 @@ CHUNK_LIMIT = 20000
 
 
 def bess_datasets() -> list[DatasetConfig]:
-    """Returns the shared/datasets.py DatasetConfig entries shared/bess_simulator.py actually
-    reads (BESS_DATASET_NAMES above), in registry order."""
+    """Returns the shared/datasets.py DatasetConfig entries relevant to BESS backtesting
+    (BESS_DATASET_NAMES above -- see that constant's docstring for exactly what "relevant"
+    covers), in registry order."""
     return [d for d in DATASETS if d.name in BESS_DATASET_NAMES]
 
 
@@ -201,7 +214,8 @@ async def backfill_dataset(
         records_fetched += len(records)
 
         try:
-            rows_saved += db.save_market_data(records, dataset)
+            save_result = db.save_market_data(records, dataset)
+            rows_saved += save_result.total
         except Exception:
             logger.exception(
                 "Backfill save failed for %s [%s, %s)", dataset.name, chunk_start, chunk_end

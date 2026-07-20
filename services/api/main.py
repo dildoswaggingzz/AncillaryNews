@@ -50,6 +50,7 @@ from shared.db_manager import DatabaseManager
 from shared.linkedin_embed import resolve_linkedin_content
 from shared.logging_config import configure_logging
 from shared.rss_reader import ArticleRef
+from shared.units import unit_for
 from shared.vector_store import QdrantStore
 
 configure_logging()
@@ -383,6 +384,21 @@ def _run_and_save_bess_backtest(
         "total_revenue_dkk": result.total_revenue_dkk,
         "full_cycle_equivalents": result.full_cycle_equivalents,
         "total_afrr_activation_revenue_eur": result.total_afrr_activation_revenue_eur,
+        # DK2's EUR-denominated capacity legs (shared/bess_simulator.py's
+        # per-currency buckets, module docstring §2) -- always 0.0 for an
+        # all-DKK DK1 run. `len(currencies_present) > 1` is this run's
+        # "not summable to one number" signal, surfaced to the dashboard
+        # template rather than recomputed there.
+        "total_capacity_revenue_eur": result.total_capacity_revenue_eur,
+        "currencies_present": sorted(result.currencies_present),
+        # How many periods each capacity leg cleared at exactly 0 (e.g.
+        # "FFR cleared at 0 for 720/720 hours in this window") -- see
+        # BacktestResult.zero_price_periods_by_leg's docstring. Not
+        # persisted (init-db/04-bess-simulations.sql has no column for it),
+        # so only available here, on the freshly-computed result, not on a
+        # later re-fetch of this run_id.
+        "zero_price_periods_by_leg": result.zero_price_periods_by_leg,
+        "capacity_allocation_fell_back_to_even": result.capacity_allocation_fell_back_to_even,
     }
 
 
@@ -968,11 +984,18 @@ def dashboard_bess_trigger(
     arbitrage_z_threshold: float = Form(...),
     capacity_commit_mw: float = Form(...),
     afrr_activation_participation_rate: float = Form(...),
-    # Checkbox rather than asking the user to type raw capacity_markets
-    # tuples -- translated into the two extra FCR-D legs server-side below.
-    # Meaningless for DK1 (no FCR-D market there); left to the user to pick
-    # a DK2 zone alongside it.
+    # Checkbox group rather than asking the user to type raw
+    # capacity_markets tuples -- each translated into its own extra leg(s)
+    # server-side below. Every one of these is meaningless for at least one
+    # zone (FCR-D and FFR are DK2-only; see shared/datasets.py's fcr_dk2/
+    # ffr_dk2 entries) -- previously that just silently earned nothing
+    # (empty series, not an error); now rejected outright below via
+    # `unit_for(...) is None`, since silently-zero legs are exactly the
+    # kind of "looks configured but isn't" gap this repo tries to avoid
+    # elsewhere (see shared/bess_simulator.py's leg_currency ValueError).
     include_fcr_d: bool = Form(False),
+    include_ffr: bool = Form(False),
+    include_afrr_down: bool = Form(False),
     db: DatabaseManager = Depends(get_db),
 ):
     """Runs the submitted form through the same trigger logic the JSON API uses, then redirects to
@@ -980,7 +1003,40 @@ def dashboard_bess_trigger(
     capacity_markets = [("FCR", "price"), ("aFRR_capacity", "up")]
     if include_fcr_d:
         capacity_markets += [("FCR", "up"), ("FCR", "down")]
+    if include_afrr_down:
+        capacity_markets += [("aFRR_capacity", "down")]
+    if include_ffr:
+        capacity_markets += [("FFR", "price")]
     try:
+        # Reject a market/zone combination the registry itself already
+        # knows is meaningless (e.g. FFR ticked for a DK1 run) -- `unit_for`
+        # returning None means shared/units.py has no entry at all for that
+        # (market, zone, product), not just "no data yet". Driven entirely
+        # by the registry, not a hardcoded per-market zone list, so this
+        # needs no new market literals here.
+        #
+        # Known gap, not a new one: `fcr_dk2`'s "up"/"down" (FCR-D) products
+        # are registered *zone-agnostically* in shared/units.py (their
+        # source dataset's real PriceArea values span DK2 and several
+        # Swedish zones, not one fixed zone -- see shared/datasets.py's
+        # fcr_dk2 comment), so `unit_for("FCR", "DK1", "up")` still resolves
+        # to a real unit even though DK1 never actually publishes FCR-D
+        # data -- this check does not catch that specific case (unlike
+        # `ffr_dk2`, which IS registered under a fixed zone="DK2" and so
+        # correctly returns None for any other zone). A DK1 run with FCR-D
+        # ticked still just silently earns nothing on those legs, exactly
+        # as it always has -- not a regression Stage 4 introduces, just a
+        # gap it doesn't happen to close.
+        unavailable = [
+            (market, product)
+            for market, product in capacity_markets
+            if unit_for(market, zone, product) is None
+        ]
+        if unavailable:
+            raise ValueError(
+                f"the following capacity market(s) are not available in zone {zone!r}: "
+                f"{unavailable}"
+            )
         config = BessConfig(
             power_mw=power_mw,
             capacity_mwh=capacity_mwh,
@@ -993,6 +1049,14 @@ def dashboard_bess_trigger(
             capacity_commit_mw=capacity_commit_mw,
             afrr_activation_participation_rate=afrr_activation_participation_rate,
             capacity_markets=tuple(capacity_markets),
+            # FFR clears at/near 0 today (shared/datasets.py's ffr_dk2
+            # entry) -- "even" allocation would silently dilute the other,
+            # genuinely-earning legs' shares purely from adding it as a
+            # group (shared/bess_simulator.py's module docstring §2).
+            # "price_ranked" avoids that; only switched on when FFR is
+            # actually in the stack, so every other run's numbers stay
+            # exactly as reproducible as before.
+            capacity_allocation="price_ranked" if include_ffr else "even",
         )
         summary = _run_and_save_bess_backtest(db, zone, start_time, end_time, config)
     except ValueError as e:

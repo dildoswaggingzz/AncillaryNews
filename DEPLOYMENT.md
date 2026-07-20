@@ -22,6 +22,46 @@ gracefully if unset):
 | `METRICS_PORT` | ingestor (default `9100`), crawler (`9101`), orchestrator (`9102`) | Falls back to the documented default; the API always serves `/metrics` on its main port (`8000`). |
 | `AUTO_RUN_ENABLED` | crawler, orchestrator | Falls back to `false` -- their *automatic* scheduled cycles don't fire (no Claude API calls happen on a schedule). See "Cost control: AUTO_RUN_ENABLED" below. |
 
+## Required deploy step: `scripts/migrate.py` (schema migrations)
+
+`docker-compose.yml` mounts `./init-db` at `/docker-entrypoint-initdb.d`,
+which Postgres only executes automatically against a **brand-new, empty**
+data directory. On any deployment whose `pgdata` volume already existed
+before a new `init-db/*.sql` file was added -- e.g. pulling a release that
+adds a new `ALTER TABLE ... ADD COLUMN` migration -- that file never applies
+itself. This is not hypothetical: it is exactly how
+`init-db/06-bess-afrr-activation.sql`'s columns went unapplied on every
+pre-existing deployment until this was found and fixed.
+
+**Run this after every `docker-compose up`/deploy, on every environment,
+including a fresh one** (idempotent -- a no-op there, since Postgres already
+applied every file itself):
+
+```bash
+DATABASE_URL=postgresql://postgres:secret@localhost:5433/energy \
+    poetry run python scripts/migrate.py
+```
+
+Applies every `init-db/*.sql` file, in filename order, against
+`DATABASE_URL`. Every statement in `init-db/*.sql` is idempotent
+(`CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`, `CREATE OR
+REPLACE VIEW`, `create_hypertable(..., if_not_exists => TRUE)`, `ALTER TABLE
+... ADD COLUMN IF NOT EXISTS`) -- verified by running the full sequence
+twice in a row against a live TimescaleDB container while building this
+script (see `scripts/migrate.py`'s module docstring for the file-by-file
+breakdown), so re-running it is always safe.
+
+**Deliberately not auto-applied at service startup.** Every service instead
+calls `DatabaseManager.check_expected_columns()` once at boot and only *logs
+a warning* (`Database schema is missing N expected column(s): ...`) if
+columns from `init-db/*.sql`'s `ALTER TABLE ... ADD COLUMN` files are
+missing -- it never mutates schema itself. Auto-applying schema changes from
+inside an application process, unattended, against a database a whole fleet
+of services shares, is exactly the kind of surprise a production deployment
+shouldn't have to reason about; running `scripts/migrate.py` is meant to be
+an explicit, on-purpose step (a human, or a deploy pipeline stage), not an
+implicit side effect of a service starting.
+
 ## Cost control: `AUTO_RUN_ENABLED`
 
 Two of this stack's four services call the Anthropic API on every scheduled
@@ -132,11 +172,15 @@ Two ways to run it:
   list) that stays open regardless of `API_KEY`, same exception as every
   other dashboard HTML route.
 
-Both backfill the exact datasets `shared/bess_simulator.py` reads --
-`shared.backfill.BESS_DATASET_NAMES` (`fcr_dk1`, `fcr_dk2`,
+Both backfill `shared.backfill.BESS_DATASET_NAMES` (`fcr_dk1`, `fcr_dk2`,
 `afrr_reserves_nordic`, `afrr_energy_activation`, `day_ahead_prices`,
-`imbalance_price`) -- never `mfrr_capacity`/`mfrr_eam` (excluded by the
-battery market-participation constraint, same as the simulator itself).
+`imbalance_price`, `ffr_dk2`, `ffr_demand_dk2`, `inertia_nordic`) -- the
+datasets `shared/bess_simulator.py` reads today, plus `ffr_dk2`/
+`ffr_demand_dk2`/`inertia_nordic`, included ahead of a near-term BESS-
+stacking change so historical depth is already available the day that
+wiring lands (see `shared/backfill.py`'s comment on the constant) -- never
+`mfrr_capacity`/`mfrr_eam`/`mfrr_capacity_extra` (excluded by the battery
+market-participation constraint, same as the simulator itself).
 
 **Idempotent / safe to re-run**: every chunk's records are saved via the
 exact same `DatabaseManager.save_market_data` the live ingestor uses, tagged

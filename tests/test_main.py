@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from shared.datasets import DATASETS
+from shared.db_manager import SaveResult
 
 MAIN_PATH = Path(__file__).parent.parent / "services" / "ingestor" / "main.py"
 
@@ -28,6 +29,13 @@ def no_rate_limit_sleep(monkeypatch):
 def db_manager_cls():
     with patch.object(ingestor_main, "DatabaseManager") as mock_cls:
         mock_instance = MagicMock()
+        # Sensible default so tests that don't care about the exact
+        # SaveResult shape (most of them) don't have to configure it --
+        # real `save_market_data` always returns a SaveResult now (Stage 2),
+        # never a bare int/None.
+        mock_instance.save_market_data.return_value = SaveResult(
+            total=1, by_series={"fake_market:fake_product": 1}
+        )
         mock_cls.return_value = mock_instance
         yield mock_cls, mock_instance
 
@@ -99,7 +107,8 @@ async def test_cycle_continues_after_one_dataset_fetch_fails(db_manager_cls):
 async def test_cycle_continues_after_one_dataset_save_fails(db_manager_cls):
     _, db_instance = db_manager_cls
     db_instance.save_market_data.side_effect = [RuntimeError("db error")] + [
-        None for _ in range(len(DATASETS) - 1)
+        SaveResult(total=1, by_series={"fake_market:fake_product": 1})
+        for _ in range(len(DATASETS) - 1)
     ]
 
     with (
@@ -157,6 +166,34 @@ def test_metrics_are_registered_and_exposition_includes_expected_names():
     assert "ingestor_dataset_poll_total" in output
 
 
+# --- schema-completeness startup check (Stage 0) ----------------------------
+
+
+def test_warn_on_missing_schema_columns_logs_warning(db_manager_cls, caplog):
+    _, db_instance = db_manager_cls
+    db_instance.check_expected_columns.return_value = [
+        ("bess_simulation_runs", "total_capacity_revenue_eur")
+    ]
+
+    with caplog.at_level("WARNING"):
+        ingestor_main._warn_on_missing_schema_columns()
+
+    assert "missing 1 expected column" in caplog.text
+    assert "scripts/migrate.py" in caplog.text
+    db_instance.close.assert_called_once()
+
+
+def test_warn_on_missing_schema_columns_silent_when_complete(db_manager_cls, caplog):
+    _, db_instance = db_manager_cls
+    db_instance.check_expected_columns.return_value = []
+
+    with caplog.at_level("WARNING"):
+        ingestor_main._warn_on_missing_schema_columns()
+
+    assert caplog.text == ""
+    db_instance.close.assert_called_once()
+
+
 async def test_cycle_records_dataset_poll_outcomes(db_manager_cls):
     """A successful fetch+save increments the success counter for that dataset."""
     _, db_instance = db_manager_cls
@@ -179,5 +216,108 @@ async def test_cycle_records_dataset_poll_outcomes(db_manager_cls):
 
     after = ingestor_main.DATASET_POLL_TOTAL.labels(
         dataset=dataset.name, status="success"
+    )._value.get()
+    assert after == before + 1
+
+
+# --- SERIES_ROWS_TOTAL / zero_rows status (Stage 2 guardrail) ----------------
+
+
+async def test_cycle_increments_series_rows_total_per_by_series_entry(db_manager_cls):
+    _, db_instance = db_manager_cls
+    dataset = DATASETS[0]
+    db_instance.save_market_data.return_value = SaveResult(
+        total=3, by_series={"real_market:up": 2, "real_market:down": 1}
+    )
+
+    before_up = ingestor_main.SERIES_ROWS_TOTAL.labels(
+        dataset=dataset.name, market="real_market", product="up"
+    )._value.get()
+    before_down = ingestor_main.SERIES_ROWS_TOTAL.labels(
+        dataset=dataset.name, market="real_market", product="down"
+    )._value.get()
+
+    async def fake_fetch(endpoint, params=None):
+        return {"records": [{"fake": "record"}]}
+
+    with (
+        patch.object(
+            ingestor_main.BaseIngestor, "fetch_data", new=AsyncMock(side_effect=fake_fetch)
+        ),
+        patch.object(ingestor_main.BaseIngestor, "close", new=AsyncMock()),
+    ):
+        await ingestor_main.run_ingestion_cycle()
+
+    after_up = ingestor_main.SERIES_ROWS_TOTAL.labels(
+        dataset=dataset.name, market="real_market", product="up"
+    )._value.get()
+    after_down = ingestor_main.SERIES_ROWS_TOTAL.labels(
+        dataset=dataset.name, market="real_market", product="down"
+    )._value.get()
+    assert after_up == before_up + 2
+    assert after_down == before_down + 1
+
+
+async def test_cycle_increments_series_rows_total_even_for_a_zero_entry(db_manager_cls):
+    """
+    A configured-but-unpopulated series (SaveResult.by_series' 0 entries)
+    must still touch the counter (`.inc(0)`), not be skipped -- that's what
+    makes it a real, queryable/alertable Prometheus time series instead of
+    one that simply never exists (see services/ingestor/main.py's
+    SERIES_ROWS_TOTAL comment).
+    """
+    _, db_instance = db_manager_cls
+    dataset = DATASETS[0]
+    db_instance.save_market_data.return_value = SaveResult(
+        total=0, by_series={"real_market:typo_product": 0}
+    )
+
+    async def fake_fetch(endpoint, params=None):
+        return {"records": [{"fake": "record"}]}
+
+    with (
+        patch.object(
+            ingestor_main.BaseIngestor, "fetch_data", new=AsyncMock(side_effect=fake_fetch)
+        ),
+        patch.object(ingestor_main.BaseIngestor, "close", new=AsyncMock()),
+    ):
+        await ingestor_main.run_ingestion_cycle()
+
+    # Merely fetching the labelled child registers it in the exposition
+    # output at 0 -- a series that was never touched at all wouldn't appear
+    # here (this is exactly the "flat 0 is visible, absent is not" distinction).
+    from prometheus_client import generate_latest
+
+    output = generate_latest().decode()
+    assert (
+        f'ingestor_series_rows_total{{dataset="{dataset.name}",market="real_market",'
+        'product="typo_product"} 0.0' in output
+    )
+
+
+async def test_cycle_reports_zero_rows_status_when_save_result_total_is_zero(db_manager_cls):
+    _, db_instance = db_manager_cls
+    dataset = DATASETS[0]
+    db_instance.save_market_data.return_value = SaveResult(
+        total=0, by_series={"real_market:typo_product": 0}
+    )
+
+    before = ingestor_main.DATASET_POLL_TOTAL.labels(
+        dataset=dataset.name, status="zero_rows"
+    )._value.get()
+
+    async def fake_fetch(endpoint, params=None):
+        return {"records": [{"fake": "record"}]}
+
+    with (
+        patch.object(
+            ingestor_main.BaseIngestor, "fetch_data", new=AsyncMock(side_effect=fake_fetch)
+        ),
+        patch.object(ingestor_main.BaseIngestor, "close", new=AsyncMock()),
+    ):
+        await ingestor_main.run_ingestion_cycle()
+
+    after = ingestor_main.DATASET_POLL_TOTAL.labels(
+        dataset=dataset.name, status="zero_rows"
     )._value.get()
     assert after == before + 1

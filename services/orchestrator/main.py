@@ -417,7 +417,34 @@ async def scheduled_synthesis_cycle() -> None:
     await run_synthesis_cycle()
 
 
+def _warn_on_missing_schema_columns():
+    """
+    Startup check (Stage 0's migration-runner fix, `scripts/migrate.py`):
+    logs a warning -- never mutates schema itself -- if the live database is
+    missing columns `init-db/*.sql`'s `ALTER TABLE ... ADD COLUMN` files
+    declare (`shared/db_manager.py:check_expected_columns`). This service's
+    scheduled Morning Brief job (`run_illustrative_backtests` ->
+    `save_bess_run`) writes the affected BESS columns, so a missing column
+    here would otherwise surface as an opaque `psycopg2` error deep inside
+    that scheduled job instead of a clear warning at boot.
+    """
+    db = DatabaseManager()
+    try:
+        missing = db.check_expected_columns()
+        if missing:
+            logger.warning(
+                "Database schema is missing %d expected column(s): %s -- run "
+                "`poetry run python scripts/migrate.py` against DATABASE_URL "
+                "(see DEPLOYMENT.md) before relying on affected features.",
+                len(missing),
+                missing,
+            )
+    finally:
+        db.close()
+
+
 async def main():
+    _warn_on_missing_schema_columns()
     start_metrics_server(METRICS_PORT)
     scheduler = AsyncIOScheduler()
     scheduler.add_job(

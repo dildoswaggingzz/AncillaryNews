@@ -45,6 +45,13 @@ select = ["E", "F", "W", "I", "B", "UP"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# "live" tests make real HTTP calls to api.energidataservice.dk (see
+# tests/test_dataset_validation.py's whole-registry sweep, run via
+# scripts/validate_datasets.py) -- excluded from the default run so the
+# offline suite (`poetry run pytest`) stays hermetic; run them explicitly
+# with `poetry run pytest -m live`.
+addopts = "-m 'not live'"
+markers = ["live: makes real network calls (excluded from the default run)"]
 
 [build-system]
 requires = ["poetry-core"]
