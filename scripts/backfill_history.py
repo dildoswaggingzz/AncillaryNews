@@ -47,6 +47,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from shared.backfill import (  # noqa: E402
     DEFAULT_BACKFILL_DAYS,
     DEFAULT_CHUNK_DAYS,
+    backfillable_datasets,
     bess_datasets,
     run_backfill,
 )
@@ -98,9 +99,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--datasets",
         type=str,
         default=None,
-        help="Comma-separated subset of BESS dataset names to backfill (default: all of them -- "
+        help="Comma-separated dataset names to backfill (default: every BESS dataset -- "
         + ", ".join(d.name for d in bess_datasets())
-        + ").",
+        + "). Also accepts the M6 fundamentals-forecasting datasets (must be named "
+        "explicitly, never included in the default): "
+        + ", ".join(d.name for d in backfillable_datasets() if d not in bess_datasets())
+        + ".",
     )
     return parser.parse_args(argv)
 

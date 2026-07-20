@@ -103,6 +103,30 @@ BESS_DATASET_NAMES = frozenset(
     }
 )
 
+# M6 P0 (docs/forecast-datasets-scope.md §4 P0 item 3): the fundamentals
+# datasets added for the forecasting layer, kept as a second, explicit
+# reviewable set -- deliberately NOT merged into BESS_DATASET_NAMES (these
+# are not datasets shared/bess_simulator.py reads) and deliberately NOT part
+# of the *default* (dataset_names=None) backfill scope below, so an
+# unqualified backfill call (in particular the API route's no-args default)
+# doesn't silently start pulling these much-higher-volume datasets. An
+# operator must name them explicitly via `--datasets` (script) /
+# `dataset_names` (API), same discipline BESS_DATASET_NAMES's own docstring
+# already establishes for its own set.
+FORECASTING_DATASET_NAMES = frozenset(
+    {
+        "forecasts_hour",
+        "prodex_5min_realtime",
+        "afrr_border_atc",
+    }
+)
+
+# Every dataset name `run_backfill`'s `dataset_names` argument will accept --
+# the union of both reviewable sets above. `bess_datasets()`'s own selection
+# (used as the *default* dataset list when `dataset_names` is omitted) is
+# intentionally narrower than this.
+BACKFILLABLE_DATASET_NAMES = BESS_DATASET_NAMES | FORECASTING_DATASET_NAMES
+
 # A real backtest needs "weeks" of history (README brief for this task); 30
 # days is the conservative default window for both the CLI script and the
 # API route when no explicit start/end is given. Energinet's own retention
@@ -117,15 +141,32 @@ DEFAULT_BACKFILL_DAYS = 30
 # rather than one single [start, end] call, both to bound each individual
 # response's size and to give the rate limiter/retry logic more, smaller
 # checkpoints to recover at if one chunk's request fails.
+#
+# **Does not fit every dataset -- verified live 2026-07-20, M6 P0**: at
+# CHUNK_LIMIT's old value (20000), a DEFAULT_CHUNK_DAYS=7-day chunk of
+# `afrr_energy_activation` (confirmed live: ~172,400 records/day, both
+# zones) would silently return only the newest ~20000 of a chunk's ~1.2M
+# records -- Energinet's `sort`/`limit` combination truncates rather than
+# erroring, so this would fail silently, not loudly. `afrr_border_atc`
+# (~21,600 records/day, confirmed live) has the same problem even at
+# `chunk_days=1`. **A full backfill of either millisecond dataset must pass
+# an explicit smaller `--chunk-days` (1 is recommended for both, verified
+# safely under the raised CHUNK_LIMIT below at that grain) -- the default
+# below stays 7 for every other, much lower-volume dataset in this
+# registry.**
 DEFAULT_CHUNK_DAYS = 7
 
-# Generous per-chunk record cap. A DEFAULT_CHUNK_DAYS-wide window of even the
-# finest-grained dataset here (afrr_energy_activation, sub-second TimeMsUTC
-# resolution) can be large, but Energinet's API itself caps out well below
-# this; kept high rather than tuned per-dataset so one constant covers every
-# BESS dataset without a second per-dataset "expected volume" table to
-# maintain.
-CHUNK_LIMIT = 20000
+# Per-chunk record cap, sized to the highest-volume dataset actually in this
+# registry (`afrr_energy_activation`, confirmed live 2026-07-20: a single
+# UTC day returned exactly 172,421 records when requested with a `limit`
+# comfortably above that count -- i.e. Energinet's API honors a large
+# `limit` rather than silently capping it lower, confirmed by that same
+# live request). 300000 leaves >70% headroom above that single-day figure
+# for `--chunk-days 1` on the two millisecond datasets (see
+# DEFAULT_CHUNK_DAYS's comment above); every other, far lower-volume dataset
+# in this registry stays comfortably under this even at the default
+# `chunk_days=7`.
+CHUNK_LIMIT = 300000
 
 
 def bess_datasets() -> list[DatasetConfig]:
@@ -133,6 +174,14 @@ def bess_datasets() -> list[DatasetConfig]:
     (BESS_DATASET_NAMES above -- see that constant's docstring for exactly what "relevant"
     covers), in registry order."""
     return [d for d in DATASETS if d.name in BESS_DATASET_NAMES]
+
+
+def backfillable_datasets() -> list[DatasetConfig]:
+    """Every dataset name `run_backfill`'s `dataset_names` argument will accept (the union of
+    BESS_DATASET_NAMES and FORECASTING_DATASET_NAMES -- see both constants' docstrings), in
+    registry order. Broader than `bess_datasets()`, which is also this module's *default*
+    dataset list when `dataset_names` is omitted -- see `run_backfill`."""
+    return [d for d in DATASETS if d.name in BACKFILLABLE_DATASET_NAMES]
 
 
 def _date_chunks(start: datetime, end: datetime, chunk_days: int):
@@ -244,6 +293,16 @@ async def backfill_dataset(
     }
 
 
+# A CHUNK_LIMIT-sized response (up to 300000 records -- see that constant's
+# comment) from the two millisecond datasets can take Energinet noticeably
+# longer to generate/transmit than a typical few-hundred-record chunk;
+# `BaseIngestor`'s general-purpose default (`timeout=30.0`, sized for the
+# live poller's much smaller "most recent N records" requests) is too tight
+# for that. Backfill-specific, not changed globally, since the live poller
+# never requests anywhere near this many records per call.
+BACKFILL_TIMEOUT_SECONDS = 120.0
+
+
 async def run_backfill(
     start: datetime,
     end: datetime | None = None,
@@ -253,9 +312,12 @@ async def run_backfill(
     db: DatabaseManager | None = None,
 ) -> dict:
     """
-    Backfills every BESS-relevant dataset (`bess_datasets()`), or the
-    `dataset_names` subset of it if given, over `[start, end)` (`end`
-    defaults to now). Builds its own `BaseIngestor` always; builds its own
+    Backfills every BESS-relevant dataset (`bess_datasets()`) by default, or
+    the `dataset_names` subset of `backfillable_datasets()` if given -- see
+    that function's docstring for why the default and the explicitly-
+    nameable set differ (BESS_DATASET_NAMES vs. the broader
+    BACKFILLABLE_DATASET_NAMES). Over `[start, end)` (`end` defaults to
+    now). Builds its own `BaseIngestor` always; builds its own
     `DatabaseManager` only if one isn't passed in -- `services/api/main.py`'s
     `POST /ingestor/backfill` route passes its own already-pooled
     `DatabaseManager` (`get_db`) rather than opening a second connection
@@ -269,16 +331,16 @@ async def run_backfill(
 
     datasets = bess_datasets()
     if dataset_names is not None:
-        known_names = {d.name for d in datasets}
+        known_names = {d.name for d in backfillable_datasets()}
         unknown = set(dataset_names) - known_names
         if unknown:
             raise ValueError(
-                f"unknown/non-BESS dataset name(s): {sorted(unknown)}; "
+                f"unknown dataset name(s): {sorted(unknown)}; "
                 f"must be a subset of {sorted(known_names)}"
             )
-        datasets = [d for d in datasets if d.name in dataset_names]
+        datasets = [d for d in DATASETS if d.name in dataset_names]
 
-    ingestor = BaseIngestor(ENERGINET_BASE_URL)
+    ingestor = BaseIngestor(ENERGINET_BASE_URL, timeout=BACKFILL_TIMEOUT_SECONDS)
     owns_db = db is None
     if owns_db:
         db = DatabaseManager()
