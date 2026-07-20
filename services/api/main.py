@@ -792,12 +792,22 @@ async def dashboard_trigger_backfill(
     request: Request,
     days: int = Form(DEFAULT_BACKFILL_DAYS),
     datasets: str = Form(""),
+    # Was hard-locked to shared.backfill.DEFAULT_CHUNK_DAYS (7) until this
+    # field was added -- the JSON /ingestor/backfill route already exposed
+    # BackfillRequest.chunk_days, but the dashboard form didn't, so a
+    # high-volume dataset (afrr_energy_activation at the default 7-day
+    # chunk -- see shared/backfill.py's DEFAULT_CHUNK_DAYS comment) could
+    # only be backfilled correctly via the JSON route or the CLI script, not
+    # this form. Defaults to the same DEFAULT_CHUNK_DAYS so existing
+    # behaviour is unchanged for callers that don't touch this field.
+    chunk_days: int = Form(DEFAULT_CHUNK_DAYS),
     db: DatabaseManager = Depends(get_db),
 ):
     """
     Dashboard counterpart to `POST /ingestor/backfill` -- fires a real
     historical backfill for the trailing `days` days (optionally restricted
-    to a comma-separated `datasets` subset) across the BESS-relevant
+    to a comma-separated `datasets` subset, with `chunk_days` controlling
+    the per-request date-range chunk size) across the BESS-relevant
     datasets (shared/backfill.py), then re-renders the dashboard home with
     the run's summary shown inline. Stays open regardless of `API_KEY` (same
     "dashboard HTML is for humans clicking around a browser" exception as
@@ -809,7 +819,9 @@ async def dashboard_trigger_backfill(
     start_time = end_time - timedelta(days=days)
     dataset_names = [n.strip() for n in datasets.split(",") if n.strip()] or None
     try:
-        result = await run_backfill(start_time, end_time, dataset_names=dataset_names, db=db)
+        result = await run_backfill(
+            start_time, end_time, dataset_names=dataset_names, chunk_days=chunk_days, db=db
+        )
     except ValueError as e:
         result = {"error": str(e)}
     reports = db.fetch_event_reports(limit=25, offset=0)

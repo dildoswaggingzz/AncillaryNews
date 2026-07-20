@@ -238,12 +238,21 @@ async def backfill_dataset(
     rest of the dataset's backfill -- mirrors
     services/ingestor/main.py:run_ingestion_cycle's "one dataset's failure
     doesn't take down the rest" pattern, applied at chunk granularity here.
+
+    A chunk whose response lands on exactly `CHUNK_LIMIT` records is flagged
+    as (likely) silently truncated by Energinet's sort+limit behavior -- see
+    the inline comment at that check -- logged as a warning and counted in
+    the returned summary's `chunks_truncated`/`truncated_windows`, distinct
+    from `chunks_failed` since the chunk did fetch and save successfully.
+
     Returns a summary dict for this one dataset.
     """
     records_fetched = 0
     rows_saved = 0
     chunks_fetched = 0
     chunks_failed = 0
+    chunks_truncated = 0
+    truncated_windows: list[dict] = []
     earliest_record_time = None
     latest_record_time = None
 
@@ -267,6 +276,34 @@ async def backfill_dataset(
         if not records:
             continue
         records_fetched += len(records)
+
+        # Energinet's dataset API applies `sort` then `limit` and *truncates*
+        # rather than erroring when a window has more records than `limit` --
+        # so a response landing on exactly CHUNK_LIMIT is indistinguishable
+        # from "this window happened to have exactly CHUNK_LIMIT records"
+        # except that the former is astronomically more likely for any chunk
+        # whose true record count comfortably exceeds CHUNK_LIMIT (see that
+        # constant's comment). Flag it either way -- a false positive here
+        # just means a re-run with a smaller chunk_days confirms nothing was
+        # actually missing, whereas staying silent means a real truncation
+        # (silently keeping only the newest CHUNK_LIMIT records of the
+        # window, per that same sort+limit behavior) reads as a clean run.
+        # Deliberately count/threshold-free: this needs no per-dataset volume
+        # table to catch a dataset nobody has profiled yet.
+        if len(records) == CHUNK_LIMIT:
+            logger.warning(
+                "Backfill chunk for %s [%s, %s) returned exactly CHUNK_LIMIT (%d) "
+                "records -- Energinet's API truncates rather than erroring when a "
+                "date-range window has more records than `limit`, so this window's "
+                "true record count may exceed what was saved. Re-run this dataset "
+                "with a smaller chunk_days to fill the gap.",
+                dataset.name,
+                chunk_start,
+                chunk_end,
+                CHUNK_LIMIT,
+            )
+            chunks_truncated += 1
+            truncated_windows.append({"start": chunk_start, "end": chunk_end})
 
         try:
             save_result = db.save_market_data(records, dataset)
@@ -292,6 +329,14 @@ async def backfill_dataset(
         "dataset_id": dataset.dataset_id,
         "chunks_fetched": chunks_fetched,
         "chunks_failed": chunks_failed,
+        # Distinct from chunks_failed on purpose -- a truncated chunk did
+        # fetch and save successfully (chunks_fetched still counts it, rows
+        # were saved), it's just missing some of that window's records. See
+        # this function's docstring / module docstring for why this needs no
+        # per-dataset volume table. Callers that want a single "did anything
+        # go wrong" signal should check both, not just chunks_failed.
+        "chunks_truncated": chunks_truncated,
+        "truncated_windows": truncated_windows,
         "records_fetched": records_fetched,
         "rows_saved": rows_saved,
         "earliest_record_time": earliest_record_time,
@@ -373,23 +418,40 @@ async def run_backfill(
             )
             results.append(result)
             logger.info(
-                "Backfilled %s: %d row(s) saved from %d chunk(s) (%d failed), "
+                "Backfilled %s: %d row(s) saved from %d chunk(s) (%d failed, %d truncated), "
                 "records span [%s, %s]",
                 dataset.name,
                 result["rows_saved"],
                 result["chunks_fetched"],
                 result["chunks_failed"],
+                result["chunks_truncated"],
                 result["earliest_record_time"],
                 result["latest_record_time"],
             )
+            if result["chunks_truncated"]:
+                logger.warning(
+                    "Backfill of %s has %d likely-truncated chunk(s) -- this run is NOT a "
+                    "clean/complete backfill for this dataset. Re-run with a smaller "
+                    "chunk_days for %s to fill the gap.",
+                    dataset.name,
+                    result["chunks_truncated"],
+                    dataset.name,
+                )
     finally:
         await ingestor.close()
         if owns_db:
             db.close()
 
+    total_chunks_truncated = sum(r["chunks_truncated"] for r in results)
     return {
         "start": start,
         "end": end,
         "datasets": results,
         "total_rows_saved": sum(r["rows_saved"] for r in results),
+        # Aggregate truncation signal so a caller/UI can flag "this run is
+        # not fully trustworthy" without inspecting every per-dataset entry
+        # itself -- see backfill_dataset's docstring for what "truncated"
+        # means here and why it's distinct from chunks_failed.
+        "total_chunks_truncated": total_chunks_truncated,
+        "any_truncated": total_chunks_truncated > 0,
     }

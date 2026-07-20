@@ -216,6 +216,39 @@ the FCR datasets) failing to fetch within the retry budget. Re-run the
 script/route for just the affected dataset(s) (`--datasets fcr_dk1`) to fill
 in any gaps -- safe per the idempotency note above.
 
+## Restarting services after a `shared/` code change: `scripts/restart-shared-services.sh`
+
+`docker-compose.yml` bind-mounts `./shared` (host) over `/app/shared`
+(container) on four services -- `api`, `ingestor`, `crawler`, and
+`orchestrator` -- so an edit under `shared/*.py` (a `git pull`/`checkout`
+included) shows up on disk inside every one of those containers
+immediately, no rebuild needed. But each is a long-running Python process
+that already `import`ed `shared.*` at startup, and Python caches imported
+modules in `sys.modules` -- an on-disk change to an already-imported module
+does nothing to a process that's still running. Only a restart re-imports
+it and picks up the change.
+
+**This is not hypothetical: it caused a real, confusing incident.** After a
+`git checkout`, `ingestor` was restarted but `api` was not, and `api` kept
+rejecting valid dataset names against a stale, pre-checkout validation list
+-- an error with no obvious link back to a checkout that happened in a
+different container entirely.
+
+Run this after any `shared/` change (a `git checkout`/`pull`/`merge`
+included) to restart every service that mounts it, together, rather than
+guessing which ones matter for a given change:
+
+```bash
+scripts/restart-shared-services.sh
+```
+
+It derives the service list from `docker-compose.yml` itself (via `docker
+compose config` + `jq`, matching on which services mount a volume whose
+container-side target is `/app/shared`) rather than hardcoding it, so it
+won't silently miss a fifth service added later that also mounts `./shared`.
+Falls back to a hardcoded list (kept in sync manually, see the script's own
+comment) if `jq`/`docker compose config` aren't available.
+
 ## What each service needs to run
 
 | Service | Requires | Optional |

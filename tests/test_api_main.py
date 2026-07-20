@@ -1185,6 +1185,8 @@ def backfill_mock():
                     "dataset_id": "FcrDK1",
                     "chunks_fetched": 5,
                     "chunks_failed": 0,
+                    "chunks_truncated": 0,
+                    "truncated_windows": [],
                     "records_fetched": 10,
                     "rows_saved": 10,
                     "earliest_record_time": "2026-06-01T00:00:00",
@@ -1192,6 +1194,42 @@ def backfill_mock():
                 }
             ],
             "total_rows_saved": 10,
+            "total_chunks_truncated": 0,
+            "any_truncated": False,
+        }
+    )
+
+
+@pytest.fixture
+def truncated_backfill_mock():
+    """Same shape as backfill_mock, but with one dataset's chunk flagged as truncated -- for
+    exercising the dashboard's truncation-warning rendering."""
+    return AsyncMock(
+        return_value={
+            "start": datetime(2026, 6, 1, tzinfo=UTC),
+            "end": datetime(2026, 7, 1, tzinfo=UTC),
+            "datasets": [
+                {
+                    "dataset": "afrr_energy_activation",
+                    "dataset_id": "AfrrEnergyActivation",
+                    "chunks_fetched": 5,
+                    "chunks_failed": 0,
+                    "chunks_truncated": 2,
+                    "truncated_windows": [
+                        {
+                            "start": datetime(2026, 6, 1, tzinfo=UTC),
+                            "end": datetime(2026, 6, 8, tzinfo=UTC),
+                        }
+                    ],
+                    "records_fetched": 300000,
+                    "rows_saved": 300000,
+                    "earliest_record_time": "2026-06-01T00:00:00",
+                    "latest_record_time": "2026-06-30T23:00:00",
+                }
+            ],
+            "total_rows_saved": 300000,
+            "total_chunks_truncated": 2,
+            "any_truncated": True,
         }
     )
 
@@ -1316,6 +1354,64 @@ def test_dashboard_trigger_backfill_stays_open_regardless_of_api_key(
 
     assert resp.status_code == 200
     backfill_mock.assert_awaited_once()
+
+
+def test_dashboard_trigger_backfill_passes_through_chunk_days(
+    client, db, monkeypatch, backfill_mock
+):
+    """chunk_days was hard-locked to DEFAULT_CHUNK_DAYS before this form field existed --
+    must now reach run_backfill."""
+    monkeypatch.delenv("API_KEY", raising=False)
+    db.fetch_event_reports.return_value = []
+    monkeypatch.setattr(api_main, "run_backfill", backfill_mock)
+
+    resp = client.post(
+        "/dashboard/ingestor/backfill",
+        data={"days": "30", "datasets": "afrr_energy_activation", "chunk_days": "1"},
+    )
+
+    assert resp.status_code == 200
+    assert backfill_mock.call_args.kwargs["chunk_days"] == 1
+
+
+def test_dashboard_trigger_backfill_defaults_chunk_days_when_omitted(
+    client, db, monkeypatch, backfill_mock
+):
+    monkeypatch.delenv("API_KEY", raising=False)
+    db.fetch_event_reports.return_value = []
+    monkeypatch.setattr(api_main, "run_backfill", backfill_mock)
+
+    resp = client.post("/dashboard/ingestor/backfill", data={"days": "30", "datasets": ""})
+
+    assert resp.status_code == 200
+    assert backfill_mock.call_args.kwargs["chunk_days"] == api_main.DEFAULT_CHUNK_DAYS
+
+
+def test_dashboard_trigger_backfill_surfaces_truncation_warning(
+    client, db, monkeypatch, truncated_backfill_mock
+):
+    monkeypatch.delenv("API_KEY", raising=False)
+    db.fetch_event_reports.return_value = []
+    monkeypatch.setattr(api_main, "run_backfill", truncated_backfill_mock)
+
+    resp = client.post("/dashboard/ingestor/backfill", data={"days": "30", "datasets": ""})
+
+    assert resp.status_code == 200
+    assert "TRUNCATED" in resp.text
+    assert "NOT a clean/complete backfill" in resp.text
+
+
+def test_dashboard_trigger_backfill_no_truncation_warning_on_clean_run(
+    client, db, monkeypatch, backfill_mock
+):
+    monkeypatch.delenv("API_KEY", raising=False)
+    db.fetch_event_reports.return_value = []
+    monkeypatch.setattr(api_main, "run_backfill", backfill_mock)
+
+    resp = client.post("/dashboard/ingestor/backfill", data={"days": "30", "datasets": ""})
+
+    assert resp.status_code == 200
+    assert "TRUNCATED" not in resp.text
 
 
 def test_dashboard_home_backfill_form_present(client, db):
