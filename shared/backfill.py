@@ -118,6 +118,12 @@ FORECASTING_DATASET_NAMES = frozenset(
         "forecasts_hour",
         "prodex_5min_realtime",
         "afrr_border_atc",
+        # The third 90-day-retention dataset (scope §1.2). Despite being
+        # millisecond-*timestamped* like the two above, it is low-cadence
+        # (~185 records/day, measured live -- see its `shared/datasets.py`
+        # entry), so it needs no `--chunk-days` special-casing and its full
+        # 90-day backfill is ~16,650 records.
+        "afrr_lfc_limits",
     }
 )
 
