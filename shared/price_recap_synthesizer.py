@@ -2,8 +2,9 @@
 LLM synthesis of the Morning Brief's (M5) "yesterday's prices, and why they
 moved" price recap section.
 
-Pulls yesterday's `day_ahead`/`FCR`/`aFRR_capacity` for DK1+DK2 plus
-`system_state` (wind/solar/CO2, zone="ALL" per shared/datasets.py), computes
+Pulls yesterday's `day_ahead`/`FCR`/`aFRR_capacity` for DK1+DK2 plus grid
+context (`system_state` wind/solar/CO2 at zone="ALL", plus DK2 grid inertia
+via `inertia`/`DK2`/`dk2` -- see `SYSTEM_STATE_KEYS` below), computes
 trailing-30-day comparison stats via a new pure helper
 (`_recap_stats`/`_pull_recap_data` below -- `shared/rule_engine.py`'s checks
 are trigger-shaped, firing only above a 3.0 std threshold, not recap-shaped,
@@ -39,6 +40,7 @@ from prometheus_client import Counter, Histogram
 from shared.db_manager import DatabaseManager
 from shared.event_synthesizer import extract_numbers, number_is_traceable
 from shared.llm_json import extract_json_object
+from shared.units import unit_for
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +52,21 @@ PRICE_SERIES = (("day_ahead", "price"), ("FCR", "price"), ("aFRR_capacity", "up"
 SYSTEM_STATE_ZONE = "ALL"
 SYSTEM_STATE_MARKET = "system_state"
 SYSTEM_STATE_PRODUCTS = ("onshore_wind", "offshore_wind", "solar", "co2_emission")
+
+# System-state/grid-context keys pulled and prompted alongside each other
+# (see _pull_recap_data / _build_user_prompt below) -- (market, zone,
+# product) rather than (market, product) since, unlike the wind/solar/CO2
+# block above, grid inertia (shared/datasets.py's inertia_nordic entry) is
+# NOT zone="ALL": it's DK2's own inertia figure specifically, not a
+# Nordic-wide one. Low Nordic inertia is a genuine causal driver of
+# FCR-D/FFR demand (less rotating mass -> faster frequency swings after a
+# disturbance -> more disturbance reserve procured), which is exactly the
+# "explain why prices moved" job this module exists for -- see
+# shared/datasets.py's inertia_nordic entry for the full rationale.
+SYSTEM_STATE_KEYS: tuple[tuple[str, str, str], ...] = (
+    *((SYSTEM_STATE_MARKET, SYSTEM_STATE_ZONE, product) for product in SYSTEM_STATE_PRODUCTS),
+    ("inertia", "DK2", "dk2"),
+)
 
 TRAILING_WINDOW_DAYS = 30
 
@@ -112,6 +129,14 @@ def _recap_stats(
         "market": market,
         "zone": zone,
         "product": product,
+        # Registry-derived (shared/units.py), never guessed -- lets every
+        # consumer of this stats dict (the zone-summary line, the LLM
+        # prompt) label its own figures instead of assuming DKK/MWh, which
+        # is wrong for e.g. DK2's FCR price (EUR/MW/h). "unknown" if the
+        # registry genuinely has no unit declared for this key (shouldn't
+        # happen for anything PRICE_SERIES/SYSTEM_STATE_PRODUCTS actually
+        # reads -- tests/test_units.py guards against a shipped "unknown").
+        "unit": unit_for(market, zone, product) or "unknown",
         "yesterday_mean": yesterday_mean,
         "yesterday_min": yesterday_rows[0]["min_value"] if yesterday_rows else None,
         "yesterday_max": yesterday_rows[0]["max_value"] if yesterday_rows else None,
@@ -123,8 +148,9 @@ def _recap_stats(
 def _pull_recap_data(db: DatabaseManager, brief_date: date) -> dict:
     """
     Pulls every stat the recap needs: `PRICE_SERIES` for both `ZONES`, plus
-    `system_state` (zone="ALL"). `brief_date` is the date the brief is
-    published *for* -- the recap always covers the day before it.
+    `SYSTEM_STATE_KEYS` (wind/solar/CO2 at zone="ALL", plus DK2 grid
+    inertia). `brief_date` is the date the brief is published *for* -- the
+    recap always covers the day before it.
     """
     yesterday = brief_date - timedelta(days=1)
     zone_stats: dict[str, list[dict]] = {zone: [] for zone in ZONES}
@@ -133,8 +159,8 @@ def _pull_recap_data(db: DatabaseManager, brief_date: date) -> dict:
             zone_stats[zone].append(_recap_stats(db, market, zone, product, yesterday))
 
     system_state_stats = [
-        _recap_stats(db, SYSTEM_STATE_MARKET, SYSTEM_STATE_ZONE, product, yesterday)
-        for product in SYSTEM_STATE_PRODUCTS
+        _recap_stats(db, market, zone, product, yesterday)
+        for market, zone, product in SYSTEM_STATE_KEYS
     ]
 
     return {
@@ -183,7 +209,7 @@ def _zone_summary_line(zone: str, stats: list[dict]) -> str:
         else "no 30-day baseline yet"
     )
     return (
-        f"{zone}: day-ahead price averaged {day_ahead['yesterday_mean']:.1f} DKK/MWh "
+        f"{zone}: day-ahead price averaged {day_ahead['yesterday_mean']:.1f} {day_ahead['unit']} "
         f"(range {day_ahead['yesterday_min']:.1f}-{day_ahead['yesterday_max']:.1f}), "
         f"{delta_phrase}."
     )
@@ -216,6 +242,13 @@ given -- never invent, estimate, or infer a number that isn't present there.
 - "causal_factors" must have 2 or 3 items.
 - If the stats don't support a confident causal story, still return an \
 honest, more tentative explanation rather than inventing one.
+- Each series below is labelled with its unit in square brackets, e.g. \
+"[DKK/MW/h]" or "[EUR/MW/h]". NEVER compare or subtract two numbers with \
+different units -- if a DK1 figure and a DK2 figure for the same market/\
+product carry different units (this happens: DK1's FCR price is DKK/MW/h, \
+DK2's is EUR/MW/h), say so explicitly (e.g. "DK1 and DK2 FCR prices aren't \
+directly comparable -- different currencies") rather than explaining the \
+apparent gap as a market phenomenon.
 """
 
 
@@ -225,15 +258,20 @@ def _build_user_prompt(recap_data: dict) -> str:
         lines.append(f"\n{zone}:")
         for s in stats:
             lines.append(
-                f"- {s['market']}/{s['product']}: yesterday mean={s['yesterday_mean']}, "
+                f"- {s['market']}/{s['product']} [{s['unit']}]: "
+                f"yesterday mean={s['yesterday_mean']}, "
                 f"min={s['yesterday_min']}, max={s['yesterday_max']}, "
                 f"trailing_30d_mean={s['trailing_30d_mean']}, "
                 f"delta_pct_vs_trailing_30d={s['delta_pct_vs_trailing_30d']}"
             )
-    lines.append("\nSystem state (zone=ALL):")
+    # Not all "system state" entries are zone="ALL" (grid inertia's DK2
+    # figure isn't -- see SYSTEM_STATE_KEYS), so each line spells out its own
+    # zone rather than a blanket "(zone=ALL)" header that would misdescribe it.
+    lines.append("\nSystem state / grid context:")
     for s in recap_data["system_state_stats"]:
         lines.append(
-            f"- {s['product']}: yesterday mean={s['yesterday_mean']}, "
+            f"- {s['market']}/{s['zone']}/{s['product']} [{s['unit']}]: "
+            f"yesterday mean={s['yesterday_mean']}, "
             f"trailing_30d_mean={s['trailing_30d_mean']}, "
             f"delta_pct_vs_trailing_30d={s['delta_pct_vs_trailing_30d']}"
         )

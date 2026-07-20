@@ -257,6 +257,35 @@ async def test_run_rule_engine_checks_zone_divergence_pairs_once():
     assert len(divergence_triggers) == 1
 
 
+async def test_run_rule_engine_skips_zone_divergence_for_mismatched_currency_pair(caplog):
+    """
+    ("FCR", "price") is DKK in DK1 and EUR in DK2 (shared/datasets.py's
+    fcr_dk2 entry) -- a DK1-DK2 diff there would be a currency artifact, not
+    a real divergence, so this pair must never reach check_zone_divergence.
+    """
+    db = MagicMock()
+    db.fetch_distinct_series.return_value = [
+        ("FCR", "DK1", "price"),
+        ("FCR", "DK2", "price"),
+    ]
+    dk1_normal = [100.0 + (i % 5) * 0.5 for i in range(MIN_HISTORY_POINTS)]
+    dk2_normal = [1.0 + (i % 5) * 0.05 for i in range(MIN_HISTORY_POINTS)]
+
+    def fake_history(market, zone, product, limit=1000):
+        if zone == "DK1":
+            return _rows([*dk1_normal, 2000.0])
+        return _rows([*dk2_normal, 100.0])
+
+    db.fetch_history.side_effect = fake_history
+
+    with caplog.at_level("INFO"):
+        triggers = await run_rule_engine(db)
+
+    divergence_triggers = [t for t in triggers if t.trigger_type == "zone_divergence"]
+    assert divergence_triggers == []
+    assert "different currencies" in caplog.text
+
+
 async def test_run_rule_engine_persists_each_fired_trigger():
     db = MagicMock()
     db.fetch_distinct_series.return_value = [("mFRR_capacity", "DK1", "up")]

@@ -362,6 +362,7 @@ BESS_RUN_ROW = {
     "tick_count": 48,
     "created_at": "2026-07-17T09:00:00+00:00",
     "total_afrr_activation_revenue_eur": 25.0,
+    "total_capacity_revenue_eur": 8.0,
 }
 
 BESS_TICK_ROW = {
@@ -537,6 +538,112 @@ def test_dashboard_bess_trigger_redirects_to_detail(client, db, monkeypatch):
 
     assert resp.status_code == 303
     assert resp.headers["location"] == "/dashboard/bess/7"
+
+
+def test_dashboard_bess_trigger_include_ffr_uses_price_ranked_for_dk2(client, db, monkeypatch):
+    captured_configs = []
+
+    def fake_run_backtest(db_arg, zone, start, end, config):
+        captured_configs.append(config)
+        return BacktestResult(zone=zone, start_time=start, end_time=end, config=config, ticks=[])
+
+    monkeypatch.setattr(api_main, "run_backtest", fake_run_backtest)
+    db.save_bess_run.return_value = 9
+
+    resp = client.post(
+        "/dashboard/bess/new",
+        data={
+            "zone": "DK2",
+            "start_time": "2026-07-16T20:00",
+            "end_time": "2026-07-17T08:00",
+            "power_mw": "1.0",
+            "capacity_mwh": "2.0",
+            "round_trip_efficiency": "0.9",
+            "soc_min_fraction": "0.1",
+            "soc_max_fraction": "0.9",
+            "starting_soc_fraction": "0.5",
+            "arbitrage_lookback_periods": "30",
+            "arbitrage_z_threshold": "0.5",
+            "capacity_commit_mw": "0.3",
+            "afrr_activation_participation_rate": "0.3",
+            "include_ffr": "true",
+            "include_afrr_down": "true",
+        },
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 303
+    assert len(captured_configs) == 1
+    assert ("FFR", "price") in captured_configs[0].capacity_markets
+    assert ("aFRR_capacity", "down") in captured_configs[0].capacity_markets
+    assert captured_configs[0].capacity_allocation == "price_ranked"
+
+
+def test_dashboard_bess_trigger_without_ffr_keeps_even_allocation(client, db, monkeypatch):
+    captured_configs = []
+
+    def fake_run_backtest(db_arg, zone, start, end, config):
+        captured_configs.append(config)
+        return BacktestResult(zone=zone, start_time=start, end_time=end, config=config, ticks=[])
+
+    monkeypatch.setattr(api_main, "run_backtest", fake_run_backtest)
+    db.save_bess_run.return_value = 9
+
+    resp = client.post(
+        "/dashboard/bess/new",
+        data={
+            "zone": "DK2",
+            "start_time": "2026-07-16T20:00",
+            "end_time": "2026-07-17T08:00",
+            "power_mw": "1.0",
+            "capacity_mwh": "2.0",
+            "round_trip_efficiency": "0.9",
+            "soc_min_fraction": "0.1",
+            "soc_max_fraction": "0.9",
+            "starting_soc_fraction": "0.5",
+            "arbitrage_lookback_periods": "30",
+            "arbitrage_z_threshold": "0.5",
+            "capacity_commit_mw": "0.3",
+            "afrr_activation_participation_rate": "0.3",
+        },
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 303
+    assert captured_configs[0].capacity_allocation == "even"
+
+
+def test_dashboard_bess_trigger_rejects_ffr_for_dk1(client, db, monkeypatch):
+    """FFR is DK2-only (shared/datasets.py's ffr_dk2 entry, fixed
+    zone="DK2") -- ticking it for a DK1 run must be rejected server-side,
+    not silently earn nothing."""
+    mock_run_backtest = MagicMock()
+    monkeypatch.setattr(api_main, "run_backtest", mock_run_backtest)
+
+    resp = client.post(
+        "/dashboard/bess/new",
+        data={
+            "zone": "DK1",
+            "start_time": "2026-07-16T20:00",
+            "end_time": "2026-07-17T08:00",
+            "power_mw": "1.0",
+            "capacity_mwh": "2.0",
+            "round_trip_efficiency": "0.9",
+            "soc_min_fraction": "0.1",
+            "soc_max_fraction": "0.9",
+            "starting_soc_fraction": "0.5",
+            "arbitrage_lookback_periods": "30",
+            "arbitrage_z_threshold": "0.5",
+            "capacity_commit_mw": "0.3",
+            "afrr_activation_participation_rate": "0.3",
+            "include_ffr": "true",
+        },
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 200
+    assert "not available in zone" in resp.text
+    mock_run_backtest.assert_not_called()
 
 
 def test_dashboard_bess_trigger_shows_error_on_invalid_config(client, db):
@@ -1583,6 +1690,26 @@ def test_dashboard_morning_brief_detail_found(client, db):
 
     assert resp.status_code == 200
     assert "Prices were mild" in resp.text
+
+
+def test_dashboard_morning_brief_detail_shows_zero_price_periods(client, db):
+    """Stage 4: 'FFR cleared at 0 for N periods' framing, not a silent zero."""
+    row = {
+        **MORNING_BRIEF_ROW,
+        "bess_estimates": [
+            {
+                **MORNING_BRIEF_ROW["bess_estimates"][0],
+                "zero_price_periods_by_leg": {"FFR:price": 720},
+            }
+        ],
+    }
+    db.fetch_morning_brief.return_value = row
+
+    resp = client.get("/dashboard/morning-briefs/1")
+
+    assert resp.status_code == 200
+    assert "FFR:price" in resp.text
+    assert "720" in resp.text
 
 
 def test_dashboard_morning_brief_detail_not_found(client, db):

@@ -55,6 +55,57 @@ an estimate, not a real co-optimized dispatch):
    data) simply earns nothing for that market that period rather than
    guessing a value.
 
+   **Per-currency buckets, never summed across currencies.** Each configured
+   leg's currency is resolved via `shared/units.py:currency_for` (backed by
+   `shared/datasets.py`'s registry) and every tick's revenue is accumulated
+   into `capacity_revenue_by_currency`, not one flat total. This is the fix
+   for a real, live defect: DK2's FCR price (`("FCR", "price")`) is EUR/MW/h
+   while DK1's is DKK/MW/h and DK2's `aFRR_capacity` is also DKK/MW/h (see
+   `shared/datasets.py`'s `fcr_dk2` comment) -- a DK2 run configured with
+   both FCR and aFRR_capacity legs previously summed EUR and DKK figures
+   into one `capacity_revenue_dkk`/`cumulative_total_revenue_dkk` number.
+   `capacity_revenue_dkk`/`cumulative_capacity_revenue_dkk`/
+   `cumulative_total_revenue_dkk` now mean **DKK legs only**;
+   `capacity_revenue_eur`/`cumulative_capacity_revenue_eur`/
+   `BacktestResult.total_capacity_revenue_eur` carry the EUR legs
+   separately, mirroring the aFRR-activation treatment in §3 below (never
+   converted, never combined -- see that section's rationale, which applies
+   identically here). A leg whose currency can't be resolved at all (a
+   registry gap, not a real "no data" case) raises `ValueError` in
+   `run_backtest` rather than silently defaulting somewhere -- see that
+   function's docstring.
+
+   **Allocation mode (`BessConfig.capacity_allocation`).** The "evenly
+   across groups" split described above is the `"even"` mode -- the global
+   default, kept that way so a stored run's persisted `config` JSONB always
+   reproduces the exact numbers it was run with (`shared/db_manager.py:
+   save_bess_run`). It has a real hazard, though: adding a group that
+   currently clears at/near 0 (e.g. FFR -- see `shared/datasets.py`'s
+   `ffr_dk2` entry, prices currently `0.0`) as a third group shrinks the
+   other, genuinely-earning groups' shares (1/2 each -> 1/3 each) while
+   itself earning nothing, so *total* modelled capacity revenue drops
+   purely from the split, not from anything about the added market itself
+   -- a user ticking "include FFR" would wrongly conclude FFR is
+   unprofitable, having actually seen an allocation artifact. `"price_ranked"`
+   fixes this: each group's share is weighted by its **relative strength**
+   -- each leg's own recent trailing price against its *own* longer-run
+   average, not a raw price level -- causally (see `_group_commit_shares`/
+   `_leg_relative_strength` -- no lookahead, mirroring `_causal_zscore`'s
+   discipline), so a group trailing near its own normal level ranks the
+   same regardless of which currency or magnitude it happens to be
+   denominated in, and a group trailing at/near 0 relative to its own
+   history shrinks toward its sibling groups instead of diluting them.
+   **Deliberately never ranks on raw price magnitude**: an earlier version
+   of this function did, which silently compared price *levels* across
+   currencies (e.g. DK2's ~20 DKK/MW/h aFRR_capacity vs. ~2 EUR/MW/h FCR)
+   and let the larger-magnitude currency dominate purely because its
+   numbers are bigger -- the same unit-mixing bug class this module's
+   per-currency capacity buckets (§2 above) exist to catch, just
+   resurfacing inside the allocator instead of the revenue totals. The
+   total committed MW is conserved exactly either way (`arbitrage_power_mw`
+   is unaffected by allocation mode -- it depends only on the configured
+   `capacity_commit_mw` scalar, never on how many/which groups share it).
+
 3. **aFRR energy activation revenue** — an *estimate*, reported separately in
    **EUR** (never summed into the DKK totals above — the ingested
    `aFRR_energy` dataset has no DKK field, and mixing currencies into one
@@ -78,17 +129,43 @@ import statistics
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from typing import Literal
 
 from shared.db_manager import DatabaseManager
+from shared.units import currency_for
 
 # Mirrors shared/rule_engine.py's MIN_HISTORY_POINTS pattern: below this many
 # trailing price points, the arbitrage strategy has no baseline to compare
 # against and stays idle rather than false-triggering on a thin sample.
 MIN_ARBITRAGE_HISTORY_POINTS = 5
 
+# "price_ranked" capacity allocation (`_group_commit_shares`) ranks each
+# capacity-market leg by its *own* recent trailing price relative to its
+# *own* longer-run average -- never a raw price level (see that function's
+# docstring for why: comparing raw levels silently compares across
+# currencies). Two windows per leg are needed: a short "how is this leg
+# doing right now" window, and a longer "what's normal for this leg"
+# baseline it's measured against. The short window reuses
+# `BessConfig.arbitrage_lookback_periods` (no second short-window knob to
+# configure); this constant sets the baseline window as a multiple of it.
+# 4x is a deliberate middle ground, not an arbitrary round number: too
+# small (close to 1x) and the baseline just re-measures the same recent
+# ticks the short window already captures, collapsing every ratio toward
+# ~1.0 regardless of what's actually happening; too large (multiple
+# dozens x) and a backtest needs an impractically long warm-up before any
+# leg's baseline is well-established, during which `_group_commit_shares`
+# has little choice but to fall back to even allocation. 4x keeps the
+# baseline meaningfully longer/smoother than the short window while still
+# reaching a stable estimate within a realistic backtest window.
+PRICE_RANKED_BASELINE_MULTIPLIER = 4
+
 # Markets excluded per the domain constraint: BESS cannot currently
 # participate in mFRR in these markets. Never read by this module.
-EXCLUDED_MARKETS = frozenset({"mFRR_capacity", "mFRR_EAM"})
+# `mFRR_capacity_extra` (shared/datasets.py's mfrr_capacity_extra entry,
+# Energinet's afternoon "extra auction" on top of `mFRR_capacity`) is the
+# same domain rule applied to the same underlying market -- an extra auction
+# doesn't change what a BESS can bid into.
+EXCLUDED_MARKETS = frozenset({"mFRR_capacity", "mFRR_EAM", "mFRR_capacity_extra"})
 
 
 @dataclass(frozen=True)
@@ -132,6 +209,19 @@ class BessConfig:
     # default, since it's meaningless for DK1 (no FCR-D market there).
     capacity_commit_mw: float = 0.3
     capacity_markets: tuple[tuple[str, str], ...] = (("FCR", "price"), ("aFRR_capacity", "up"))
+    # How each period's capacity_commit_mw is split across capacity_markets'
+    # distinct market groups -- see module docstring §2's "Allocation mode"
+    # for the full rationale/hazard this exists to fix. "even" (the global
+    # default) always has, and still does, split flat 1/n_groups regardless
+    # of price; "price_ranked" weights each group by its own causal
+    # relative strength (recent trailing price vs. its own longer-run
+    # average -- unit-free, never a raw price level, so a DKK leg and a EUR
+    # leg at the same relative strength always rank equally) instead. Kept
+    # at "even" by default so a stored run's persisted `config` JSONB
+    # always reproduces the exact numbers it was run with -- opt into
+    # "price_ranked" per run, most importantly for any config that includes
+    # a market prone to clearing at/near 0 (FFR today).
+    capacity_allocation: Literal["even", "price_ranked"] = "even"
 
     # --- aFRR energy activation parameters ---
     # Fraction of the committed aFRR_capacity MW assumed activated each
@@ -179,6 +269,11 @@ class BessConfig:
             raise ValueError("max_cycles_per_day must be positive (or None for unconstrained)")
         if not 0 <= self.afrr_activation_participation_rate <= 1:
             raise ValueError("afrr_activation_participation_rate must be in [0, 1]")
+        if self.capacity_allocation not in ("even", "price_ranked"):
+            raise ValueError(
+                f"capacity_allocation must be 'even' or 'price_ranked', "
+                f"got {self.capacity_allocation!r}"
+            )
 
 
 @dataclass
@@ -193,10 +288,16 @@ class BessTick:
     energy_discharged_mwh: float  # grid-delivered energy this tick (0 unless action == "discharge")
     arbitrage_revenue_dkk: float
     capacity_reserved_mw: float
+    # DKK capacity-reservation legs ONLY (module docstring §2) -- a DK2 run
+    # with any EUR-denominated leg (e.g. FCR) never mixes it in here; see
+    # `capacity_revenue_eur` below for that leg's own total.
     capacity_revenue_dkk: float
     capacity_revenue_by_market: dict[str, float]
     cumulative_arbitrage_revenue_dkk: float
+    # DKK capacity legs ONLY, same scope as `capacity_revenue_dkk` above.
     cumulative_capacity_revenue_dkk: float
+    # arbitrage (DKK) + capacity (DKK legs only) -- never includes
+    # `capacity_revenue_eur`/`afrr_activation_revenue_eur` below.
     cumulative_total_revenue_dkk: float
     # True when max_cycles_per_day (not power/SoC) capped this tick's discharge
     cycle_cap_binding: bool = False
@@ -205,6 +306,11 @@ class BessTick:
     # cumulative_total_revenue_dkk.
     afrr_activation_revenue_eur: float = 0.0
     cumulative_afrr_activation_revenue_eur: float = 0.0
+    # EUR capacity-reservation legs (module docstring §2, e.g. DK2's FCR) --
+    # reported separately from every DKK field above, never converted or
+    # summed into them.
+    capacity_revenue_eur: float = 0.0
+    cumulative_capacity_revenue_eur: float = 0.0
 
 
 @dataclass
@@ -214,6 +320,22 @@ class BacktestResult:
     end_time: datetime
     config: BessConfig
     ticks: list[BessTick] = field(default_factory=list)
+    # How many periods each configured capacity leg cleared at exactly 0 --
+    # a *real, present* price of 0 (e.g. FFR today, see shared/datasets.py's
+    # ffr_dk2 entry), distinct from "no price data available at all" (which
+    # capacity_revenue_by_market already silently treats as 0 revenue with
+    # no further visibility). Lets a caller say "FFR cleared at 0 for
+    # 720/720 hours in this window" rather than just showing a flat zero
+    # with no context on whether that's typical or an anomaly. Keyed the
+    # same way as capacity_revenue_by_market ("{market}:{product}").
+    zero_price_periods_by_leg: dict[str, int] = field(default_factory=dict)
+    # True if "price_ranked" capacity_allocation (BessConfig) ever had to
+    # fall back to an even split because every configured group's trailing
+    # price was 0 at some tick -- most commonly the backtest's very first
+    # tick(s), before any trailing history exists (causal allocation has
+    # nothing to rank by yet; see `_group_commit_shares`). Always False for
+    # "even" allocation, which never consults trailing prices at all.
+    capacity_allocation_fell_back_to_even: bool = False
 
     @property
     def total_arbitrage_revenue_dkk(self) -> float:
@@ -237,6 +359,33 @@ class BacktestResult:
         separately.
         """
         return self.ticks[-1].cumulative_afrr_activation_revenue_eur if self.ticks else 0.0
+
+    @property
+    def total_capacity_revenue_eur(self) -> float:
+        """
+        EUR capacity-reservation revenue (module docstring §2, e.g. DK2's
+        FCR legs), separate from `total_capacity_revenue_dkk`'s DKK-only
+        total above -- never summed with it, same "separate currency
+        buckets, never converted" posture as `total_afrr_activation_revenue_eur`.
+        """
+        return self.ticks[-1].cumulative_capacity_revenue_eur if self.ticks else 0.0
+
+    @property
+    def currencies_present(self) -> frozenset[str]:
+        """
+        Currencies with nonzero capacity revenue across the run. `len() > 1`
+        means this run's capacity revenue is genuinely not summable to one
+        number -- callers (dashboard templates, the morning-brief synthesis
+        prompts) must show every currency's total separately rather than
+        picking/combining one, and can use this property to decide whether
+        that "not summable" framing is even needed.
+        """
+        currencies = set()
+        if self.total_capacity_revenue_dkk != 0.0:
+            currencies.add("DKK")
+        if self.total_capacity_revenue_eur != 0.0:
+            currencies.add("EUR")
+        return frozenset(currencies)
 
     @property
     def total_discharged_mwh(self) -> float:
@@ -293,6 +442,107 @@ def _value_at_or_before(sorted_series: list[tuple[datetime, float]], t: datetime
     return result
 
 
+def _leg_relative_strength(short_history: deque[float], baseline_history: deque[float]) -> float:
+    """
+    Unit-free "how strong is this leg's price right now, relative to its
+    *own* longer-run history" ratio: `mean(short_history) / mean(baseline_history)`,
+    both windows drawn from the *same leg's own* past clearing prices (so
+    always the same currency -- see `_group_commit_shares` for why this,
+    not a raw price level, is what gets compared/averaged across legs).
+
+    A flat, unremarkable leg (short mean == baseline mean, at any
+    magnitude, in any currency) always ratios to ~1.0. A leg trailing
+    unusually high relative to its own history ratios above 1.0; unusually
+    low, below. `0.0` if either window is empty (no history yet) or the
+    baseline mean is 0 or negative (an undefined/meaningless ratio -- most
+    notably a leg that has *always* cleared at 0, e.g. FFR today: its own
+    baseline is 0, so there is no "normal level" to be relatively strong
+    against, and this returns 0 rather than raising `ZeroDivisionError`).
+    Clipped at 0 on the low end (a negative ratio would be meaningless for
+    weighting purposes even in the unlikely event of a negative price).
+    """
+    if not short_history or not baseline_history:
+        return 0.0
+    baseline_mean = statistics.mean(baseline_history)
+    if baseline_mean <= 0:
+        return 0.0
+    return max(statistics.mean(short_history) / baseline_mean, 0.0)
+
+
+def _group_commit_shares(
+    legs_by_group: dict[str, list[tuple[str, str]]],
+    capacity_price_short_history: dict[str, deque[float]],
+    capacity_price_baseline_history: dict[str, deque[float]],
+    capacity_commit_mw: float,
+) -> tuple[dict[str, float], bool]:
+    """
+    `"price_ranked"` capacity allocation (`BessConfig.capacity_allocation`)
+    for one tick: each market group's share of `capacity_commit_mw` is
+    weighted by its **relative strength** -- the mean, across that group's
+    legs, of each leg's own `_leg_relative_strength` (a leg's recent
+    trailing price against its *own* longer-run baseline, never a raw price
+    level). **Deliberately unit-free**: an earlier version of this function
+    weighted groups by raw trailing *price*, which silently compared
+    magnitudes across currencies -- e.g. DK2's aFRR_capacity (~20 DKK) vs.
+    FCR (~2 EUR) -- and let a DKK leg dominate a EUR leg purely because DKK
+    numbers happen to be bigger, the same unit-mixing bug class
+    `shared/units.py` exists to catch elsewhere in this module (§2). Ranking
+    on each leg's ratio to its own history instead means two legs at the
+    *same relative strength* (e.g. both currently 2x their own normal
+    level) always rank equally, regardless of currency or magnitude -- see
+    `tests/test_bess_simulator.py`'s cross-currency regression test.
+
+    **Causal by construction**, same discipline as `_causal_zscore` and the
+    prior raw-price version: both `capacity_price_short_history` and
+    `capacity_price_baseline_history` must only ever contain prices from
+    ticks strictly before the one being allocated -- `run_backtest` appends
+    each tick's own clearing price to both of its leg's deques only *after*
+    using their pre-append contents for this function.
+
+    A zero-relative-strength group's share shrinks toward its sibling
+    groups (proportional reweighting, not a hard cutoff). The total
+    committed MW across all groups is always conserved at exactly
+    `capacity_commit_mw` (same as "even") when at least one group has
+    positive relative strength; `arbitrage_power_mw` is computed
+    independently of allocation mode (see `run_backtest`) and is therefore
+    never affected by this function's output either way.
+
+    Returns `(commit_per_group, fell_back_to_even)`. Falls back to an even
+    split across every group -- and reports that via the second return
+    value, for `BacktestResult.capacity_allocation_fell_back_to_even` -- if
+    every group's relative strength is 0 (no history yet, or every leg's
+    own baseline is itself 0/undefined) -- there is no signal at all to
+    rank by.
+    """
+    n_groups = len(legs_by_group)
+    if n_groups == 0:
+        return {}, False
+
+    group_relative_strength: dict[str, float] = {}
+    for market, legs in legs_by_group.items():
+        leg_ratios = [
+            _leg_relative_strength(
+                capacity_price_short_history[f"{m}:{product}"],
+                capacity_price_baseline_history[f"{m}:{product}"],
+            )
+            for m, product in legs
+        ]
+        group_relative_strength[market] = statistics.mean(leg_ratios) if leg_ratios else 0.0
+
+    total_relative_strength = sum(group_relative_strength.values())
+    even_share = capacity_commit_mw / n_groups
+    if total_relative_strength <= 0:
+        return {market: even_share for market in legs_by_group}, True
+
+    return (
+        {
+            market: capacity_commit_mw * (strength / total_relative_strength)
+            for market, strength in group_relative_strength.items()
+        },
+        False,
+    )
+
+
 def _fetch_series(
     db: DatabaseManager,
     market: str,
@@ -334,6 +584,13 @@ def run_backtest(
     in the window. If there are no day-ahead price points in the window, the
     result has an empty tick list (not an error) — this is a caller-facing
     "no data for this window" signal, not a crash.
+
+    Raises `ValueError` if any configured `capacity_markets` leg has no
+    declared currency in `shared/datasets.py`'s registry (via
+    `shared/units.py:currency_for`) -- fail loud rather than silently
+    treating an unlabelled leg as "no currency"/0, since a silently
+    unlabelled leg is exactly the kind of gap that let DKK and EUR get
+    summed together in the first place (see module docstring §2).
     """
     config = config or BessConfig()
 
@@ -350,11 +607,23 @@ def run_backtest(
         legs_by_group[market].append((market, product))
 
     capacity_series_by_leg: dict[str, list[tuple[datetime, float]]] = {}
+    # Resolved once per backtest, alongside the price series fetch above --
+    # every leg's currency is a static registry fact (shared/units.py), not
+    # something that varies per tick, so there's no reason to re-resolve it
+    # inside the per-tick loop below.
+    leg_currency: dict[str, str | None] = {}
     for legs in legs_by_group.values():
         for m, product in legs:
-            capacity_series_by_leg[f"{m}:{product}"] = _fetch_series(
-                db, m, zone, product, start_time, end_time
-            )
+            key = f"{m}:{product}"
+            capacity_series_by_leg[key] = _fetch_series(db, m, zone, product, start_time, end_time)
+            leg_currency[key] = currency_for(m, zone, product)
+
+    unknown_currency_legs = [k for k, c in leg_currency.items() if c is None]
+    if unknown_currency_legs:
+        raise ValueError(
+            f"no unit declared for capacity leg(s) {unknown_currency_legs} in zone {zone!r}; "
+            "add `unit=` to the SeriesConfig in shared/datasets.py"
+        )
 
     # aFRR energy activation price series -- fetched once per backtest, only
     # if "aFRR_capacity" is actually a configured group (module docstring
@@ -377,14 +646,39 @@ def run_backtest(
     leg_efficiency = config.round_trip_efficiency**0.5
 
     n_groups = len(legs_by_group)
-    commit_per_group = config.capacity_commit_mw / n_groups if n_groups else 0.0
+    # `arbitrage_power_mw` depends only on the configured `capacity_commit_mw`
+    # scalar -- never on how many/which groups share it, or on which
+    # allocation mode is in use (see BessConfig.capacity_allocation's
+    # docstring: "price_ranked" reweights *within* the committed total, it
+    # never changes the total itself).
     arbitrage_power_mw = max(config.power_mw - config.capacity_commit_mw, 0.0)
 
+    # Per-leg rolling price histories for "price_ranked" allocation
+    # (`_group_commit_shares`/`_leg_relative_strength`) -- maintained
+    # unconditionally (cheap, and keeps the per-tick loop below branch-free
+    # on this point) but only ever *read* when
+    # `config.capacity_allocation == "price_ranked"`. Two windows per leg,
+    # since ranking on relative strength (this leg's recent price vs. its
+    # own longer-run average -- see PRICE_RANKED_BASELINE_MULTIPLIER's
+    # comment for why this, not a raw price level) needs both a short
+    # "recent" window and a longer "normal" baseline window to compare it
+    # against.
+    capacity_price_short_history: dict[str, deque[float]] = {
+        key: deque(maxlen=config.arbitrage_lookback_periods) for key in capacity_series_by_leg
+    }
+    capacity_price_baseline_history: dict[str, deque[float]] = {
+        key: deque(maxlen=config.arbitrage_lookback_periods * PRICE_RANKED_BASELINE_MULTIPLIER)
+        for key in capacity_series_by_leg
+    }
+
     cumulative_arbitrage = 0.0
-    cumulative_capacity = 0.0
+    cumulative_capacity_dkk = 0.0
+    cumulative_capacity_eur = 0.0
     cumulative_afrr_activation = 0.0
     ticks: list[BessTick] = []
     history: list[float] = []
+    zero_price_periods_by_leg: dict[str, int] = defaultdict(int)
+    capacity_allocation_fell_back_to_even = False
 
     # Rolling 24-hour discharge window for the cycle cap (see BessConfig's
     # `max_cycles_per_day` docstring for why this is rolling, not a
@@ -412,10 +706,40 @@ def run_backtest(
 
         # --- capacity reservation (independent of the arbitrage decision) ---
         capacity_revenue_by_market: dict[str, float] = {}
+        # Per-currency buckets (module docstring §2) -- a leg's revenue lands
+        # in exactly one bucket, keyed by its registry-declared currency
+        # (resolved once above into `leg_currency`, never re-derived here).
+        # `leg_currency` is guaranteed to hold no `None` values by this point
+        # (the ValueError check above), so every leg has a real bucket to
+        # land in.
+        capacity_revenue_by_currency: dict[str, float] = defaultdict(float)
         capacity_reserved_mw = 0.0
         commit_per_group_this_tick: dict[str, float] = {}
         if n_groups:
+            # Group-level commit shares for this tick: "even" is the flat
+            # 1/n_groups split this module has always used; "price_ranked"
+            # reweights by each leg's relative strength against its own
+            # history (see BessConfig.capacity_allocation /
+            # _group_commit_shares' docstrings -- deliberately unit-free,
+            # never a raw price level). Either way the shares always sum to
+            # config.capacity_commit_mw (barring a price_ranked fallback,
+            # which is itself an even split) -- `arbitrage_power_mw` above
+            # is unaffected regardless.
+            if config.capacity_allocation == "price_ranked":
+                commit_per_group_by_market, fell_back_to_even = _group_commit_shares(
+                    legs_by_group,
+                    capacity_price_short_history,
+                    capacity_price_baseline_history,
+                    config.capacity_commit_mw,
+                )
+                if fell_back_to_even:
+                    capacity_allocation_fell_back_to_even = True
+            else:
+                even_share = config.capacity_commit_mw / n_groups
+                commit_per_group_by_market = {market: even_share for market in legs_by_group}
+
             for market, legs in legs_by_group.items():
+                commit_per_group = commit_per_group_by_market[market]
                 commit_per_leg = commit_per_group / len(legs)
                 commit_per_group_this_tick[market] = commit_per_group
                 for m, product in legs:
@@ -425,14 +749,28 @@ def run_backtest(
                     if clearing_price is None:
                         capacity_revenue_by_market[key] = 0.0
                         continue
+                    if clearing_price == 0.0:
+                        zero_price_periods_by_leg[key] += 1
                     revenue = clearing_price * commit_per_leg * dt_hours
                     capacity_revenue_by_market[key] = revenue
+                    capacity_revenue_by_currency[leg_currency[key]] += revenue
                     capacity_reserved_mw += commit_per_leg
-        capacity_revenue = sum(capacity_revenue_by_market.values())
-        cumulative_capacity += capacity_revenue
+                    # Causal: this tick's own clearing price is only added
+                    # to its leg's short/baseline trailing histories AFTER
+                    # being used (via `_group_commit_shares`, called above,
+                    # before this loop) for THIS tick's allocation weight --
+                    # a later tick's weighting may see it, this tick's never
+                    # does. Mirrors the arbitrage z-score `history.append`
+                    # below.
+                    capacity_price_short_history[key].append(clearing_price)
+                    capacity_price_baseline_history[key].append(clearing_price)
+        capacity_revenue_dkk_tick = capacity_revenue_by_currency["DKK"]
+        capacity_revenue_eur_tick = capacity_revenue_by_currency["EUR"]
+        cumulative_capacity_dkk += capacity_revenue_dkk_tick
+        cumulative_capacity_eur += capacity_revenue_eur_tick
 
         # --- aFRR energy activation revenue (module docstring §3, always EUR,
-        # never mixed into the DKK capacity_revenue above) ---
+        # never mixed into the DKK/EUR capacity buckets above) ---
         afrr_committed_mw = commit_per_group_this_tick.get("aFRR_capacity", 0.0)
         activation_price = (
             _value_at_or_before(activation_price_series, t) if afrr_committed_mw else None
@@ -502,14 +840,16 @@ def run_backtest(
                 energy_discharged_mwh=energy_discharged_mwh,
                 arbitrage_revenue_dkk=arbitrage_revenue,
                 capacity_reserved_mw=capacity_reserved_mw,
-                capacity_revenue_dkk=capacity_revenue,
+                capacity_revenue_dkk=capacity_revenue_dkk_tick,
                 capacity_revenue_by_market=capacity_revenue_by_market,
                 cumulative_arbitrage_revenue_dkk=cumulative_arbitrage,
-                cumulative_capacity_revenue_dkk=cumulative_capacity,
-                cumulative_total_revenue_dkk=cumulative_arbitrage + cumulative_capacity,
+                cumulative_capacity_revenue_dkk=cumulative_capacity_dkk,
+                cumulative_total_revenue_dkk=cumulative_arbitrage + cumulative_capacity_dkk,
                 cycle_cap_binding=cycle_cap_binding,
                 afrr_activation_revenue_eur=afrr_activation_revenue,
                 cumulative_afrr_activation_revenue_eur=cumulative_afrr_activation,
+                capacity_revenue_eur=capacity_revenue_eur_tick,
+                cumulative_capacity_revenue_eur=cumulative_capacity_eur,
             )
         )
 
@@ -521,5 +861,11 @@ def run_backtest(
             history.pop(0)
 
     return BacktestResult(
-        zone=zone, start_time=start_time, end_time=end_time, config=config, ticks=ticks
+        zone=zone,
+        start_time=start_time,
+        end_time=end_time,
+        config=config,
+        ticks=ticks,
+        zero_price_periods_by_leg=dict(zero_price_periods_by_leg),
+        capacity_allocation_fell_back_to_even=capacity_allocation_fell_back_to_even,
     )

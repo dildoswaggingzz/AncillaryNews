@@ -38,6 +38,7 @@ from prometheus_client import Counter, Histogram
 from shared.db_manager import DatabaseManager
 from shared.event_synthesizer import extract_numbers
 from shared.llm_json import extract_json_object
+from shared.units import unit_for
 
 logger = logging.getLogger(__name__)
 
@@ -218,10 +219,17 @@ def _build_user_prompt(horizon: str, context: dict) -> str:
     aggregates = context.get("daily_aggregates", [])
     if aggregates:
         values = [a["mean_value"] for a in aggregates if a.get("mean_value") is not None]
+        # FORECAST_MARKET/FORECAST_ZONE/FORECAST_PRODUCT are fixed (module
+        # constants below), so this is always the same registry-declared
+        # unit -- resolved via shared/units.py rather than hardcoded, same
+        # fix as shared/price_recap_synthesizer.py's equivalent line, so a
+        # future FORECAST_ZONE/FORECAST_MARKET change can't silently
+        # mislabel this summary.
+        unit = unit_for(FORECAST_MARKET, context.get("zone", FORECAST_ZONE), FORECAST_PRODUCT)
         summary_line = (
             f"{len(aggregates)} day(s) of historical daily mean day-ahead price data, "
             f"ranging from {min(values):.1f} to {max(values):.1f} "
-            f"(overall mean {sum(values) / len(values):.1f}) DKK/MWh"
+            f"(overall mean {sum(values) / len(values):.1f}) {unit}"
             if values
             else f"{len(aggregates)} day(s) of historical data, but no usable values"
         )

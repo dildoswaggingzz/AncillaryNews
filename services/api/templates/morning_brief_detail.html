@@ -71,6 +71,7 @@
   <table>
     <tr>
       <th>Config</th><th>Zone</th><th>Run</th><th>Total revenue (DKK)</th>
+      <th>Capacity revenue (EUR)</th>
       <th>Full cycle equivalents</th><th>Cycle cap binding?</th>
     </tr>
     {% for estimate in row.bess_estimates %}
@@ -79,9 +80,25 @@
       <td>{{ estimate.zone }}</td>
       <td><a href="/dashboard/bess/{{ estimate.run_id }}">#{{ estimate.run_id }}</a></td>
       <td>{{ "%.2f"|format(estimate.total_revenue_dkk) }}</td>
+      <td>{{ "%.2f"|format(estimate.get('total_capacity_revenue_eur', 0.0)) }}
+        {% if estimate.get('total_capacity_revenue_eur', 0.0) %}
+        <span class="muted">-- separate currency, not summed into the DKK total</span>
+        {% endif %}
+      </td>
       <td>{{ "%.3f"|format(estimate.full_cycle_equivalents) }}</td>
       <td>{{ "yes" if estimate.cycle_cap_was_binding else "no" }}</td>
     </tr>
+    {% if estimate.get('zero_price_periods_by_leg') %}
+    <tr>
+      <td colspan="7" class="muted">
+        Cleared at 0:
+        {% for leg, count in estimate.zero_price_periods_by_leg.items() %}
+          {{ leg }} ({{ count }} period{{ "s" if count != 1 else "" }}){{ ", " if not loop.last else "" }}
+        {% endfor %}
+        -- an honest count, not silently folded into the total above.
+      </td>
+    </tr>
+    {% endif %}
     {% endfor %}
   </table>
   {% else %}

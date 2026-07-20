@@ -12,7 +12,13 @@ Implemented trigger classes (feasible with what's actually ingested per
   history.
 - **Zone divergence** (part of "Abnormal pricing pattern"): DK1 vs DK2 price
   divergence for the same `(market, product)` beyond what recent paired
-  history would predict.
+  history would predict. Guarded by `shared/units.py:same_currency` before
+  ever computing a DK1-DK2 diff -- `("FCR", "price")` is DKK in DK1 and EUR
+  in DK2 (see `shared/datasets.py`'s `fcr_dk2` entry), and subtracting those
+  is a unit artifact, not a market signal. This module calls into
+  `shared/units.py` for that check rather than hardcoding "FCR" (or any
+  other market name) here, keeping this module free of market-name literals
+  -- see `run_rule_engine`.
 - **Negative/zero price flag** (part of "Abnormal pricing pattern"): a
   non-positive value for a product whose history shows non-positive values
   are rare.
@@ -46,6 +52,7 @@ from datetime import UTC, datetime
 from prometheus_client import Counter
 
 from shared.db_manager import DatabaseManager
+from shared.units import same_currency
 
 logger = logging.getLogger(__name__)
 
@@ -366,6 +373,16 @@ async def run_rule_engine(db: DatabaseManager) -> list[Trigger]:
         dk1_rows = history_by_key.get((market, "DK1", product))
         dk2_rows = history_by_key.get((market, "DK2", product))
         if not dk1_rows or not dk2_rows:
+            continue
+
+        if not same_currency((market, "DK1", product), (market, "DK2", product)):
+            logger.info(
+                "skipping zone_divergence check for %s/%s: DK1 and DK2 are denominated in "
+                "different currencies (a unit artifact, not a market signal) -- see "
+                "shared/units.py",
+                market,
+                product,
+            )
             continue
 
         divergence = check_zone_divergence(market, product, dk1_rows, dk2_rows)

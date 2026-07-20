@@ -42,10 +42,22 @@
         <td><input type="number" step="any" min="0" max="1" id="afrr_activation_participation_rate" name="afrr_activation_participation_rate" value="{{ defaults.afrr_activation_participation_rate }}" required></td></tr>
     <tr><td><label for="include_fcr_d">Include FCR-D (DK2 only)</label></td>
         <td><input type="checkbox" id="include_fcr_d" name="include_fcr_d" value="true"></td></tr>
+    <tr><td><label for="include_afrr_down">Include aFRR down-regulation</label></td>
+        <td><input type="checkbox" id="include_afrr_down" name="include_afrr_down" value="true"></td></tr>
+    <tr><td><label for="include_ffr">Include FFR (DK2 only)</label></td>
+        <td><input type="checkbox" id="include_ffr" name="include_ffr" value="true"></td></tr>
   </table>
   <p class="muted">
-    FCR-D (fast-disturbance reserve) only exists in DK2 -- checking this box for a DK1 run
-    will simply earn nothing on those legs (empty series, not an error).
+    FCR-D (fast-disturbance reserve) and FFR (Fast Frequency Reserve) only exist in DK2 --
+    ticking either for a DK1 run is now rejected server-side (rather than silently earning
+    nothing on those legs, as it used to). aFRR down-regulation capacity is available in
+    both zones.
+  </p>
+  <p class="muted">
+    FFR currently clears at 0.0 (see <code>shared/datasets.py</code>) -- ticking it
+    automatically switches this run to <code>capacity_allocation="price_ranked"</code>
+    server-side, so FFR's zero price doesn't dilute the other markets' shares the way an
+    even split would (<code>shared/bess_simulator.py</code>'s module docstring §2).
   </p>
   <p><button type="submit">Run backtest</button></p>
 </form>

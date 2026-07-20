@@ -1,3 +1,4 @@
+from collections import deque
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
@@ -6,6 +7,7 @@ import pytest
 from shared.bess_simulator import (
     BessConfig,
     _causal_zscore,
+    _leg_relative_strength,
     _value_at_or_before,
     run_backtest,
 )
@@ -26,12 +28,13 @@ def _db_with_series(
     fcr_up: list[dict] | None = None,
     fcr_down: list[dict] | None = None,
     activation: list[dict] | None = None,
+    ffr: list[dict] | None = None,
 ):
     """Builds a MagicMock DatabaseManager whose fetch_series_values returns the given series
     per (market, product), matching shared.db_manager.DatabaseManager.fetch_series_values's
     signature. `fcr` answers ("FCR", "price"); `fcr_up`/`fcr_down` answer ("FCR", "up")/
     ("FCR", "down") (FCR-D legs); `afrr` answers ("aFRR_capacity", "up"); `activation`
-    answers ("aFRR_energy", "activation_price")."""
+    answers ("aFRR_energy", "activation_price"); `ffr` answers ("FFR", "price")."""
     db = MagicMock()
 
     def fetch_series_values(
@@ -49,6 +52,8 @@ def _db_with_series(
             return afrr or []
         if market == "aFRR_energy":
             return activation or []
+        if market == "FFR" and product == "price":
+            return ffr or []
         raise AssertionError(f"unexpected market/product {market!r}/{product!r} requested")
 
     db.fetch_series_values.side_effect = fetch_series_values
@@ -94,6 +99,14 @@ def test_bess_config_rejects_excluded_capacity_market():
 def test_bess_config_rejects_excluded_price_market():
     with pytest.raises(ValueError, match="not eligible"):
         BessConfig(price_market="mFRR_EAM")
+
+
+def test_bess_config_rejects_mfrr_capacity_extra():
+    """Stage 3: the mFRR extra-auction market is the same domain rule as
+    mFRR_capacity itself -- an extra auction doesn't change what a BESS can
+    bid into."""
+    with pytest.raises(ValueError, match="not eligible"):
+        BessConfig(capacity_markets=(("mFRR_capacity_extra", "up"),))
 
 
 # --- causal z-score -----------------------------------------------------------
@@ -455,9 +468,10 @@ def test_fcr_up_down_legs_do_not_collide_in_capacity_revenue_by_market():
     # Both legs share market="FCR" but distinct products -- must not collide.
     assert first_tick.capacity_revenue_by_market["FCR:up"] == pytest.approx(40.0 * 0.2 * 1.0)
     assert first_tick.capacity_revenue_by_market["FCR:down"] == pytest.approx(25.0 * 0.2 * 1.0)
-    assert first_tick.capacity_revenue_by_market["FCR:up"] != first_tick.capacity_revenue_by_market[
-        "FCR:down"
-    ]
+    assert (
+        first_tick.capacity_revenue_by_market["FCR:up"]
+        != first_tick.capacity_revenue_by_market["FCR:down"]
+    )
 
 
 def test_commit_splits_across_market_groups_not_raw_leg_entries():
@@ -586,3 +600,501 @@ def test_afrr_activation_revenue_never_appears_in_total_revenue_dkk():
     assert result.total_revenue_dkk == pytest.approx(
         result.total_arbitrage_revenue_dkk + result.total_capacity_revenue_dkk
     )
+
+
+# --- per-currency capacity buckets (Stage 1 correctness fix) -----------------
+#
+# The regression test that should have existed: a DK2-shaped config mixing
+# EUR FCR (DK2's FCR price/FCR-D legs) and DKK aFRR_capacity must never sum
+# them into one number -- this is the exact live defect described in
+# shared/bess_simulator.py's module docstring §2.
+
+
+def test_dk2_mixed_currency_capacity_buckets_never_summed():
+    day_ahead = _price_rows([100.0] * 5)
+    fcr = _price_rows([50.0])  # ("FCR", "price") in DK2 -> EUR/MW/h (shared/units.py)
+    afrr = _price_rows([30.0])  # ("aFRR_capacity", "up") in DK2 -> DKK/MW/h
+    db = _db_with_series(day_ahead, fcr=fcr, afrr=afrr)
+    config = BessConfig(
+        capacity_commit_mw=0.4,
+        capacity_markets=(("FCR", "price"), ("aFRR_capacity", "up")),
+    )
+
+    result = run_backtest(db, "DK2", BASE_TIME, BASE_TIME + timedelta(hours=5), config)
+
+    first_tick = result.ticks[0]
+    # commit split evenly across 2 groups: 0.2 MW each, 1-hour tick.
+    expected_eur_leg = 50.0 * 0.2 * 1.0
+    expected_dkk_leg = 30.0 * 0.2 * 1.0
+
+    # capacity_revenue_dkk (and its cumulative) holds ONLY the DKK (aFRR)
+    # contribution -- the EUR (FCR) leg must never appear in it.
+    assert first_tick.capacity_revenue_dkk == pytest.approx(expected_dkk_leg)
+    assert result.total_capacity_revenue_dkk == pytest.approx(expected_dkk_leg * 5)
+
+    # capacity_revenue_eur (and its cumulative) holds ONLY the EUR (FCR)
+    # contribution.
+    assert first_tick.capacity_revenue_eur == pytest.approx(expected_eur_leg)
+    assert result.total_capacity_revenue_eur == pytest.approx(expected_eur_leg * 5)
+
+    # cumulative_total_revenue_dkk (arbitrage + capacity) must exclude the
+    # EUR leg entirely.
+    assert result.total_revenue_dkk == pytest.approx(
+        result.total_arbitrage_revenue_dkk + result.total_capacity_revenue_dkk
+    )
+    # sanity: the EUR figure is a real, distinct, nonzero number -- not
+    # silently zeroed out or folded into the DKK total above.
+    assert result.total_capacity_revenue_eur > 0.0
+    assert result.total_capacity_revenue_eur != pytest.approx(result.total_capacity_revenue_dkk)
+
+    assert result.currencies_present == frozenset({"DKK", "EUR"})
+
+
+def test_dk1_backtest_capacity_revenue_numerically_unchanged():
+    """
+    DK1 is all-DKK (fcr_dk1 and afrr_reserves_nordic are both DKK/MW/h) --
+    Stage 1's per-currency bucketing must not move a single DK1 number. This
+    is the proof that Stage 1 only moved what it should (DK2's mixed-
+    currency figures), never DK1's.
+    """
+    day_ahead = _price_rows([100.0] * 5)
+    fcr = _price_rows([50.0])
+    afrr = _price_rows([30.0])
+    db = _db_with_series(day_ahead, fcr=fcr, afrr=afrr)
+    config = BessConfig(
+        capacity_commit_mw=0.4, capacity_markets=(("FCR", "price"), ("aFRR_capacity", "up"))
+    )
+
+    result = run_backtest(db, "DK1", BASE_TIME, BASE_TIME + timedelta(hours=5), config)
+
+    # Hand-computed expected total: 2 groups, 0.2 MW/leg, 1h ticks, 5 ticks.
+    expected_capacity_revenue_dkk = (50.0 * 0.2 + 30.0 * 0.2) * 1.0 * 5
+    assert result.total_capacity_revenue_dkk == pytest.approx(expected_capacity_revenue_dkk)
+    assert result.total_capacity_revenue_eur == 0.0
+    assert result.currencies_present == frozenset({"DKK"})
+    assert result.total_revenue_dkk == pytest.approx(
+        result.total_arbitrage_revenue_dkk + result.total_capacity_revenue_dkk
+    )
+
+
+def test_currencies_present_empty_when_no_capacity_revenue():
+    day_ahead = _price_rows([100.0] * 5)
+    db = _db_with_series(day_ahead, fcr=[], afrr=[])
+    config = BessConfig(capacity_commit_mw=0.3)
+
+    result = run_backtest(db, "DK1", BASE_TIME, BASE_TIME + timedelta(hours=5), config)
+
+    assert result.currencies_present == frozenset()
+
+
+def test_unlabelled_capacity_leg_raises_value_error(monkeypatch):
+    """
+    A leg whose currency can't be resolved (a registry gap, not a "no data"
+    case) must fail loud, not silently default to 0/None -- a silently
+    unlabelled leg is exactly how the DKK/EUR summing defect arose.
+    """
+    monkeypatch.setattr("shared.bess_simulator.currency_for", lambda market, zone, product: None)
+    day_ahead = _price_rows([100.0] * 3)
+    fcr = _price_rows([50.0])
+    db = _db_with_series(day_ahead, fcr=fcr)
+    config = BessConfig(capacity_commit_mw=0.3, capacity_markets=(("FCR", "price"),))
+
+    with pytest.raises(ValueError, match="no unit declared"):
+        run_backtest(db, "DK2", BASE_TIME, BASE_TIME + timedelta(hours=3), config)
+
+
+# --- Stage 4.1: "price_ranked" capacity allocation ---------------------------
+
+
+def test_capacity_allocation_defaults_to_even():
+    assert BessConfig().capacity_allocation == "even"
+
+
+def test_capacity_allocation_rejects_invalid_value():
+    with pytest.raises(ValueError, match="capacity_allocation"):
+        BessConfig(capacity_allocation="best_effort")
+
+
+def test_price_ranked_gives_zero_price_group_near_full_share_to_its_sibling():
+    """
+    The core allocation fix: with a zero-trailing-price FFR group alongside
+    a steadily-priced aFRR_capacity group, once FFR's trailing history is
+    established (all zeros), aFRR should get essentially its *entire*
+    group's weight -- FFR's near-0 share is redistributed to its sibling,
+    never lost to arbitrage or left diluting aFRR's share the way "even"
+    would (see BessConfig.capacity_allocation's docstring).
+    """
+    day_ahead = _price_rows([100.0] * 10)
+    afrr = _price_rows([10.0] * 10)  # flat, nonzero
+    ffr = _price_rows([0.0] * 10)  # flat zero -- FFR clears at 0 today, live
+    db = _db_with_series(day_ahead, afrr=afrr, ffr=ffr)
+    config = BessConfig(
+        capacity_commit_mw=0.4,
+        capacity_markets=(("FFR", "price"), ("aFRR_capacity", "up")),
+        capacity_allocation="price_ranked",
+        arbitrage_lookback_periods=5,
+    )
+
+    result = run_backtest(db, "DK2", BASE_TIME, BASE_TIME + timedelta(hours=10), config)
+
+    # By the last tick, FFR's whole trailing window is zeros -- aFRR should
+    # be getting essentially the full 0.4 MW commit (weight -> 1.0), not the
+    # 0.2 MW an even split would give it.
+    last_tick = result.ticks[-1]
+    assert last_tick.capacity_revenue_by_market["aFRR_capacity:up"] == pytest.approx(
+        10.0 * 0.4 * 1.0, rel=1e-6
+    )
+    assert last_tick.capacity_revenue_by_market["FFR:price"] == pytest.approx(0.0)
+
+
+def test_price_ranked_does_not_reduce_arbitrage_revenue_vs_no_ffr_run():
+    """
+    The coordinator's key test: including a zero-price FFR group under
+    "price_ranked" must not reduce total_arbitrage_revenue_dkk versus an
+    otherwise-identical run that never configured FFR at all --
+    arbitrage_power_mw depends only on capacity_commit_mw (never on
+    capacity_markets' composition or allocation mode), so this should hold
+    exactly, not just approximately/directionally.
+    """
+    values = [98.0, 102.0, 99.0, 101.0, 100.0, 100.0] + [1.0] * 5 + [500.0] * 5
+    day_ahead = _price_rows(values)
+    afrr = _price_rows([10.0] * len(values))
+    ffr = _price_rows([0.0] * len(values))
+    common_kwargs = dict(
+        capacity_commit_mw=0.4,
+        arbitrage_lookback_periods=6,
+        arbitrage_z_threshold=0.1,
+    )
+
+    db_with_ffr = _db_with_series(day_ahead, afrr=afrr, ffr=ffr)
+    with_ffr_config = BessConfig(
+        capacity_markets=(("FFR", "price"), ("aFRR_capacity", "up")),
+        capacity_allocation="price_ranked",
+        **common_kwargs,
+    )
+    with_ffr = run_backtest(
+        db_with_ffr, "DK2", BASE_TIME, BASE_TIME + timedelta(hours=len(values)), with_ffr_config
+    )
+
+    db_no_ffr = _db_with_series(day_ahead, afrr=afrr)
+    no_ffr_config = BessConfig(
+        capacity_markets=(("aFRR_capacity", "up"),),
+        **common_kwargs,
+    )
+    no_ffr = run_backtest(
+        db_no_ffr, "DK2", BASE_TIME, BASE_TIME + timedelta(hours=len(values)), no_ffr_config
+    )
+
+    assert with_ffr.total_arbitrage_revenue_dkk == pytest.approx(no_ffr.total_arbitrage_revenue_dkk)
+    # Sanity: this isn't trivially true because both runs earned nothing --
+    # confirm real arbitrage activity happened in both.
+    assert with_ffr.total_arbitrage_revenue_dkk != 0.0
+
+
+def test_price_ranked_avoids_capacity_revenue_dilution_from_zero_price_group():
+    """
+    The actual bug being fixed: under "even", adding a zero-price FFR group
+    dilutes aFRR_capacity's share (1/2 -> 1/3, in a 2- vs 3-group stack),
+    reducing *total* capacity revenue even though FFR itself contributes
+    nothing. Under "price_ranked", once FFR's trailing history reads 0,
+    aFRR's capacity revenue should recover to (approximately) what it earns
+    in a run that never configured FFR at all -- not stay diluted the way
+    "even" would leave it.
+    """
+    day_ahead = _price_rows([100.0] * 10)
+    afrr = _price_rows([10.0] * 10)
+    ffr = _price_rows([0.0] * 10)
+
+    db_even = _db_with_series(day_ahead, afrr=afrr, ffr=ffr)
+    even_config = BessConfig(
+        capacity_commit_mw=0.4,
+        capacity_markets=(("FFR", "price"), ("aFRR_capacity", "up")),
+        capacity_allocation="even",
+    )
+    even_result = run_backtest(
+        db_even, "DK2", BASE_TIME, BASE_TIME + timedelta(hours=10), even_config
+    )
+
+    db_ranked = _db_with_series(day_ahead, afrr=afrr, ffr=ffr)
+    ranked_config = BessConfig(
+        capacity_commit_mw=0.4,
+        capacity_markets=(("FFR", "price"), ("aFRR_capacity", "up")),
+        capacity_allocation="price_ranked",
+        arbitrage_lookback_periods=5,
+    )
+    ranked_result = run_backtest(
+        db_ranked, "DK2", BASE_TIME, BASE_TIME + timedelta(hours=10), ranked_config
+    )
+
+    # "even" dilutes aFRR to a 0.2 MW share (half of 0.4) the whole time,
+    # since it never looks at price. "price_ranked" should earn strictly
+    # more total DKK capacity revenue once FFR's trailing-zero history
+    # kicks in (aFRR's share grows toward the full 0.4 MW).
+    assert ranked_result.total_capacity_revenue_dkk > even_result.total_capacity_revenue_dkk
+
+
+def test_price_ranked_falls_back_to_even_on_first_tick_with_no_trailing_history():
+    """
+    Every leg's trailing deque starts empty -- causally, there is no price
+    signal to rank by yet on the very first tick(s) of any run, so
+    price_ranked must fall back to an even split there (and report it).
+    """
+    day_ahead = _price_rows([100.0] * 3)
+    afrr = _price_rows([10.0] * 3)
+    ffr = _price_rows([5.0] * 3)
+    db = _db_with_series(day_ahead, afrr=afrr, ffr=ffr)
+    config = BessConfig(
+        capacity_commit_mw=0.4,
+        capacity_markets=(("FFR", "price"), ("aFRR_capacity", "up")),
+        capacity_allocation="price_ranked",
+    )
+
+    result = run_backtest(db, "DK2", BASE_TIME, BASE_TIME + timedelta(hours=3), config)
+
+    first_tick = result.ticks[0]
+    # Even split: 0.4 / 2 groups = 0.2 MW each.
+    assert first_tick.capacity_revenue_by_market["aFRR_capacity:up"] == pytest.approx(
+        10.0 * 0.2 * 1.0
+    )
+    assert first_tick.capacity_revenue_by_market["FFR:price"] == pytest.approx(5.0 * 0.2 * 1.0)
+    assert result.capacity_allocation_fell_back_to_even is True
+
+
+def test_price_ranked_falls_back_to_even_when_every_group_stays_at_zero():
+    day_ahead = _price_rows([100.0] * 5)
+    afrr = _price_rows([0.0] * 5)
+    ffr = _price_rows([0.0] * 5)
+    db = _db_with_series(day_ahead, afrr=afrr, ffr=ffr)
+    config = BessConfig(
+        capacity_commit_mw=0.4,
+        capacity_markets=(("FFR", "price"), ("aFRR_capacity", "up")),
+        capacity_allocation="price_ranked",
+    )
+
+    result = run_backtest(db, "DK2", BASE_TIME, BASE_TIME + timedelta(hours=5), config)
+
+    assert result.capacity_allocation_fell_back_to_even is True
+    # Every tick's revenue is 0 either way (both prices are 0), but the
+    # split itself should still be even (0.2 MW each) throughout, not
+    # collapsed/undefined.
+    for tick in result.ticks:
+        assert tick.capacity_reserved_mw == pytest.approx(0.4)
+
+
+def test_even_allocation_never_sets_fell_back_flag():
+    day_ahead = _price_rows([100.0] * 5)
+    afrr = _price_rows([0.0] * 5)
+    db = _db_with_series(day_ahead, afrr=afrr)
+    config = BessConfig(capacity_commit_mw=0.3, capacity_allocation="even")
+
+    result = run_backtest(db, "DK1", BASE_TIME, BASE_TIME + timedelta(hours=5), config)
+
+    assert result.capacity_allocation_fell_back_to_even is False
+
+
+def test_price_ranked_allocation_is_causal_no_lookahead():
+    """
+    The property most likely to be silently broken: a leg's *own* clearing
+    price this tick must never influence *this* tick's allocation weight --
+    only ticks strictly before it may. Construct a group (FFR) that clears
+    at 0 for several ticks, then jumps to a huge price -- if price_ranked
+    looked ahead, aFRR's share would collapse the instant FFR's price
+    jumps; if it's correctly causal, aFRR keeps its full share for that one
+    tick (FFR's trailing history is still all zeros) and only loses share
+    starting the *next* tick, once FFR's jump has actually entered its
+    trailing window.
+    """
+    n_flat = 6
+    values = [0.0] * n_flat + [1000.0] * 3
+    day_ahead = _price_rows([100.0] * len(values))
+    afrr = _price_rows([10.0] * len(values))
+    ffr = _price_rows(values)
+    db = _db_with_series(day_ahead, afrr=afrr, ffr=ffr)
+    config = BessConfig(
+        capacity_commit_mw=0.4,
+        capacity_markets=(("FFR", "price"), ("aFRR_capacity", "up")),
+        capacity_allocation="price_ranked",
+        arbitrage_lookback_periods=5,
+    )
+
+    result = run_backtest(db, "DK2", BASE_TIME, BASE_TIME + timedelta(hours=len(values)), config)
+
+    jump_tick = result.ticks[n_flat]  # first tick where FFR's OWN price is 1000
+    next_tick = result.ticks[n_flat + 1]  # one tick later -- the jump is now in history
+
+    # At the jump tick itself: FFR's trailing history is still all zeros
+    # (its own new price hasn't been appended yet) -- aFRR must still get
+    # its full, undiluted 0.4 MW share.
+    assert jump_tick.capacity_revenue_by_market["aFRR_capacity:up"] == pytest.approx(
+        10.0 * 0.4 * 1.0, rel=1e-6
+    )
+
+    # One tick later, FFR's jump has entered its trailing window -- aFRR's
+    # share must now be measurably smaller than the jump tick's (proving
+    # the jump price *did* eventually get used, just not a tick early).
+    assert (
+        next_tick.capacity_revenue_by_market["aFRR_capacity:up"]
+        < jump_tick.capacity_revenue_by_market["aFRR_capacity:up"]
+    )
+
+
+def test_price_ranked_ranks_on_relative_strength_not_raw_magnitude():
+    """
+    Regression test for the exact bug the coordinator found: an earlier
+    version of `_group_commit_shares` ranked groups by raw trailing price,
+    which silently compared magnitudes across currencies (DK2's
+    aFRR_capacity, ~tens of DKK, vs. FCR, ~single-digit EUR) -- a DKK leg
+    would out-rank a EUR leg purely because DKK numbers are bigger, the
+    same unit-mixing bug class shared/units.py exists to catch elsewhere.
+
+    Here, FCR (EUR) moves from a baseline of 1.0 to a recent trailing of
+    2.0 (2x its own history); aFRR_capacity (DKK) moves from a baseline of
+    10.0 to a recent trailing of 20.0 (also exactly 2x its own history,
+    despite being 10x FCR's raw magnitude throughout). At the same
+    *relative* strength, the two groups must be allocated approximately
+    equal shares of capacity_commit_mw -- never the ~10x-skewed split the
+    old raw-magnitude ranking would have produced.
+
+    Numbers are exact and hand-computed (not just "roughly equal"): with
+    arbitrage_lookback_periods=5 and PRICE_RANKED_BASELINE_MULTIPLIER=4
+    (baseline window=20), 20 baseline ticks followed by 5 elevated ticks,
+    evaluated at the very last tick (index 24): the short window (last 5
+    of the 24 prior ticks) holds 1 baseline + 4 elevated values, and the
+    baseline window (last 20 of the 24 prior ticks) holds 16 baseline + 4
+    elevated values -- both FCR and aFRR see the exact same 1:4 and 16:4
+    mixes (just scaled by a constant factor), so their ratios are
+    identical: (1*1 + 4*2) / 5 = 1.8 over (16*1 + 4*2) / 20 = 1.2 -> 1.5,
+    for both legs, regardless of the 10x raw-magnitude gap between them.
+    """
+    n_baseline = 20
+    n_elevated = 5
+    fcr_values = [1.0] * n_baseline + [2.0] * n_elevated
+    afrr_values = [10.0] * n_baseline + [20.0] * n_elevated  # same relative move, 10x the magnitude
+    day_ahead = _price_rows([100.0] * len(fcr_values))
+    fcr = _price_rows(fcr_values)
+    afrr = _price_rows(afrr_values)
+    db = _db_with_series(day_ahead, fcr=fcr, afrr=afrr)
+    config = BessConfig(
+        capacity_commit_mw=0.4,
+        capacity_markets=(("FCR", "price"), ("aFRR_capacity", "up")),
+        capacity_allocation="price_ranked",
+        arbitrage_lookback_periods=5,
+    )
+
+    result = run_backtest(
+        db, "DK2", BASE_TIME, BASE_TIME + timedelta(hours=len(fcr_values)), config
+    )
+
+    last_tick = result.ticks[-1]
+    fcr_revenue = last_tick.capacity_revenue_by_market["FCR:price"]
+    afrr_revenue = last_tick.capacity_revenue_by_market["aFRR_capacity:up"]
+
+    # Hand-computed: both ratios are exactly 1.5 -> equal weights -> each
+    # leg's commit is 0.2 MW. Revenue = price * commit * dt_hours (dt=1h).
+    expected_commit_mw = 0.2
+    assert fcr_revenue == pytest.approx(2.0 * expected_commit_mw * 1.0, rel=1e-6)
+    assert afrr_revenue == pytest.approx(20.0 * expected_commit_mw * 1.0, rel=1e-6)
+
+    # The property under test, stated directly: equal relative strength ->
+    # (approximately) equal MW commit, regardless of the 10x raw-price gap.
+    # Revenue = price * commit, so commit_ratio = revenue_ratio / price_ratio.
+    fcr_commit = fcr_revenue / 2.0
+    afrr_commit = afrr_revenue / 20.0
+    assert fcr_commit == pytest.approx(afrr_commit, rel=1e-6)
+    assert fcr_commit == pytest.approx(expected_commit_mw, rel=1e-6)
+
+    # Sanity against the bug this test guards against: the OLD raw-magnitude
+    # ranking would have weighted aFRR (trailing ~18 DKK) roughly 10x FCR's
+    # (trailing ~1.8 EUR) share purely from the raw numbers -- i.e. an MW
+    # commit ratio near 10, not near 1. Assert the actual commit ratio is
+    # nowhere close to that old, wrong shape.
+    assert afrr_commit / fcr_commit == pytest.approx(1.0, rel=1e-3)
+
+
+def test_price_ranked_leg_relative_strength_is_zero_when_own_baseline_is_zero():
+    """
+    A leg whose own longer-run baseline is itself 0 (FFR's real situation
+    today) must rank at 0 relative strength -- never a ZeroDivisionError,
+    and never treated as "infinitely strong" just because its trailing
+    price is nonzero while its baseline briefly reads 0 momentum from a
+    handful of leading zeros ageing out."""
+    zero_baseline: deque[float] = deque([0.0, 0.0, 0.0], maxlen=20)
+    nonzero_short: deque[float] = deque([5.0, 5.0], maxlen=5)
+    assert _leg_relative_strength(nonzero_short, zero_baseline) == 0.0
+
+    empty: deque[float] = deque(maxlen=5)
+    assert _leg_relative_strength(empty, zero_baseline) == 0.0
+    assert _leg_relative_strength(nonzero_short, empty) == 0.0
+
+
+def test_leg_relative_strength_ratio_to_own_baseline():
+    short = deque([2.0, 2.0], maxlen=5)
+    baseline = deque([1.0, 1.0, 1.0, 1.0], maxlen=20)
+    assert _leg_relative_strength(short, baseline) == pytest.approx(2.0)
+
+
+def test_zero_price_periods_by_leg_counts_only_real_zero_prices():
+    """
+    Distinguishes a real, present price of 0 (counted) from a period with
+    no price data at all (never counted -- capacity_revenue_by_market
+    already treats that as a separate "no data" case)."""
+    day_ahead = _price_rows([100.0] * 6)
+    # 0.0, 0.0, 5.0, None (dropped before reaching run_backtest -- see
+    # _fetch_series), 0.0, 5.0 -- but _price_rows(None) entries are dropped
+    # by _fetch_series's null-filtering, so only real values remain in the
+    # series; carrying forward via _value_at_or_before means the two
+    # "missing" ticks still see the last *known* value, not None -- so to
+    # exercise a genuine "no data yet" tick, start the FFR series later
+    # than day_ahead's window.
+    ffr = _price_rows([0.0, 0.0, 5.0, 0.0], start=BASE_TIME + timedelta(hours=2))
+    db = _db_with_series(day_ahead, ffr=ffr)
+    config = BessConfig(capacity_commit_mw=0.2, capacity_markets=(("FFR", "price"),))
+
+    result = run_backtest(db, "DK2", BASE_TIME, BASE_TIME + timedelta(hours=6), config)
+
+    # Ticks 0-1 have no FFR price yet (series starts at hour 2) -- not
+    # counted as zero-price periods, just "no data".
+    assert result.ticks[0].capacity_revenue_by_market["FFR:price"] == 0.0
+    assert result.ticks[1].capacity_revenue_by_market["FFR:price"] == 0.0
+    # Ticks 2,3,5 (carrying forward tick 5's value from tick 4=0.0) clear at
+    # a real 0.0; tick 4 clears at a real 5.0.
+    assert result.zero_price_periods_by_leg == {"FFR:price": 3}
+
+
+def test_zero_price_periods_by_leg_empty_when_no_capacity_markets():
+    day_ahead = _price_rows([100.0] * 3)
+    db = _db_with_series(day_ahead)
+    config = BessConfig(capacity_commit_mw=0.0, capacity_markets=())
+
+    result = run_backtest(db, "DK1", BASE_TIME, BASE_TIME + timedelta(hours=3), config)
+
+    assert result.zero_price_periods_by_leg == {}
+
+
+def test_dk1_backtest_unaffected_by_capacity_allocation_field_existing():
+    """
+    Definition-of-done regression check: DK1's default ("even") behaviour
+    must be bit-for-bit unchanged now that capacity_allocation exists --
+    the two runs below (one passing the field explicitly, one relying on
+    the default) must produce identical results.
+    """
+    day_ahead = _price_rows([100.0] * 5)
+    fcr = _price_rows([50.0] * 5)
+    afrr = _price_rows([30.0] * 5)
+    db_a = _db_with_series(day_ahead, fcr=fcr, afrr=afrr)
+    db_b = _db_with_series(day_ahead, fcr=fcr, afrr=afrr)
+
+    config_default = BessConfig(capacity_commit_mw=0.4)
+    config_explicit = BessConfig(capacity_commit_mw=0.4, capacity_allocation="even")
+
+    result_default = run_backtest(
+        db_a, "DK1", BASE_TIME, BASE_TIME + timedelta(hours=5), config_default
+    )
+    result_explicit = run_backtest(
+        db_b, "DK1", BASE_TIME, BASE_TIME + timedelta(hours=5), config_explicit
+    )
+
+    assert result_default.total_capacity_revenue_dkk == pytest.approx(
+        result_explicit.total_capacity_revenue_dkk
+    )
+    assert result_default.total_revenue_dkk == pytest.approx(result_explicit.total_revenue_dkk)

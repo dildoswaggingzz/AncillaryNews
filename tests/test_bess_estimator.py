@@ -5,6 +5,7 @@ from shared.bess_estimator import (
     DEFAULT_ZONES,
     ILLUSTRATIVE_CONFIGS,
     MORNING_BRIEF_RUN_LABEL,
+    ZONE_CAPACITY_MARKETS,
     run_illustrative_backtests,
 )
 from shared.bess_simulator import BacktestResult, BessTick
@@ -165,3 +166,131 @@ def test_run_illustrative_backtests_surfaces_total_afrr_activation_revenue_eur()
         summaries = run_illustrative_backtests(db, ("DK2",), start_time=START, end_time=END)
 
     assert all(s["total_afrr_activation_revenue_eur"] == 42.0 for s in summaries)
+
+
+# --- Stage 4.2: ZONE_CAPACITY_MARKETS data table -----------------------------
+
+
+def test_zone_capacity_markets_dk1_has_no_ffr_or_fcr_d():
+    dk1 = ZONE_CAPACITY_MARKETS["DK1"]
+    assert ("FCR", "price") in dk1
+    assert ("aFRR_capacity", "up") in dk1
+    assert ("aFRR_capacity", "down") in dk1
+    assert ("FCR", "up") not in dk1
+    assert ("FCR", "down") not in dk1
+    assert ("FFR", "price") not in dk1
+
+
+def test_zone_capacity_markets_dk2_includes_full_stack():
+    dk2 = ZONE_CAPACITY_MARKETS["DK2"]
+    assert set(dk2) == {
+        ("FCR", "price"),
+        ("FCR", "up"),
+        ("FCR", "down"),
+        ("aFRR_capacity", "up"),
+        ("aFRR_capacity", "down"),
+        ("FFR", "price"),
+    }
+
+
+def test_dk2_configs_use_price_ranked_allocation_dk1_stays_even():
+    """
+    DK2's stack includes FFR (currently clearing at 0) -- must use
+    "price_ranked" so FFR doesn't dilute FCR/aFRR's shares (shared/
+    bess_simulator.py's module docstring §2). DK1 has no zero-price-prone
+    market in its stack, so it stays at the reproducible "even" default.
+    """
+    db = MagicMock()
+    db.save_bess_run.return_value = 1
+    captured_configs_by_zone: dict[str, list] = {"DK1": [], "DK2": []}
+
+    with patch("shared.bess_estimator.run_backtest") as mock_run_backtest:
+
+        def fake_run_backtest(db_arg, zone, start, end, config):
+            captured_configs_by_zone[zone].append(config)
+            return _result_with_ticks(zone, config, cap_binding=False)
+
+        mock_run_backtest.side_effect = fake_run_backtest
+        run_illustrative_backtests(db, ("DK1", "DK2"), start_time=START, end_time=END)
+
+    assert all(c.capacity_allocation == "price_ranked" for c in captured_configs_by_zone["DK2"])
+    assert all(c.capacity_allocation == "even" for c in captured_configs_by_zone["DK1"])
+
+
+def test_dk1_configs_include_afrr_down():
+    """Previously omitted for no stated reason -- down-regulation capacity
+    is genuinely BESS-addressable the same way up-regulation is."""
+    db = MagicMock()
+    db.save_bess_run.return_value = 1
+    captured_configs = []
+
+    with patch("shared.bess_estimator.run_backtest") as mock_run_backtest:
+
+        def fake_run_backtest(db_arg, zone, start, end, config):
+            captured_configs.append(config)
+            return _result_with_ticks(zone, config, cap_binding=False)
+
+        mock_run_backtest.side_effect = fake_run_backtest
+        run_illustrative_backtests(db, ("DK1",), start_time=START, end_time=END)
+
+    assert all(("aFRR_capacity", "down") in c.capacity_markets for c in captured_configs)
+
+
+def test_dk2_configs_include_ffr():
+    db = MagicMock()
+    db.save_bess_run.return_value = 1
+    captured_configs = []
+
+    with patch("shared.bess_estimator.run_backtest") as mock_run_backtest:
+
+        def fake_run_backtest(db_arg, zone, start, end, config):
+            captured_configs.append(config)
+            return _result_with_ticks(zone, config, cap_binding=False)
+
+        mock_run_backtest.side_effect = fake_run_backtest
+        run_illustrative_backtests(db, ("DK2",), start_time=START, end_time=END)
+
+    assert all(("FFR", "price") in c.capacity_markets for c in captured_configs)
+    assert all(("aFRR_capacity", "down") in c.capacity_markets for c in captured_configs)
+
+
+def test_summary_includes_zero_price_periods_and_currencies_present():
+    db = MagicMock()
+    db.save_bess_run.return_value = 1
+
+    def _result_with_extras(zone, config, cap_binding):
+        result = _result_with_ticks(zone, config, cap_binding)
+        result.zero_price_periods_by_leg = {"FFR:price": 720}
+        return result
+
+    with patch("shared.bess_estimator.run_backtest") as mock_run_backtest:
+        mock_run_backtest.side_effect = lambda db_arg, zone, start, end, config: (
+            _result_with_extras(zone, config, cap_binding=False)
+        )
+        summaries = run_illustrative_backtests(db, ("DK2",), start_time=START, end_time=END)
+
+    assert all(s["zero_price_periods_by_leg"] == {"FFR:price": 720} for s in summaries)
+    # currencies_present must be JSON-serializable (this summary is
+    # persisted as JSONB) -- a sorted list, not the raw frozenset.
+    assert all(isinstance(s["currencies_present"], list) for s in summaries)
+
+
+def test_summary_currencies_present_reflects_backtest_result():
+    db = MagicMock()
+    db.save_bess_run.return_value = 1
+
+    def _result_with_currencies(zone, config, cap_binding):
+        result = _result_with_ticks(zone, config, cap_binding)
+        result.ticks[0].capacity_revenue_dkk = 10.0
+        result.ticks[0].cumulative_capacity_revenue_dkk = 10.0
+        result.ticks[0].capacity_revenue_eur = 5.0
+        result.ticks[0].cumulative_capacity_revenue_eur = 5.0
+        return result
+
+    with patch("shared.bess_estimator.run_backtest") as mock_run_backtest:
+        mock_run_backtest.side_effect = lambda db_arg, zone, start, end, config: (
+            _result_with_currencies(zone, config, cap_binding=False)
+        )
+        summaries = run_illustrative_backtests(db, ("DK2",), start_time=START, end_time=END)
+
+    assert all(s["currencies_present"] == ["DKK", "EUR"] for s in summaries)

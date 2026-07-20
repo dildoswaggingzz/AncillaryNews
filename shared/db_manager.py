@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from psycopg2 import pool as psycopg2_pool
@@ -31,6 +32,57 @@ TRIGGER_INSERT_QUERY = """
     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
 """
 
+# Startup schema-completeness check (Stage 0's migration-runner fix,
+# `scripts/migrate.py`). `docker-compose.yml` mounts `init-db/` at
+# `/docker-entrypoint-initdb.d`, which Postgres only executes against a
+# *fresh, empty* data directory -- so an `ALTER TABLE ... ADD COLUMN` file
+# added after a deployment's volume was first created never runs there on
+# its own (see `scripts/migrate.py`'s module docstring, and the exact bug
+# this caught: `init-db/06-bess-afrr-activation.sql`'s columns never applied
+# on any pre-existing `pgdata` volume, silently breaking `save_bess_run`).
+# Listed here as (table, column) pairs -- only the `ALTER TABLE ... ADD
+# COLUMN` files are at risk (a `CREATE TABLE IF NOT EXISTS` file is either
+# fully present or the whole table is missing, which every write against it
+# would fail on immediately and loudly; a missing *column* on an otherwise-
+# present table is the silent case worth a dedicated check for).
+EXPECTED_SCHEMA_COLUMNS: tuple[tuple[str, str], ...] = (
+    # init-db/05-morning-briefs.sql
+    ("bess_simulation_runs", "label"),
+    # init-db/06-bess-afrr-activation.sql
+    ("bess_simulation_runs", "total_afrr_activation_revenue_eur"),
+    ("bess_simulation_ticks", "afrr_activation_revenue_eur"),
+    ("bess_simulation_ticks", "cumulative_afrr_activation_revenue_eur"),
+    # init-db/07-bess-capacity-currency.sql
+    ("bess_simulation_runs", "total_capacity_revenue_eur"),
+    ("bess_simulation_ticks", "capacity_revenue_eur"),
+    ("bess_simulation_ticks", "cumulative_capacity_revenue_eur"),
+)
+
+
+@dataclass(frozen=True)
+class SaveResult:
+    """
+    `save_market_data`'s return value (Stage 2 guardrail): `total` rows
+    written across every series, plus a `market:product` -> rows-written
+    breakdown that starts **every configured series at 0** before the
+    record loop even runs -- not only the keys that happened to get a row.
+
+    That upfront zero-initialisation is the entire point: a typo'd
+    `value_field` is otherwise indistinguishable from a column that's
+    legitimately null across a whole batch (both produce zero mapped rows
+    for that series, and `save_market_data` previously returned only a
+    single flat `int`, with no per-series breakdown at all). With
+    `by_series` always carrying every configured series, a permanently-
+    flat-at-zero series is a real, alertable Prometheus time series
+    (`services/ingestor/main.py`'s `SERIES_ROWS_TOTAL.labels(...).inc(0)`
+    for every series, every cycle) rather than a metric that simply never
+    exists -- see that module for the `increase(ingestor_series_rows_total
+    [6h]) == 0` alert this makes possible.
+    """
+
+    total: int
+    by_series: dict[str, int]
+
 
 class DatabaseManager:
     """
@@ -45,7 +97,7 @@ class DatabaseManager:
             raise ValueError("DATABASE_URL environment variable is not set")
         self._pool = psycopg2_pool.SimpleConnectionPool(minconn, maxconn, self.conn_str)
 
-    def save_market_data(self, records: list[dict], dataset: DatasetConfig) -> int:
+    def save_market_data(self, records: list[dict], dataset: DatasetConfig) -> SaveResult:
         """
         Maps a batch of raw Energinet records to market_data_history rows per
         `dataset`'s declarative field mapping (shared/datasets.py) and inserts
@@ -62,12 +114,31 @@ class DatabaseManager:
         for that record, since not every Energinet record populates every
         product column (e.g. a capacity record may carry `UpPriceDKK` but not
         `DownPriceDKK` for a given hour).
+
+        Returns a `SaveResult` (Stage 2 guardrail) rather than a bare row
+        count -- see that dataclass's docstring for why `by_series` starts
+        every *configured* series at 0 up front, not only the ones that
+        ended up with a row.
         """
         fetched_at = datetime.now(UTC)
         values = []
+        # Every configured series starts at 0 -- see SaveResult's docstring.
+        by_series: dict[str, int] = {
+            f"{s.market or dataset.market}:{s.product}": 0 for s in dataset.series
+        }
         for record in records:
             time_value = record[dataset.time_field]
-            zone_value = record[dataset.zone_field] if dataset.zone_field else dataset.zone
+            # The record-level zone this dataset resolves to (per-record
+            # `PriceArea`, or the dataset's fixed `zone` when it has no
+            # `zone_field`). `s.zone or record_zone_value` below lets one
+            # series override this per-record resolution with a fixed zone
+            # of its own -- needed for a zone-heterogeneous dataset (a
+            # synchronous-area-wide figure alongside per-zone figures in the
+            # same record, e.g. `InertiaNordicSyncharea`), see
+            # `shared/datasets.py`'s `SeriesConfig.zone` docstring. `None`
+            # (the default for every series today) leaves this per-record
+            # resolution untouched, so existing behavior is unchanged.
+            record_zone_value = record[dataset.zone_field] if dataset.zone_field else dataset.zone
             for s in dataset.series:
                 if record.get(s.value_field) is None:
                     continue
@@ -75,11 +146,13 @@ class DatabaseManager:
                     continue
                 if any(record.get(k) != v for k, v in s.extra_filters.items()):
                     continue
+                key = f"{s.market or dataset.market}:{s.product}"
+                by_series[key] += 1
                 values.append(
                     (
                         time_value,
                         s.market or dataset.market,
-                        zone_value,
+                        s.zone or record_zone_value,
                         s.product,
                         record[s.value_field],
                         dataset.source,
@@ -92,7 +165,7 @@ class DatabaseManager:
             logger.warning(
                 "No mappable series found in %d records for %s", len(records), dataset.name
             )
-            return 0
+            return SaveResult(total=0, by_series=by_series)
 
         conn = self._pool.getconn()
         try:
@@ -106,7 +179,7 @@ class DatabaseManager:
         finally:
             self._pool.putconn(conn)
 
-        return len(values)
+        return SaveResult(total=len(values), by_series=by_series)
 
     def fetch_distinct_series(self) -> list[tuple[str, str, str]]:
         """
@@ -590,8 +663,9 @@ class DatabaseManager:
                     INSERT INTO bess_simulation_runs
                         (zone, start_time, end_time, config, total_arbitrage_revenue_dkk,
                          total_capacity_revenue_dkk, total_revenue_dkk, full_cycle_equivalents,
-                         tick_count, label, total_afrr_activation_revenue_eur)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                         tick_count, label, total_afrr_activation_revenue_eur,
+                         total_capacity_revenue_eur)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id;
                     """,
                     (
@@ -606,6 +680,7 @@ class DatabaseManager:
                         len(result.ticks),
                         label,
                         result.total_afrr_activation_revenue_eur,
+                        result.total_capacity_revenue_eur,
                     ),
                 )
                 run_id = cur.fetchone()[0]
@@ -629,6 +704,8 @@ class DatabaseManager:
                             t.cumulative_total_revenue_dkk,
                             t.afrr_activation_revenue_eur,
                             t.cumulative_afrr_activation_revenue_eur,
+                            t.capacity_revenue_eur,
+                            t.cumulative_capacity_revenue_eur,
                         )
                         for t in result.ticks
                     ]
@@ -641,7 +718,8 @@ class DatabaseManager:
                              capacity_revenue_dkk, capacity_revenue_by_market,
                              cumulative_arbitrage_revenue_dkk, cumulative_capacity_revenue_dkk,
                              cumulative_total_revenue_dkk, afrr_activation_revenue_eur,
-                             cumulative_afrr_activation_revenue_eur)
+                             cumulative_afrr_activation_revenue_eur, capacity_revenue_eur,
+                             cumulative_capacity_revenue_eur)
                         VALUES %s;
                         """,
                         tick_values,
@@ -671,7 +749,8 @@ class DatabaseManager:
         query = f"""
             SELECT id, zone, start_time, end_time, config, total_arbitrage_revenue_dkk,
                    total_capacity_revenue_dkk, total_revenue_dkk, full_cycle_equivalents,
-                   tick_count, created_at, label, total_afrr_activation_revenue_eur
+                   tick_count, created_at, label, total_afrr_activation_revenue_eur,
+                   total_capacity_revenue_eur
             FROM bess_simulation_runs
             {where_clause}
             ORDER BY created_at DESC
@@ -698,7 +777,8 @@ class DatabaseManager:
                     """
                     SELECT id, zone, start_time, end_time, config, total_arbitrage_revenue_dkk,
                            total_capacity_revenue_dkk, total_revenue_dkk, full_cycle_equivalents,
-                           tick_count, created_at, label, total_afrr_activation_revenue_eur
+                           tick_count, created_at, label, total_afrr_activation_revenue_eur,
+                           total_capacity_revenue_eur
                     FROM bess_simulation_runs
                     WHERE id = %s;
                     """,
@@ -724,7 +804,8 @@ class DatabaseManager:
                            capacity_revenue_dkk, capacity_revenue_by_market,
                            cumulative_arbitrage_revenue_dkk, cumulative_capacity_revenue_dkk,
                            cumulative_total_revenue_dkk, afrr_activation_revenue_eur,
-                           cumulative_afrr_activation_revenue_eur
+                           cumulative_afrr_activation_revenue_eur, capacity_revenue_eur,
+                           cumulative_capacity_revenue_eur
                     FROM bess_simulation_ticks
                     WHERE run_id = %s
                     ORDER BY time ASC;
@@ -752,6 +833,8 @@ class DatabaseManager:
                 "cumulative_total_revenue_dkk": r[12],
                 "afrr_activation_revenue_eur": r[13],
                 "cumulative_afrr_activation_revenue_eur": r[14],
+                "capacity_revenue_eur": r[15],
+                "cumulative_capacity_revenue_eur": r[16],
             }
             for r in rows
         ]
@@ -775,6 +858,7 @@ class DatabaseManager:
             "created_at": row[10],
             "label": row[11],
             "total_afrr_activation_revenue_eur": row[12],
+            "total_capacity_revenue_eur": row[13],
         }
 
     # --- Morning Brief (M5) persistence: forecasts, briefs, aggregates -----
@@ -1076,6 +1160,33 @@ class DatabaseManager:
             }
             for r in rows
         ]
+
+    def check_expected_columns(self) -> list[tuple[str, str]]:
+        """
+        Returns the subset of `EXPECTED_SCHEMA_COLUMNS` missing from the live
+        database -- a startup sanity check for `init-db/*.sql`'s `ALTER
+        TABLE ... ADD COLUMN` migrations, which (unlike a fresh volume's
+        `docker-entrypoint-initdb.d` run) do not apply themselves to an
+        already-existing `pgdata` volume; see `scripts/migrate.py`.
+
+        Deliberately read-only -- this never adds a missing column itself,
+        only reports it, so a caller can log a clear warning telling an
+        operator to run `scripts/migrate.py` rather than have schema drift
+        silently under a running fleet (see that script's module docstring
+        for why auto-applying schema changes at service startup is the wrong
+        call here).
+        """
+        conn = self._pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT table_name, column_name FROM information_schema.columns "
+                    "WHERE table_schema = 'public';"
+                )
+                present = set(cur.fetchall())
+        finally:
+            self._pool.putconn(conn)
+        return [pair for pair in EXPECTED_SCHEMA_COLUMNS if pair not in present]
 
     def close(self):
         """Releases all pooled connections. Call once per process lifecycle."""
