@@ -671,8 +671,13 @@ async def trigger_crawler_run_now(crawler_main=Depends(get_crawler_main)):
 class BackfillRequest(BaseModel):
     start_time: datetime | None = None
     end_time: datetime | None = None
-    # Subset of shared.backfill.bess_datasets() names, e.g. ["fcr_dk1"].
-    # Unset (None) backfills every BESS-relevant dataset.
+    # Subset of shared.backfill.backfillable_datasets() names, e.g.
+    # ["fcr_dk1"] -- also accepts the M6 fundamentals-forecasting datasets
+    # (shared.backfill.FORECASTING_DATASET_NAMES), which must be named
+    # explicitly here. Unset (None) backfills every BESS-relevant dataset
+    # only (shared.backfill.bess_datasets()) -- the forecasting datasets are
+    # deliberately excluded from that default, see FORECASTING_DATASET_NAMES'
+    # docstring.
     datasets: list[str] | None = None
     chunk_days: int = DEFAULT_CHUNK_DAYS
 

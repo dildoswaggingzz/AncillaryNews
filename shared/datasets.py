@@ -653,4 +653,233 @@ DATASETS: list[DatasetConfig] = [
         is_provisional=True,
         params={"limit": 100, "sort": "HourUTC DESC"},
     ),
+    # --- M6 P0: fundamentals gap (docs/forecast-datasets-scope.md §2 Tier 1) ---
+    #
+    # Wind/solar generation forecast, hourly, per price area and per
+    # forecast type. Confirmed live 2026-07-20. `filter_field="ForecastType"`
+    # follows the `fcr_dk2` precedent above (a shared value shape --
+    # `ForecastDayAhead`/`ForecastIntraday`/`Forecast5Hour`/`Forecast1Hour`/
+    # `ForecastCurrent` -- distinguished per record by a categorical field,
+    # here `ForecastType` instead of `ProductName`). Three ForecastType
+    # values confirmed live: "Offshore Wind", "Onshore Wind", "Solar".
+    # `meta/dataset/Forecasts_Hour` labels every horizon column "MWh per
+    # hour", not the bare "MW" this file uses elsewhere (e.g.
+    # `power_system_right_now`'s wind/solar) for the same physical quantity
+    # -- energy-per-hour and power are numerically identical, so `unit="MW"`
+    # below is deliberate, not an oversight; kept consistent with this
+    # registry's existing convention rather than Energinet's own
+    # inconsistent per-dataset labeling.
+    #
+    # **`ForecastCurrent` is leak-contaminated -- never use it as a model
+    # feature** (docs/forecast-datasets-scope.md §1.3, re-confirmed live
+    # 2026-07-20: a same-day sample showed `ForecastCurrent ==
+    # ForecastDayAhead` on a not-yet-elapsed hour, and the module's own
+    # verified example shows it equalling `ForecastIntraday` once that
+    # horizon has passed). It is the *last-revised* value as of ingestion
+    # time, i.e. it silently uses information that would not have been
+    # available at bid time -- a model trained on it backtests beautifully
+    # and fails live. Rather than simply omitting the column (losing the
+    # "what did Energinet believe most recently" figure entirely, which has
+    # legitimate audit/display value), it is ingested under a product name
+    # that makes the hazard impossible to miss at the call site:
+    # `f"{type}_current_leaky_do_not_use_as_feature"`. Every consumer -- P1's
+    # leak-safe feature builder above all -- must treat this product name as
+    # a hard exclusion list entry, not just a column to be careful with.
+    DatasetConfig(
+        name="forecasts_hour",
+        dataset_id="Forecasts_Hour",
+        market="wind_solar_forecast",
+        time_field="HourUTC",
+        zone_field="PriceArea",
+        series=[
+            series
+            for forecast_type, slug in (
+                ("Offshore Wind", "offshore_wind"),
+                ("Onshore Wind", "onshore_wind"),
+                ("Solar", "solar"),
+            )
+            for series in (
+                SeriesConfig(
+                    product=f"{slug}_day_ahead",
+                    value_field="ForecastDayAhead",
+                    unit="MW",
+                    filter_field="ForecastType",
+                    filter_value=forecast_type,
+                ),
+                SeriesConfig(
+                    product=f"{slug}_intraday",
+                    value_field="ForecastIntraday",
+                    unit="MW",
+                    filter_field="ForecastType",
+                    filter_value=forecast_type,
+                ),
+                SeriesConfig(
+                    product=f"{slug}_5hour",
+                    value_field="Forecast5Hour",
+                    unit="MW",
+                    filter_field="ForecastType",
+                    filter_value=forecast_type,
+                ),
+                SeriesConfig(
+                    product=f"{slug}_1hour",
+                    value_field="Forecast1Hour",
+                    unit="MW",
+                    filter_field="ForecastType",
+                    filter_value=forecast_type,
+                ),
+                # LEAK HAZARD -- see the dataset-level comment above. Do not
+                # read this product from any forecasting feature builder.
+                SeriesConfig(
+                    product=f"{slug}_current_leaky_do_not_use_as_feature",
+                    value_field="ForecastCurrent",
+                    unit="MW",
+                    filter_field="ForecastType",
+                    filter_value=forecast_type,
+                ),
+            )
+        ],
+        is_provisional=True,
+        params={"limit": 100, "sort": "HourUTC DESC"},
+    ),
+    # Realised production and cross-border exchange, 5-minute resolution,
+    # per price area. Confirmed live 2026-07-20. Not one of the §1.2
+    # 90-day-retention datasets (history from 2014-12-31), so the default
+    # `limit=100` (~4h+ of coverage across both zones at 1 record/5min/zone)
+    # is unchanged from this file's usual default -- see the millisecond
+    # datasets below for where `limit` actually needs sizing arithmetic.
+    #
+    # Differenced against `forecasts_hour`'s `*_1hour`/`*_5hour` columns
+    # (P1), this is what turns a forecast into a forecast *error* -- the
+    # single most useful engineered feature `docs/forecast-datasets-scope.md`
+    # §1.1/§2 identifies. `BornholmSE4` is genuinely null on many DK1 rows
+    # and genuinely populated on DK2 rows (Bornholm is electrically part of
+    # DK2's SE4 interconnection) -- not a typo, matches
+    # `shared/db_manager.py`'s "missing series' value field simply omits
+    # that product" handling with no special-casing needed here.
+    DatasetConfig(
+        name="prodex_5min_realtime",
+        dataset_id="ElectricityProdex5MinRealtime",
+        market="realtime_production_exchange",
+        time_field="Minutes5UTC",
+        zone_field="PriceArea",
+        series=[
+            SeriesConfig(product="production_lt100mw", value_field="ProductionLt100MW", unit="MW"),
+            SeriesConfig(product="production_ge100mw", value_field="ProductionGe100MW", unit="MW"),
+            SeriesConfig(product="offshore_wind", value_field="OffshoreWindPower", unit="MW"),
+            SeriesConfig(product="onshore_wind", value_field="OnshoreWindPower", unit="MW"),
+            SeriesConfig(product="solar", value_field="SolarPower", unit="MW"),
+            SeriesConfig(product="exchange_great_belt", value_field="ExchangeGreatBelt", unit="MW"),
+            SeriesConfig(product="exchange_germany", value_field="ExchangeGermany", unit="MW"),
+            SeriesConfig(
+                product="exchange_netherlands", value_field="ExchangeNetherlands", unit="MW"
+            ),
+            SeriesConfig(
+                product="exchange_great_britain", value_field="ExchangeGreatBritain", unit="MW"
+            ),
+            SeriesConfig(product="exchange_norway", value_field="ExchangeNorway", unit="MW"),
+            SeriesConfig(product="exchange_sweden", value_field="ExchangeSweden", unit="MW"),
+            SeriesConfig(product="exchange_bornholm_se4", value_field="BornholmSE4", unit="MW"),
+        ],
+        is_provisional=True,
+        params={"limit": 100, "sort": "Minutes5UTC DESC"},
+    ),
+    # PICASSO cross-border available transfer capacity for aFRR -- **one of
+    # the three §1.2 90-day-rolling-retention datasets**; live-reconfirmed
+    # 2026-07-20 that the window is genuinely rolling (earliest record had
+    # advanced from 2026-04-20T09:00 at the scope doc's audit time earlier
+    # today to 2026-04-20T18:00 by the time this entry was written -- ~9
+    # hours later, same calendar day. Every day this sits un-ingested
+    # destroys a day of aFRR-border training data with no way to recover it.
+    #
+    # **Schema mismatch, flagged rather than forced (see task instructions):
+    # this dataset has no `PriceArea` field at all.** It is keyed by
+    # `BorderName` (a corridor, e.g. "DK1-DE", "DK2-DK1" -- confirmed live;
+    # see below), not a bidding zone. `market_data_history.zone` is a single
+    # column every other dataset in this registry populates with an actual
+    # bidding-zone code (DK1/DK2/SE3/.../ALL) that `shared/units.py` and
+    # `shared/rule_engine.py`'s DK1-vs-DK2 divergence checks both assume.
+    # `BorderName` doesn't fit that shape:
+    #   - `DK1-DE`/`DK2-DE` are unambiguous -- each zone's own external
+    #     interconnector to Germany. **Correction from an earlier, narrower
+    #     live check**: a first 500-record/~33-minute sample (2026-07-20)
+    #     only showed `DK1-DE` and `DK2-DK1`, and this comment briefly (in
+    #     the same change) concluded DK2 had no external aFRR-ATC border of
+    #     its own -- a full one-day backfill run moments later (same date)
+    #     surfaced `DK2-DE` too (2,648/2,168 export/import rows), proving
+    #     that conclusion wrong. Left here as a concrete, live example of
+    #     why design (b) below (auto-discovery, not enumeration) is the
+    #     right call: a narrow sample is not a safe basis for a hardcoded
+    #     BorderName enumeration, and this dataset's own volume made that
+    #     obvious within the same working session.
+    #   - `DK2-DK1` (the Storebælt/Great Belt internal cable) is NOT a
+    #     bidding-zone-external border at all -- it's the constraint
+    #     *between* the two Danish zones this whole system models. Neither
+    #     "DK1" nor "DK2" alone is a correct zone label for it.
+    #
+    # Two designs were considered:
+    #   (a) Enumerate each (BorderName, Direction) pair as its own
+    #       `SeriesConfig` with a fixed per-series `zone` override (the
+    #       `inertia_nordic` pattern above) -- consistent with this file's
+    #       usual style, but **silently drops any future BorderName**
+    #       Energinet adds until someone updates this registry entry. Given
+    #       this dataset's entire reason for urgency is "every unarchived
+    #       day is destroyed permanently," a silent enumeration gap is
+    #       exactly the failure mode P0 exists to prevent.
+    #   (b) `zone_field="BorderName"` -- the raw corridor string flows
+    #       straight into `market_data_history.zone`, auto-covering any
+    #       BorderName Energinet publishes, present or future, with zero
+    #       registry maintenance. **Chosen** for that reason, but it means
+    #       `zone` for this one dataset/market is a corridor identifier
+    #       ("DK1-DE", "DK2-DK1"), not a bidding-zone code -- `zone="DK1"`
+    #       will NOT return this dataset's DK1-DE row. Any future consumer
+    #       (P1's feature builder in particular) must know this dataset is
+    #       the one exception and derive a bidding-zone split from the
+    #       `BorderName` prefix itself if it needs one (e.g.
+    #       `BorderName.split("-")[0]`), not query by zone directly.
+    #
+    # **This is a real schema tension, not a clean fit -- flagged in the M6
+    # P0 report for operator sign-off, not resolved unilaterally.** A P1
+    # follow-up could add a `zone_from_field`/derivation hook to
+    # `SeriesConfig`/`shared/db_manager.py` so this data could be
+    # re-projected onto true bidding zones without losing choice (b)'s
+    # auto-discovery property; not built here to avoid a schema change
+    # mid-way through an urgent, otherwise-additive-only P0 ingestion task.
+    #
+    # `Direction` ("Import"/"Export"/occasionally "N/A" -- the latter left
+    # unmapped, seen live but undocumented in `meta/dataset`) is the
+    # remaining categorical field, handled the usual `filter_field` way.
+    #
+    # **`limit` sizing (confirmed live 2026-07-20, `fcr_dk2`-style
+    # arithmetic):** a full one-day backfill run returned 23,523 records
+    # across every BorderName/Direction combo active that day (DK1-DE,
+    # DK2-DE, DK2-DK1 x Import/Export) -- ~16.3 records/min, so a 15-minute
+    # poll window needs >=~245 records for what's active today. `limit=2000`
+    # leaves >8x headroom for additional borders Energinet may start
+    # publishing (which, per design (b) above, this entry will pick up
+    # automatically with no further registry change).
+    DatasetConfig(
+        name="afrr_border_atc",
+        dataset_id="AfrrBorderAvailableTransferCapacity",
+        market="aFRR_border_atc",
+        time_field="TimeMsUTC",
+        zone_field="BorderName",
+        series=[
+            SeriesConfig(
+                product="import",
+                value_field="Limit",
+                unit="MW",
+                filter_field="Direction",
+                filter_value="Import",
+            ),
+            SeriesConfig(
+                product="export",
+                value_field="Limit",
+                unit="MW",
+                filter_field="Direction",
+                filter_value="Export",
+            ),
+        ],
+        is_provisional=True,
+        params={"limit": 2000, "sort": "TimeMsUTC DESC"},
+    ),
 ]
