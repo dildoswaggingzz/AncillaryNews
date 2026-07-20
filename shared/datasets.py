@@ -882,4 +882,53 @@ DATASETS: list[DatasetConfig] = [
         is_provisional=True,
         params={"limit": 2000, "sort": "TimeMsUTC DESC"},
     ),
+    # aFRR LFC activation limits -- Energinet's own hard ceiling on how much
+    # energy the Load Frequency Controller is allowed to activate, per price
+    # area and direction. The third of the three 90-day-rolling-retention
+    # datasets in the M6 scope's §1.2 (`docs/forecast-datasets-scope.md`);
+    # `meta/dataset` states the window explicitly ("includes data from the
+    # last 3 months"), so the same "every unarchived day is destroyed
+    # permanently" urgency applies here as to `afrr_energy_activation` and
+    # `afrr_border_atc`.
+    #
+    # Forecast value: this is a *binding constraint on the aFRR activation
+    # price*, not merely a correlate. When the LFC hits its limit it cannot
+    # activate further aFRR energy regardless of the merit order, so the
+    # marginal price decouples -- the same mechanism as border ATC exhaustion
+    # in `afrr_border_atc` above, but internal rather than cross-border. The
+    # headroom between realised activation and this limit is the natural
+    # derived feature, not the raw limit.
+    #
+    # **Volume correction to the scope doc (measured live 2026-07-20):** §1.2
+    # groups this with the other two as a "millisecond dataset", which reads
+    # as high-frequency. It is not. A 3000-record `TimeMsUTC DESC` pull spans
+    # 16.2 days -- ~185 records/day across both zones (~0.13/min, one update
+    # per zone per ~15.6 min), versus `afrr_energy_activation`'s confirmed
+    # ~172,400/day. It is millisecond-*timestamped*, not high-cadence. Two
+    # practical consequences: its full 90-day backfill is ~16,650 records
+    # (seconds, not the ~20-25 min `afrr_energy_activation` needs), and it
+    # needs no `--chunk-days 1` special-casing.
+    #
+    # **`limit` sizing** (`fcr_dk2`-style arithmetic): ~1.9 records per
+    # 15-minute poll window, so the file-default `limit=100` carries ~50x
+    # headroom and ~13h of coverage. Left at the default deliberately -- the
+    # elevated `limit=2000` on `afrr_border_atc` above is not the pattern to
+    # copy here; that entry needed it, this one does not.
+    #
+    # Unlike `afrr_border_atc`, this dataset has a real `PriceArea` (DK1/DK2),
+    # so it maps cleanly onto the usual `zone` convention with none of that
+    # entry's corridor-vs-bidding-zone tension.
+    DatasetConfig(
+        name="afrr_lfc_limits",
+        dataset_id="AfrrLfcActivationLimits",
+        market="aFRR_lfc_limits",
+        time_field="TimeMsUTC",
+        zone_field="PriceArea",
+        series=[
+            SeriesConfig(product="up", value_field="LimitUp", unit="MW"),
+            SeriesConfig(product="down", value_field="LimitDown", unit="MW"),
+        ],
+        is_provisional=True,
+        params={"limit": 100, "sort": "TimeMsUTC DESC"},
+    ),
 ]
