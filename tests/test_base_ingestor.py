@@ -236,6 +236,76 @@ async def test_token_bucket_throttles_once_capacity_is_exhausted(monkeypatch):
     assert sleeps == [1.0]
 
 
+# --- fetch_data logging: WARNING on a retried attempt, ERROR only when the
+# retry budget is exhausted (not on every attempt) -------------------------
+
+
+@respx.mock
+async def test_fetch_data_logs_warning_not_error_on_a_retried_attempt(ingestor, caplog):
+    """
+    A 500 that succeeds on its second attempt is a self-healing, routine
+    retry -- it should show up as a WARNING (from `_log_before_retry`), not
+    an ERROR, so an unattended run's error-level logs stay reserved for
+    genuine, exhausted failures.
+    """
+    route = respx.get(f"{BASE_URL}/flaky").mock(
+        side_effect=[httpx.Response(500), httpx.Response(200, json={"ok": True})]
+    )
+
+    with caplog.at_level("DEBUG", logger="shared.base_ingestor"):
+        data = await ingestor.fetch_data("flaky")
+
+    assert data == {"ok": True}
+    assert route.call_count == 2
+    error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+    warning_records = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert error_records == []
+    assert any("retrying" in r.message for r in warning_records)
+    await ingestor.close()
+
+
+@respx.mock
+async def test_fetch_data_logs_error_only_once_when_retries_are_exhausted(ingestor, caplog):
+    """
+    A request that fails all 5 attempts should log exactly one ERROR (from
+    `_log_retry_exhausted`, at the point retries are actually given up on)
+    -- not one ERROR per attempt (the previous behavior) -- alongside a
+    WARNING for each of the 4 attempts that were, at the time, still going
+    to be retried.
+    """
+    route = respx.get(f"{BASE_URL}/down").mock(return_value=httpx.Response(500))
+
+    with caplog.at_level("DEBUG", logger="shared.base_ingestor"):
+        with pytest.raises(RetryError):
+            await ingestor.fetch_data("down")
+
+    assert route.call_count == 5
+    error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+    warning_records = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(error_records) == 1
+    assert "exhausted its retry budget" in error_records[0].message
+    assert len(warning_records) == 4
+    await ingestor.close()
+
+
+@respx.mock
+async def test_fetch_data_logs_the_raw_http_error_at_debug_not_error(ingestor, caplog):
+    """The per-attempt raw HTTP-status log line moved from ERROR to DEBUG (see
+    fetch_data's docstring) -- still present for troubleshooting, just no longer
+    noisy at ERROR on every attempt."""
+    respx_route = respx.get(f"{BASE_URL}/flaky").mock(
+        side_effect=[httpx.Response(500), httpx.Response(200, json={"ok": True})]
+    )
+
+    with caplog.at_level("DEBUG", logger="shared.base_ingestor"):
+        await ingestor.fetch_data("flaky")
+
+    assert respx_route.call_count == 2
+    debug_messages = [r.message for r in caplog.records if r.levelname == "DEBUG"]
+    assert any("HTTP error occurred: 500" in m for m in debug_messages)
+    await ingestor.close()
+
+
 async def test_base_ingestor_fetch_data_consumes_a_bucket_token(ingestor):
     starting_tokens = ingestor._bucket._tokens
     with respx.mock:

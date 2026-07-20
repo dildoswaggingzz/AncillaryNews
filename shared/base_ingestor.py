@@ -24,6 +24,34 @@ in 197 seconds."}`):
    timeouts, connection errors) keeps the original exponential-backoff
    behavior unchanged -- those don't come with a server-advertised cooldown
    to honor.
+
+**Honest assessment of what actually carries a backfill (2026-07-20, M6
+rate-limit cleanup):** a live 91-day/4-dataset backfill measured over the
+same 60-minute window as the live poller: the poller (small `limit`,
+100-2000) saw a ~5% 429 rate; the backfill (`shared/backfill.py`'s much
+larger `limit`, up to `CHUNK_LIMIT`=300000) saw a ~37% 429 rate, with nearly
+every backfill request getting a 429 on its *first* attempt and succeeding
+after the server-advertised cooldown (~36-60s) -- i.e. concern 2 (reactive
+retry) absorbed essentially all of it, 0 chunks failed outright, at the cost
+of a ~60s penalty per retried chunk. Concern 1 (`TokenBucket`) did not
+prevent that -- it paces *request count*, and a backfill's problem in
+practice is response *volume* (a `limit=300000` request vs. the poller's
+`limit=100-2000`), which the bucket does not currently account for (each
+`fetch_data` call costs exactly 1 token regardless of `limit`). Whether
+Energinet's quota is actually volume-sensitive (and a volume-aware bucket
+would meaningfully help) versus purely request-count (in which case the
+bucket's calibration is what would need retuning) has not been established
+live -- a planned controlled probe to distinguish the two was blocked by a
+backfill already in flight against the same API from the same IP at the
+time (any 429 measurement taken then would be contaminated by concurrent
+load, not usable to isolate volume-sensitivity). So: treat `TokenBucket` as
+a politeness measure only -- it keeps a *fast* burst of many small requests
+from tripping the limit, which is real and worth keeping -- not as the
+thing that makes backfills succeed. The thing that actually makes backfills
+succeed today is concern 2, the reactive server-directed retry; do not
+assume retuning `TokenBucket` alone would reduce the backfill's 429 rate
+without first confirming (via that probe, run when the API is quiet) what
+the quota is actually keyed on.
 """
 
 import asyncio
@@ -32,7 +60,13 @@ import re
 import time
 
 import httpx
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import (
+    RetryError,
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -123,18 +157,69 @@ def _wait_energinet_rate_limit(retry_state):
     being retried is a 429, wait exactly the server-advertised delay
     (`parse_retry_after_seconds`); for every other retried error, fall back
     to the pre-existing exponential backoff (module docstring point 2).
+
+    Deliberately does not log -- `_log_before_retry` (this module's
+    `before_sleep` hook) is the single place that logs "a retry is about to
+    happen", so every retry (429 or otherwise) gets exactly one WARNING
+    line instead of this function and that hook each logging their own.
     """
     exc = retry_state.outcome.exception() if retry_state.outcome else None
     if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
-        delay = parse_retry_after_seconds(exc.response)
-        logger.warning(
-            "Rate limited (429); honoring server-advertised cooldown of %.1fs before retrying "
-            "(attempt %d)",
-            delay,
-            retry_state.attempt_number,
-        )
-        return delay
+        return parse_retry_after_seconds(exc.response)
     return wait_exponential(multiplier=1, min=2, max=10)(retry_state)
+
+
+def _log_before_retry(retry_state) -> None:
+    """
+    Tenacity `before_sleep` hook for `fetch_data`: the single place that
+    logs "this request failed but is about to be retried". Tenacity only
+    invokes `before_sleep` when it has already decided to retry (i.e. never
+    on the final, exhausted attempt -- see `_log_retry_exhausted` for that
+    case), so this is naturally WARNING-level, not ERROR: a 429 (or
+    transient 5xx/timeout) that self-heals via retry is expected, routine
+    behavior against this API (module docstring), not an incident. Logging
+    it at ERROR -- the previous behavior, one `logger.error` line per
+    attempt inside `fetch_data` itself -- made an unattended backfill run
+    read as a stream of failures when nothing was actually wrong, and would
+    bury a genuine, retry-exhausted failure in the noise.
+    """
+    exc = retry_state.outcome.exception() if retry_state.outcome else None
+    status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    delay = retry_state.next_action.sleep if retry_state.next_action else 0.0
+    logger.warning(
+        "fetch_data attempt %d failed (%s); retrying in %.1fs",
+        retry_state.attempt_number,
+        f"HTTP {status_code}" if status_code is not None else repr(exc),
+        delay,
+    )
+
+
+def _log_retry_exhausted(retry_state):
+    """
+    Tenacity `retry_error_callback` for `fetch_data`: fires exactly once,
+    only when the retry budget (`stop_after_attempt(5)`) is actually
+    exhausted -- i.e. every attempt failed and there will be no more, as
+    opposed to `_log_before_retry`'s WARNING for a failure that is still
+    going to be retried. This is the one case in `fetch_data`'s retry
+    lifecycle that genuinely warrants ERROR.
+
+    Re-raises the same `tenacity.RetryError` tenacity would raise on its
+    own if no `retry_error_callback` were configured (see tenacity's
+    `BaseRetrying._post_stop_check_actions`: with no callback, and
+    `reraise` left at its default `False`, it raises `self.retry_error_cls
+    (fut) from fut.exception()` -- this mirrors that exactly), so
+    `fetch_data`'s existing exhausted-retries contract
+    (tests/test_base_ingestor.py::test_fetch_data_raises_after_exhausting_retries)
+    is unchanged; only the logging moves from per-attempt ERROR to a single
+    ERROR at the point retries are actually given up on.
+    """
+    exc = retry_state.outcome.exception() if retry_state.outcome else None
+    logger.error(
+        "fetch_data exhausted its retry budget after %d attempt(s): %r",
+        retry_state.attempt_number,
+        exc,
+    )
+    raise RetryError(retry_state.outcome) from exc
 
 
 class TokenBucket:
@@ -206,12 +291,23 @@ class BaseIngestor:
         stop=stop_after_attempt(5),
         wait=_wait_energinet_rate_limit,
         retry=retry_if_exception_type((httpx.HTTPError, httpx.TimeoutException)),
+        before_sleep=_log_before_retry,
+        retry_error_callback=_log_retry_exhausted,
     )
     async def fetch_data(self, endpoint: str, params: dict = None):
         """
         Fetches data from Energinet/ENTSO-E, self-pacing via `TokenBucket`
         and retrying with a server-advertised (429) or exponential (other
         errors) delay -- see module docstring.
+
+        Logging: a failed attempt that tenacity is going to retry logs at
+        DEBUG here (the raw HTTP/exception line) and WARNING once from
+        `_log_before_retry`; only a failure that survives all 5 attempts
+        logs at ERROR, from `_log_retry_exhausted`. See those two
+        functions' docstrings -- the previous behavior (ERROR on every
+        single attempt, including ones about to self-heal via retry) made
+        routine, expected 429s indistinguishable from a genuine failure in
+        an unattended run's logs.
         """
         await self._bucket.acquire()
         url = f"{self.base_url.rstrip('/')}/{endpoint.lstrip('/')}"
@@ -220,10 +316,10 @@ class BaseIngestor:
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP error occurred: {e.response.status_code}")
+            logger.debug("HTTP error occurred: %s", e.response.status_code)
             raise
         except Exception as e:
-            logger.error(f"Unexpected error: {e}")
+            logger.debug("Unexpected error: %s", e)
             raise
 
     async def close(self):
