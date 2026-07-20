@@ -64,8 +64,21 @@
     Postgres writes, no Anthropic API calls. Safe to re-run (see
     <code>shared/backfill.py</code>).
   </p>
+  <p class="muted">
+    <strong>Chunk size matters for high-volume datasets.</strong> Energinet's API truncates
+    (rather than erroring) when a date-range chunk has more records than the per-chunk limit --
+    a truncated chunk still "succeeds" with a plausible row count, so it will not look like a
+    failure. <code>afrr_energy_activation</code> is the known case: it runs
+    ~172,400 records/day, so the default 7-day chunk (~1.2M records) is truncated to roughly a
+    quarter of the window's real data. It is in the default (blank Datasets field) BESS dataset
+    set, so leaving Datasets blank backfills it at the truncating default unless you lower
+    Chunk days. Use <code>chunk_days=1</code> for <code>afrr_energy_activation</code> (and
+    <code>afrr_border_atc</code> if backfilling the forecasting datasets). If a run reports any
+    truncated chunks below, re-run just that dataset with a smaller chunk size.
+  </p>
   <form method="post" action="/dashboard/ingestor/backfill">
     <label>Days back: <input type="number" name="days" value="30" min="1" style="width:5em;"></label>
+    <label>Chunk days: <input type="number" name="chunk_days" value="7" min="1" style="width:5em;"></label>
     <label>Datasets (comma-separated, blank = all):
       <input type="text" name="datasets" placeholder="fcr_dk1,day_ahead_prices" style="width:20em;">
     </label>
@@ -79,12 +92,28 @@
     <p><strong>Backfill result:</strong>
       {{ backfill_result.total_rows_saved }} row(s) saved across
       {{ backfill_result.datasets|length }} dataset(s), window
-      {{ backfill_result.start }} &ndash; {{ backfill_result.end }}.</p>
+      {{ backfill_result.start }} &ndash; {{ backfill_result.end }}.
+      {% if backfill_result.any_truncated %}
+      <span class="badge badge-correction">TRUNCATED DATA</span>
+      {% endif %}
+    </p>
+    {% if backfill_result.any_truncated %}
+    <p><strong>Warning:</strong> {{ backfill_result.total_chunks_truncated }} chunk(s) across
+      this run returned exactly the per-chunk record limit -- Energinet's API truncates rather
+      than erroring, so this run is likely missing records for the dataset(s) flagged below.
+      This is NOT a clean/complete backfill. Re-run the affected dataset(s) with a smaller
+      Chunk days value.</p>
+    {% endif %}
     <ul>
       {% for r in backfill_result.datasets %}
       <li>{{ r.dataset }}: {{ r.rows_saved }} row(s) saved
-        ({{ r.chunks_fetched }} chunk(s), {{ r.chunks_failed }} failed),
-        span [{{ r.earliest_record_time }}, {{ r.latest_record_time }}]</li>
+        ({{ r.chunks_fetched }} chunk(s), {{ r.chunks_failed }} failed,
+        {{ r.chunks_truncated }} truncated),
+        span [{{ r.earliest_record_time }}, {{ r.latest_record_time }}]
+        {% if r.chunks_truncated > 0 %}
+        <span class="badge badge-correction">TRUNCATED</span>
+        {% endif %}
+      </li>
       {% endfor %}
     </ul>
     {% endif %}

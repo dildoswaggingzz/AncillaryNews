@@ -6,6 +6,7 @@ import pytest
 import respx
 from tenacity import wait_none
 
+import shared.backfill as backfill_module
 from shared.backfill import (
     BESS_DATASET_NAMES,
     _date_chunks,
@@ -274,6 +275,85 @@ async def test_backfill_dataset_is_safe_to_rerun(ingestor, db):
     await ingestor.close()
 
 
+# --- backfill_dataset truncation detection (Energinet sort+limit truncates,
+# does not error -- a chunk landing on exactly CHUNK_LIMIT records is the
+# truncation signature) -----------------------------------------------------
+
+
+@respx.mock
+async def test_backfill_dataset_flags_chunk_at_exactly_chunk_limit_as_truncated(
+    ingestor, db, monkeypatch
+):
+    monkeypatch.setattr(backfill_module, "CHUNK_LIMIT", 3)
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    end = datetime(2026, 1, 8, tzinfo=UTC)  # a single 7-day chunk
+
+    records = [{"HourUTC": f"2026-01-0{i}T00:00:00", "FCRdk_DKK": 1.0} for i in range(1, 4)]
+    respx.get(FCR_DK1_URL).mock(return_value=httpx.Response(200, json={"records": records}))
+
+    result = await backfill_dataset(ingestor, db, FCR_DK1, start, end, rate_limit_seconds=0)
+
+    assert result["chunks_truncated"] == 1
+    assert result["chunks_failed"] == 0  # a truncated chunk still fetched and saved successfully
+    assert result["chunks_fetched"] == 1
+    assert result["rows_saved"] == 3
+    assert result["truncated_windows"] == [{"start": start, "end": end}]
+    await ingestor.close()
+
+
+@respx.mock
+async def test_backfill_dataset_does_not_flag_chunk_just_below_chunk_limit(
+    ingestor, db, monkeypatch
+):
+    monkeypatch.setattr(backfill_module, "CHUNK_LIMIT", 3)
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    end = datetime(2026, 1, 8, tzinfo=UTC)
+
+    records = [{"HourUTC": f"2026-01-0{i}T00:00:00", "FCRdk_DKK": 1.0} for i in range(1, 3)]
+    respx.get(FCR_DK1_URL).mock(return_value=httpx.Response(200, json={"records": records}))
+
+    result = await backfill_dataset(ingestor, db, FCR_DK1, start, end, rate_limit_seconds=0)
+
+    assert result["chunks_truncated"] == 0
+    assert result["truncated_windows"] == []
+    assert result["rows_saved"] == 2
+    await ingestor.close()
+
+
+@respx.mock
+async def test_backfill_dataset_flags_only_the_truncated_chunk_among_several(
+    ingestor, db, monkeypatch
+):
+    """Two chunks: the first lands on exactly CHUNK_LIMIT (truncated), the second doesn't --
+    only the first should be counted/listed."""
+    monkeypatch.setattr(backfill_module, "CHUNK_LIMIT", 2)
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    end = datetime(2026, 1, 15, tzinfo=UTC)  # chunk_days=7 -> 2 chunks
+
+    truncated_chunk_records = [
+        {"HourUTC": "2026-01-02T00:00:00", "FCRdk_DKK": 1.0},
+        {"HourUTC": "2026-01-03T00:00:00", "FCRdk_DKK": 2.0},
+    ]
+    ok_chunk_records = [{"HourUTC": "2026-01-09T00:00:00", "FCRdk_DKK": 3.0}]
+    respx.get(FCR_DK1_URL).mock(
+        side_effect=[
+            httpx.Response(200, json={"records": truncated_chunk_records}),
+            httpx.Response(200, json={"records": ok_chunk_records}),
+        ]
+    )
+
+    result = await backfill_dataset(
+        ingestor, db, FCR_DK1, start, end, chunk_days=7, rate_limit_seconds=0
+    )
+
+    assert result["chunks_truncated"] == 1
+    assert result["chunks_fetched"] == 2
+    assert result["truncated_windows"] == [
+        {"start": start, "end": datetime(2026, 1, 8, tzinfo=UTC)}
+    ]
+    await ingestor.close()
+
+
 # --- run_backfill (orchestration) -------------------------------------------
 
 
@@ -302,12 +382,18 @@ async def test_run_backfill_rejects_non_bess_dataset_name():
         )
 
 
-def _fake_backfill_dataset_result(dataset):
+def _fake_backfill_dataset_result(dataset, chunks_truncated=0):
     return {
         "dataset": dataset.name,
         "dataset_id": dataset.dataset_id,
         "chunks_fetched": 1,
         "chunks_failed": 0,
+        "chunks_truncated": chunks_truncated,
+        "truncated_windows": (
+            [{"start": datetime(2026, 1, 1, tzinfo=UTC), "end": datetime(2026, 1, 2, tzinfo=UTC)}]
+            if chunks_truncated
+            else []
+        ),
         "records_fetched": 1,
         "rows_saved": 1,
         "earliest_record_time": "2026-01-01T00:00:00",
@@ -404,3 +490,57 @@ async def test_run_backfill_defaults_end_to_now(monkeypatch, fake_backfill_datas
         after = datetime.now(UTC)
 
     assert before <= summary["end"] <= after
+
+
+# --- run_backfill: chunks_truncated aggregation/propagation ----------------
+
+
+async def test_run_backfill_aggregates_no_truncation_when_none_occurred(monkeypatch):
+    async def _fake(_ingestor, _db, dataset, _start, _end, chunk_days, rate_limit_seconds):
+        return _fake_backfill_dataset_result(dataset, chunks_truncated=0)
+
+    monkeypatch.setattr("shared.backfill.backfill_dataset", _fake)
+    mock_db = MagicMock()
+
+    with patch("shared.backfill.BaseIngestor") as mock_ingestor_cls:
+        mock_ingestor_cls.return_value.close = AsyncMock()
+
+        summary = await run_backfill(
+            datetime(2026, 1, 1, tzinfo=UTC),
+            datetime(2026, 1, 2, tzinfo=UTC),
+            dataset_names=["fcr_dk1", "day_ahead_prices"],
+            db=mock_db,
+            rate_limit_seconds=0,
+        )
+
+    assert summary["total_chunks_truncated"] == 0
+    assert summary["any_truncated"] is False
+    assert all(r["chunks_truncated"] == 0 for r in summary["datasets"])
+
+
+async def test_run_backfill_aggregates_truncation_across_datasets(monkeypatch):
+    """One dataset truncated (2 chunks), the other clean -- the aggregate must surface it, and
+    the per-dataset breakdown must still identify which one."""
+
+    async def _fake(_ingestor, _db, dataset, _start, _end, chunk_days, rate_limit_seconds):
+        truncated = 2 if dataset.name == "afrr_energy_activation" else 0
+        return _fake_backfill_dataset_result(dataset, chunks_truncated=truncated)
+
+    monkeypatch.setattr("shared.backfill.backfill_dataset", _fake)
+    mock_db = MagicMock()
+
+    with patch("shared.backfill.BaseIngestor") as mock_ingestor_cls:
+        mock_ingestor_cls.return_value.close = AsyncMock()
+
+        summary = await run_backfill(
+            datetime(2026, 1, 1, tzinfo=UTC),
+            datetime(2026, 1, 2, tzinfo=UTC),
+            dataset_names=["fcr_dk1", "afrr_energy_activation"],
+            db=mock_db,
+            rate_limit_seconds=0,
+        )
+
+    assert summary["total_chunks_truncated"] == 2
+    assert summary["any_truncated"] is True
+    by_name = {r["dataset"]: r["chunks_truncated"] for r in summary["datasets"]}
+    assert by_name == {"fcr_dk1": 0, "afrr_energy_activation": 2}
