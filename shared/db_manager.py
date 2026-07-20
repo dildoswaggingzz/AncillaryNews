@@ -1161,6 +1161,40 @@ class DatabaseManager:
             for r in rows
         ]
 
+    def fetch_zone_counts(
+        self, market: str, time_from: datetime, time_to: datetime
+    ) -> dict[str, int]:
+        """
+        Returns `{zone: row_count}` for one market's rows in
+        `[time_from, time_to]`, read from the `market_data` view (latest
+        revision per `(time, zone, product)`, init-db/01-init.sql) so a
+        duplicate revision (the append-only-backfill hazard `shared/
+        feature_store.py`'s module docstring describes) is never
+        double-counted.
+
+        Built for that module's §4.5 zone-allowlist diagnostic
+        (`wind_solar_forecast`'s confirmed `UNDEFINED` zone pocket) -- lets a
+        caller count how many rows in a window fall outside an explicit
+        zone allow-list without ever trusting whatever strings happen to
+        appear in the `zone` column itself.
+        """
+        conn = self._pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT zone, count(*)
+                    FROM market_data
+                    WHERE market = %s AND time >= %s AND time <= %s
+                    GROUP BY zone;
+                    """,
+                    (market, time_from, time_to),
+                )
+                rows = cur.fetchall()
+        finally:
+            self._pool.putconn(conn)
+        return {zone: count for zone, count in rows}
+
     def check_expected_columns(self) -> list[tuple[str, str]]:
         """
         Returns the subset of `EXPECTED_SCHEMA_COLUMNS` missing from the live
