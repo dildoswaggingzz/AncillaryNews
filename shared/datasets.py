@@ -111,12 +111,110 @@ class DatasetConfig:
     source: str = "Energinet"
     is_provisional: bool = True
     params: dict = field(default_factory=lambda: {"limit": 100, "sort": "TimeUTC DESC"})
+    # Declares whether this dataset publishes records for FUTURE delivery
+    # times -- a D-1 auction clearing (e.g. `fcr_dk2`'s FCR-D/FCR-N D-1
+    # auction) or a forecast (e.g. `forecasts_hour`) that reveals tomorrow's
+    # values today, as opposed to a realised measurement or same-period
+    # settlement that only ever has data up to "now" (e.g.
+    # `imbalance_price`, `prodex_5min_realtime`).
+    #
+    # **Why this field exists (a real, live bug):** every `DatasetConfig`
+    # polls with `sort=<time_field> DESC` and a fixed `limit` -- for a
+    # forward-publishing dataset, the newest `limit` records by that sort
+    # are tomorrow's delivery periods, so the poll window never reaches the
+    # present and captures zero usable history. Confirmed live 2026-07-21:
+    # `day_ahead_prices`/`fcr_dk2`/`afrr_reserves_nordic`/`forecasts_hour`
+    # each returned 0 past/now records under the pre-fix `limit`-only
+    # params (`FCR` DK2 had a 25-day hole in `market_data_history` as a
+    # result). The fix is an explicit `start` param bounding the poll
+    # window from the past side (see `FORWARD_PUBLISH_START` /
+    # `_forward_publish_params` below) -- but a *future* dataset addition
+    # must not silently reintroduce this bug by omitting it. Declaring the
+    # property here, rather than leaving it implicit in whether a `start`
+    # key happens to be hand-typed into `params`, is what lets
+    # `tests/test_datasets.py`'s
+    # `test_forward_publishing_datasets_declare_a_start_param` catch that at
+    # CI time: any dataset with `forward_publish_horizon` set MUST have
+    # `start` in `params`, so setting this field without also setting
+    # `start` fails the suite immediately, and forgetting to set this field
+    # at all for a genuinely forward-publishing dataset is a registry
+    # authoring mistake this test cannot catch (that judgment call --
+    # "does this dataset publish into the future" -- has to be verified
+    # live per dataset; see the datasets flagged as unclassified in the
+    # git history around this field's introduction).
+    #
+    # `None` (default): backward/realised-only, or genuinely uninvestigated
+    # (see individual entries below for which). A relative-time string
+    # (Energinet's own syntax, e.g. `"P1D"`) when set: documents *how far*
+    # forward this dataset currently publishes, for a reader's benefit --
+    # informational only, NOT machine-parsed to size `params["limit"]` (the
+    # limit is sized per-dataset from measured record-rate arithmetic, see
+    # each entry's comment), since the actual forward reach fluctuates
+    # through the day (e.g. right after a D-1 auction clears vs. just
+    # before the next one) in a way a single horizon string can't capture
+    # precisely enough to safely drive a `limit` computation.
+    forward_publish_horizon: str | None = None
+
+
+# Relative-time margin used as `start` for every forward-publishing
+# dataset's poll (see `DatasetConfig.forward_publish_horizon` above).
+# "now-P2D" is Energinet's documented relative-time syntax, confirmed live
+# against the real API (2026-07-21) to fix the zero-past-records bug:
+# `day_ahead_prices`/`fcr_dk2`/`afrr_reserves_nordic`/`forecasts_hour` all
+# went from 0 past/now records to a healthy several-day-deep window under
+# this exact value.
+#
+# Deliberately NOT widened further "just in case": every extra day of
+# margin is extra rate-limit budget spent on every single 15-minute poll
+# cycle, against an API that already rate-limits aggressively per-IP (see
+# services/ingestor/main.py's RATE_LIMIT_SECONDS and shared/backfill.py's
+# module docstring on 429s). P2D (48h) is chosen specifically as a margin
+# that lets a handful of missed poll cycles self-heal (the live poller
+# fills any gap on its very next successful cycle) without needing a wider
+# window "for safety" -- a genuinely missed 48h+ of cycles is an outage
+# `shared/backfill.py`'s manual/on-demand backfill exists to repair, not
+# something the live poller's steady-state margin should be sized around.
+FORWARD_PUBLISH_START = "now-P2D"
+
+
+def _forward_publish_params(sort_field: str, limit: int) -> dict:
+    """
+    Builds the `params` dict for a forward-publishing `DatasetConfig` (one
+    with `forward_publish_horizon` set). Centralizing this is the point:
+    every call site gets `start=FORWARD_PUBLISH_START` for free, so a
+    forward-publishing entry built this way cannot omit it by a copy-paste
+    slip the way a hand-typed `params={...}` dict could.
+
+    Without an explicit `start`, `sort=<field> DESC` + a fixed `limit`
+    returns only the newest (i.e. furthest-future) `limit` records for a
+    forward-publishing dataset and never reaches the present -- see
+    `DatasetConfig.forward_publish_horizon`'s docstring for the live defect
+    this exists to prevent from recurring.
+    """
+    return {"limit": limit, "sort": f"{sort_field} DESC", "start": FORWARD_PUBLISH_START}
 
 
 DATASETS: list[DatasetConfig] = [
     # High priority — mFRR capacity (reservation) market. Closest confirmed
     # substitute for the unconfirmed "mFRR EAM energy activation" dataset;
     # this is capacity/reservation payments, not activation/energy payments.
+    #
+    # **Forward-publishing, thin margin (confirmed live 2026-07-21):** this
+    # is a D-1 capacity auction -- under the pre-fix `limit`-only params
+    # (sort `TimeUTC DESC`, no `start`), a poll returned 27 future times vs.
+    # only 23 past times, i.e. the fixed `limit=100` window reached back
+    # just ~21-23h before running out, not zero like `fcr_dk2`/
+    # `afrr_reserves_nordic`/`day_ahead_prices`/`forecasts_hour` below, but
+    # thin enough to be in-scope for the same `start` fix (see
+    # `DatasetConfig.forward_publish_horizon`'s docstring). **Limit
+    # arithmetic:** 100 records / 50 distinct hours (27 future + 23 past) =
+    # 2 records/hour (DK1 + DK2, one row per zone-hour, `up`/`down` share a
+    # row). Fixed past window `FORWARD_PUBLISH_START` gives 48h; forward
+    # reach is bounded to the D-1 auction's own ~1-day-ahead horizon, so a
+    # 48h worst-case margin on that side too is conservative. Total window
+    # ~96h x 2 records/hour = 192 records; `limit=250` leaves modest (~30%)
+    # headroom without over-provisioning (API etiquette: every extra record
+    # is rate-limit budget on an aggressively-limited API).
     DatasetConfig(
         name="mfrr_capacity",
         dataset_id="mFRRCapacityMarket",
@@ -128,6 +226,8 @@ DATASETS: list[DatasetConfig] = [
             SeriesConfig(product="down", value_field="DownPriceDKK", unit="DKK/MW/h"),
         ],
         is_provisional=True,
+        forward_publish_horizon="P1D",
+        params=_forward_publish_params("TimeUTC", 250),
     ),
     # mFRR capacity extra auctions -- Energinet runs an afternoon "extra
     # auction" on `mfrr_capacity` above only when the daily morning auction's
@@ -152,6 +252,13 @@ DATASETS: list[DatasetConfig] = [
     # (not sample-based) validation correctly does not flag this (the
     # columns are present in the published schema regardless of what any
     # particular row's values are).
+    #
+    # **Forward-publishing, thin margin** -- same `MfrrCapacityMarketExtra`
+    # shape/dimensioning as `mfrr_capacity` above (confirmed live 2026-07-21:
+    # same ~27 future / ~23 past time split under the pre-fix params), so
+    # the same arithmetic applies: 2 records/hour (DK1+DK2), 96h worst-case
+    # window (48h fixed past + ~48h D-1-bounded forward) => ~192 records;
+    # `limit=250` for the same ~30% headroom reasoning as `mfrr_capacity`.
     DatasetConfig(
         name="mfrr_capacity_extra",
         dataset_id="MfrrCapacityMarketExtra",
@@ -167,7 +274,8 @@ DATASETS: list[DatasetConfig] = [
             SeriesConfig(product="down_procured_volume", value_field="DownProcuredMW", unit="MW"),
         ],
         is_provisional=True,
-        params={"limit": 100, "sort": "TimeUTC DESC"},
+        forward_publish_horizon="P1D",
+        params=_forward_publish_params("TimeUTC", 250),
     ),
     # High priority — aFRR activation energy (PICASSO). Millisecond-resolution,
     # near-real-time; catalogue notes only EUR prices are published (no DKK).
@@ -288,6 +396,31 @@ DATASETS: list[DatasetConfig] = [
     ),
     # High priority — day-ahead spot reference prices, used to contextualize
     # activation price spikes (e.g. "mFRR price >> day-ahead price").
+    #
+    # **Forward-publishing -- zero past/now records under the pre-fix params
+    # (confirmed live 2026-07-21).** `DayAheadPrices` is a D-1 auction
+    # (NordPool day-ahead), now 15-minute MTU (docs/forecast-datasets-scope.md
+    # §3's target table), and this Energi Data Service dataset publishes
+    # `PriceArea`-broad -- no zone filter is applied at query time (this
+    # entry's `zone_field="PriceArea"` maps whatever zones the raw feed
+    # contains, not a fixed DK1/DK2 pair), so the auction reveal spans
+    # every zone the feed carries at once. The old `sort=TimeUTC DESC,
+    # limit=100` (no `start`) returned 17 distinct 15-min slots, ALL future
+    # -- 0 past/now, the exact live defect this field/params fix exists for.
+    #
+    # **Limit arithmetic (measured live with `start=now-P2D`):** 1818
+    # records / 303 distinct 15-min slots = 6.0 records/slot (confirms this
+    # dataset's zone count is effectively constant at 6 for this feed, not
+    # something this entry needs to enumerate). The past side of the window
+    # is fixed by `FORWARD_PUBLISH_START` at 48h = 192 fifteen-minute slots
+    # -- and the measured 192 past slots in that same live check match this
+    # exactly, confirming the 15-min-slot assumption. Forward reach is
+    # bounded by the auction's own mechanics (reveals one full calendar day
+    # once cleared, ~12:00 UTC daily) to a worst case of ~48h forward (right
+    # after a clearing, with today's remainder still outstanding) = another
+    # 192 slots. Worst-case total: 384 slots x 6 records/slot = 2304
+    # records; `limit=2500` leaves ~10% headroom -- modest headroom
+    # deliberately, not overprovisioned (API etiquette).
     DatasetConfig(
         name="day_ahead_prices",
         dataset_id="DayAheadPrices",
@@ -298,6 +431,8 @@ DATASETS: list[DatasetConfig] = [
             SeriesConfig(product="price", value_field="DayAheadPriceDKK", unit="DKK/MWh"),
         ],
         is_provisional=False,
+        forward_publish_horizon="P1D",
+        params=_forward_publish_params("TimeUTC", 2500),
     ),
     # BESS simulator (shared/bess_simulator.py) — FCR capacity/reservation
     # prices. Two different datasets per zone since FCR is structured
@@ -311,6 +446,35 @@ DATASETS: list[DatasetConfig] = [
     # up/down split (FCR is a single symmetric band) — one "price" product,
     # using `FCRdk_DKK` (the domestic-weighted clearing price, combining
     # domestic + cross-border volume) rather than `FCRcross_DKK` alone.
+    #
+    # **Forward-publishing (confirmed live 2026-07-21, same sweep as the
+    # rest of this bugfix).** `FcrDK1` is the FCR Cooperation's own D-1
+    # auction -- a pre-fix poll (`sort=HourUTC DESC`, no `start`) returned
+    # 100 records / 100 distinct hours, 27 future / 73 past, oldest reached
+    # 2026-07-18T18:00 (~3 days back).
+    #
+    # **That 3-day reach was accidental, not designed -- this is the fact a
+    # future reader most needs.** At the measured 1.0 record/hour (100
+    # records over 100 distinct hours -- one row per hour, no PriceArea
+    # split to multiply it), `limit=100` happens to span ~100h, comfortably
+    # past "now" despite the missing `start`. That adequacy holds only while
+    # record density stays at 1/hour: if Energinet ever adds a price area,
+    # a product, or an auction-type split to this dataset -- exactly what
+    # `fcr_dk2`'s own comment above documents happening to it (30
+    # records/hour measured, not the "6/hour" a first glance at that
+    # dataset's name would assume) -- this entry fails the identical
+    # zero-past-records way, with the identical absence of symptoms, the
+    # day that happens. Declaring `forward_publish_horizon` and using
+    # `start` now closes that latent recurrence, not just today's measured
+    # shortfall.
+    #
+    # **Limit arithmetic:** 1.0 record/hour measured x 96h worst-case window
+    # (48h fixed past via `FORWARD_PUBLISH_START` + ~48h D-1-bounded
+    # forward) = 96 records needed. `limit=250` (consistent with
+    # `mfrr_capacity`/`mfrr_capacity_extra`) leaves ~160% headroom --
+    # deliberately generous here specifically because the current 1/hour
+    # density is the fragile assumption above, not because this dataset
+    # needs a wide margin on its own account.
     DatasetConfig(
         name="fcr_dk1",
         dataset_id="FcrDK1",
@@ -322,7 +486,8 @@ DATASETS: list[DatasetConfig] = [
             SeriesConfig(product="price", value_field="FCRdk_DKK", unit="DKK/MW/h"),
         ],
         is_provisional=True,
-        params={"limit": 100, "sort": "HourUTC DESC"},
+        forward_publish_horizon="P1D",
+        params=_forward_publish_params("HourUTC", 250),
     ),
     # FcrNdDK2 packs three products (FCR-D ned/upp, FCR-N) and two auction
     # views (D-1 early / Total) into one shared `PriceTotalEUR` column,
@@ -381,14 +546,34 @@ DATASETS: list[DatasetConfig] = [
     # 30-row pull sorted `HourUTC DESC` returned 30 rows for a SINGLE hour --
     # `FcrNdDK2` carries every Nordic PriceArea (DK2/SE1-4, 5 zones) x 3
     # ProductName x 2 AuctionType = 30 raw records/hour, not the "3 products
-    # x 2 auction types = 6/hour" this dataset's name suggests. With
-    # `limit=100`, that's ~3.3h of raw record coverage -- still comfortably
-    # more than the 15-minute live-poll cadence needs (services/ingestor/
-    # main.py), so `limit` is unchanged; noted here since it's a real
-    # correction to what a first glance at the dataset would assume. Adding
-    # the volume/D-1 series above extracts more *columns* from these same
-    # already-fetched records -- it does not change how many raw records
-    # `limit` needs to cover, so this append is safe at the current value.
+    # x 2 auction types = 6/hour" this dataset's name suggests.
+    #
+    # **Correction, same investigation session -- `limit=100` was NOT fine.**
+    # This is a D-1 auction (`AuctionType` literally carries "D-1 early"),
+    # i.e. forward-publishing -- `sort=HourUTC DESC` with no `start` means
+    # the newest 100 records by that sort are tomorrow's auction hours, not
+    # the most recent past ones. Confirmed live 2026-07-21: an unfixed poll
+    # returned 3 distinct hours, ALL future, 0 past/now -- this dataset had
+    # a 25-day hole in `market_data_history` as a direct result. The
+    # "~3.3h of raw record coverage... comfortably more than the 15-minute
+    # live-poll cadence needs" reasoning above assumed the window's floor
+    # was "now"; it never was. See `DatasetConfig.forward_publish_horizon`'s
+    # docstring for the general fix.
+    #
+    # **New limit arithmetic (measured live with `start=now-P2D`):** 3375
+    # records / 75 distinct hours = 45.0 records/hour -- higher than the
+    # 30/hour single-hour sample above (that sample evidently caught a
+    # moment with fewer than all 5 PriceAreas reporting, or fewer than all
+    # 6 product/auction combos; 45/hour is the figure actually observed
+    # across the fixed window and is what this `limit` is sized from). Past
+    # side fixed by `FORWARD_PUBLISH_START` at 48h; the measured window's 48
+    # past hours match exactly. Forward reach is bounded by the D-1
+    # auction's own ~1-day-ahead horizon -- worst case ~48h forward.
+    # Worst-case total: 96h x 45 records/hour = 4320 records; `limit=4500`
+    # leaves ~4% headroom on top of that worst case (deliberately modest,
+    # not "days more just in case" -- API etiquette). Adding the volume/D-1
+    # series above extracts more *columns* from these same fetched records
+    # -- it does not change how many raw records `limit` needs to cover.
     DatasetConfig(
         name="fcr_dk2",
         dataset_id="FcrNdDK2",
@@ -494,7 +679,8 @@ DATASETS: list[DatasetConfig] = [
             ),
         ],
         is_provisional=True,
-        params={"limit": 100, "sort": "HourUTC DESC"},
+        forward_publish_horizon="P1D",
+        params=_forward_publish_params("HourUTC", 4500),
     ),
     # FFR (Fast Frequency Reserve) capacity/reservation market, DK2-only --
     # confirmed live 2026-07-21, documented but never previously ingested
@@ -519,6 +705,25 @@ DATASETS: list[DatasetConfig] = [
     # ~`MIN_HISTORY_POINTS` polls after any future non-zero season ends and
     # prices drop back to 0. Not a bug to "fix" here -- documented so it
     # isn't mistaken for one later.
+    #
+    # **Forward-publishing (confirmed live 2026-07-21, same sweep as the
+    # rest of this bugfix).** FFR clears in a D-1 auction, same mechanics as
+    # `fcr_dk1`/`ffr_demand_dk2` -- a pre-fix poll (`sort=HourUTC DESC`, no
+    # `start`) returned 100 records / 100 distinct hours, 27 future / 73
+    # past, oldest reached 2026-07-18T18:00 (~3 days back).
+    #
+    # **That 3-day reach is accidental, not designed** -- see `fcr_dk1`'s
+    # comment above for the full reasoning: at 1.0 record/hour (no
+    # PriceArea split, one row per hour), `limit=100` happens to reach past
+    # "now" today, but that headroom evaporates the moment Energinet adds
+    # any per-record split to this dataset (a live-documented pattern --
+    # see `fcr_dk2`'s comment), at which point this fails the identical
+    # zero-past-records way with the identical absence of symptoms.
+    #
+    # **Limit arithmetic:** 1.0 record/hour measured x 96h worst-case window
+    # (48h fixed past + ~48h D-1-bounded forward) = 96 records needed;
+    # `limit=250` (consistent with `mfrr_capacity`/`fcr_dk1`) leaves ~160%
+    # headroom for exactly that fragile-density scenario.
     DatasetConfig(
         name="ffr_dk2",
         dataset_id="FFRDK2",
@@ -533,7 +738,8 @@ DATASETS: list[DatasetConfig] = [
             SeriesConfig(product="purchased_volume", value_field="FFR_PurchasedMW", unit="MW"),
         ],
         is_provisional=True,
-        params={"limit": 100, "sort": "HourUTC DESC"},
+        forward_publish_horizon="P1D",
+        params=_forward_publish_params("HourUTC", 250),
     ),
     # FFR demand curve, DK2-only -- eight step-wise demand levels
     # (`ffrupdemandd0`..`ffrupdemandd7`) from the same auction FFR clears in
@@ -543,6 +749,25 @@ DATASETS: list[DatasetConfig] = [
     # this one dataset, confirmed via live `meta/dataset/FFRdemandDK2`; do
     # not "fix" the casing to match this file's usual PascalCase convention,
     # that would just break the mapping.
+    #
+    # **Forward-publishing (confirmed live 2026-07-21, same sweep as the
+    # rest of this bugfix).** Same D-1 auction this dataset's demand curve
+    # comes from -- a pre-fix poll (`sort=HourUTC DESC`, no `start`)
+    # returned 100 records / 100 distinct hours, 27 future / 73 past,
+    # oldest reached 2026-07-18T18:00 (~3 days back).
+    #
+    # **That 3-day reach is accidental, not designed** -- see `fcr_dk1`'s
+    # comment above: at 1.0 record/hour (no PriceArea split, one row per
+    # hour), `limit=100` happens to reach past "now" today only because of
+    # this dataset's current record density, which evaporates the moment
+    # Energinet adds any per-record split (the live-documented pattern --
+    # see `fcr_dk2`'s comment), reintroducing the identical zero-past-
+    # records failure with the identical absence of symptoms.
+    #
+    # **Limit arithmetic:** 1.0 record/hour measured x 96h worst-case window
+    # (48h fixed past + ~48h D-1-bounded forward) = 96 records needed;
+    # `limit=250` (consistent with `mfrr_capacity`/`fcr_dk1`/`ffr_dk2`)
+    # leaves ~160% headroom for that same fragile-density scenario.
     DatasetConfig(
         name="ffr_demand_dk2",
         dataset_id="FFRdemandDK2",
@@ -555,7 +780,8 @@ DATASETS: list[DatasetConfig] = [
             for i in range(8)
         ],
         is_provisional=True,
-        params={"limit": 100, "sort": "HourUTC DESC"},
+        forward_publish_horizon="P1D",
+        params=_forward_publish_params("HourUTC", 250),
     ),
     # BESS simulator — Nordic aFRR capacity/reservation market (distinct
     # from `afrr_energy_activation` above, which is the PICASSO
@@ -577,6 +803,20 @@ DATASETS: list[DatasetConfig] = [
     # deliberately NOT retro-renamed to match**, since that would orphan
     # already-ingested history under the old product names (the
     # inconsistency is accepted, not "fixed").
+    #
+    # **Forward-publishing -- zero past/now records under the pre-fix params
+    # (confirmed live 2026-07-21).** `AfrrReservesNordic` is a D-1 capacity
+    # auction across the Nordic PriceAreas -- the old `sort=TimeUTC DESC,
+    # limit=100` (no `start`) returned only 9 distinct hours, ALL future --
+    # 0 past/now. **Limit arithmetic (measured live with `start=now-P2D`):**
+    # 900 records / 75 distinct hours = 12.0 records/hour (empirical rate
+    # across however many Nordic PriceAreas this feed actually carries per
+    # hour -- not independently re-enumerated here, this measured rate is
+    # the arithmetic input). Past side fixed by `FORWARD_PUBLISH_START` at
+    # 48h (measured window's 48 past hours confirm this). Forward reach
+    # bounded by the D-1 auction's own ~1-day-ahead horizon -- worst case
+    # ~48h forward. Worst-case total: 96h x 12 records/hour = 1152 records;
+    # `limit=1300` leaves ~13% headroom, deliberately modest.
     DatasetConfig(
         name="afrr_reserves_nordic",
         dataset_id="AfrrReservesNordic",
@@ -597,7 +837,8 @@ DATASETS: list[DatasetConfig] = [
             SeriesConfig(product="down_eur", value_field="DownPriceEUR", unit="EUR/MW/h"),
         ],
         is_provisional=True,
-        params={"limit": 100, "sort": "TimeUTC DESC"},
+        forward_publish_horizon="P1D",
+        params=_forward_publish_params("TimeUTC", 1300),
     ),
     # High priority — near-real-time system state (wind/solar/CO2), used as
     # explanatory soft-signal context ("low wind" style narratives). No
@@ -685,6 +926,21 @@ DATASETS: list[DatasetConfig] = [
     # `f"{type}_current_leaky_do_not_use_as_feature"`. Every consumer -- P1's
     # leak-safe feature builder above all -- must treat this product name as
     # a hard exclusion list entry, not just a column to be careful with.
+    #
+    # **Forward-publishing -- zero past/now records under the pre-fix params
+    # (confirmed live 2026-07-21).** This is the P1 feature store's core
+    # fundamentals input, and by definition every row's `HourUTC` is the
+    # delivery hour a forecast was made *for*, which `ForecastDayAhead`
+    # reveals up to a day before it arrives -- the old `sort=HourUTC DESC,
+    # limit=100` (no `start`) returned 17 distinct hours, ALL future, 0
+    # past/now. **Limit arithmetic (measured live with `start=now-P2D`):**
+    # 450 records / 75 distinct hours = 6.0 records/hour (3 ForecastType
+    # values x 2 PriceAreas -- DK1/DK2, matching this dataset's declared
+    # zone scope). Past side fixed by `FORWARD_PUBLISH_START` at 48h
+    # (measured window's 48 past hours confirm this). Forward reach bounded
+    # by the forecast's own ~1-day-ahead horizon -- worst case ~48h forward.
+    # Worst-case total: 96h x 6 records/hour = 576 records; `limit=650`
+    # leaves ~13% headroom, deliberately modest.
     DatasetConfig(
         name="forecasts_hour",
         dataset_id="Forecasts_Hour",
@@ -739,7 +995,8 @@ DATASETS: list[DatasetConfig] = [
             )
         ],
         is_provisional=True,
-        params={"limit": 100, "sort": "HourUTC DESC"},
+        forward_publish_horizon="P1D",
+        params=_forward_publish_params("HourUTC", 650),
     ),
     # Realised production and cross-border exchange, 5-minute resolution,
     # per price area. Confirmed live 2026-07-20. Not one of the §1.2

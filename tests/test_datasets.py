@@ -154,3 +154,75 @@ def test_dk1_and_dk2_fcr_price_are_different_frozen_units():
     dk2_price = next(s for s in fcr_dk2.series if s.product == "price")
     assert dk1_price.unit == "DKK/MW/h"
     assert dk2_price.unit == "EUR/MW/h"
+
+
+# --- forward-publishing datasets must declare a `start` param -------------
+#
+# The live bug this guards against (confirmed live 2026-07-21, see
+# `DatasetConfig.forward_publish_horizon`'s docstring in shared/datasets.py):
+# every DatasetConfig polls with `sort=<time_field> DESC` and a fixed
+# `limit`. For a dataset that publishes records for FUTURE delivery times
+# (a D-1 auction clearing or a forecast), the newest `limit` records by that
+# sort are all future periods, so the poll window never reaches the present
+# and captures zero usable history -- `day_ahead_prices`, `fcr_dk2`,
+# `afrr_reserves_nordic`, and `forecasts_hour` were all caught doing exactly
+# this (FCR DK2 alone had a 25-day hole in market_data_history as a result).
+#
+# The fix is an explicit `start` param bounding the poll window from the
+# past side. This test is the point of the task: it makes "this dataset
+# publishes into the future" a registry-declared fact
+# (`forward_publish_horizon`) whose consequence (`start` must be in
+# `params`) is enforced at CI time -- a future dataset addition that sets
+# `forward_publish_horizon` without also adding `start` fails the suite
+# immediately, rather than silently reintroducing the bug and only
+# surfacing it as a mysterious data gap weeks later.
+def test_forward_publishing_datasets_declare_a_start_param():
+    missing_start = [
+        dataset.name
+        for dataset in DATASETS
+        if dataset.forward_publish_horizon is not None and "start" not in dataset.params
+    ]
+    assert missing_start == [], (
+        f"{missing_start} declare `forward_publish_horizon` but have no `start` in `params` -- "
+        "without it, `sort=<time_field> DESC` alone returns only future records for a "
+        "forward-publishing dataset and never reaches the present (see "
+        "shared/datasets.py:DatasetConfig.forward_publish_horizon's docstring)"
+    )
+
+
+def test_forward_publishing_datasets_use_the_shared_start_margin():
+    """
+    Not strictly required by the bug fix itself (any non-empty `start` would
+    stop the zero-past-records defect), but every forward-publishing entry
+    today goes through `_forward_publish_params`, which always injects
+    `FORWARD_PUBLISH_START` -- pinning that here catches an entry that
+    bypasses the helper and hand-types a different (and possibly wider,
+    against the deliberate "don't widen the margin" API-etiquette
+    guidance -- see FORWARD_PUBLISH_START's docstring) `start` value.
+    """
+    from shared.datasets import FORWARD_PUBLISH_START
+
+    mismatched = [
+        dataset.name
+        for dataset in DATASETS
+        if dataset.forward_publish_horizon is not None
+        and dataset.params.get("start") != FORWARD_PUBLISH_START
+    ]
+    assert mismatched == []
+
+
+def test_non_forward_publishing_datasets_have_no_start_param():
+    """
+    The inverse guard: a dataset with no declared `forward_publish_horizon`
+    (i.e. presumed backward/realised-only or not yet investigated) picking
+    up a `start` param would be a silent, undocumented behavior change --
+    if a dataset genuinely needs `start` for some other reason, it should
+    also gain a `forward_publish_horizon` (or a comment explaining the
+    exception), not carry `start` unexplained.
+    """
+    unexplained_start = [
+        dataset.name
+        for dataset in DATASETS
+        if dataset.forward_publish_horizon is None and "start" in dataset.params
+    ]
+    assert unexplained_start == []
