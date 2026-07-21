@@ -121,25 +121,75 @@ async def _run(args: argparse.Namespace) -> dict:
 
     for r in summary["datasets"]:
         logger.info(
-            "%s: %d row(s) saved (%d chunk(s), %d failed), records span [%s, %s]",
+            "%s: %d row(s) saved (%d chunk(s), %d failed, %d truncated), records span [%s, %s]",
             r["dataset"],
             r["rows_saved"],
             r["chunks_fetched"],
             r["chunks_failed"],
+            r["chunks_truncated"],
             r["earliest_record_time"],
             r["latest_record_time"],
         )
+        # shared.backfill.backfill_dataset already logs a warning per truncated
+        # chunk as it happens; this is the CLI's own operator-facing summary
+        # line, so a truncated dataset doesn't just scroll past unnoticed in a
+        # long run's output -- see this script's module docstring / the PR #5
+        # incident this fixes (a 4.6-year fcr_dk2 backfill truncated 4 of 6
+        # chunks, 88 missing days, with nothing in this summary flagging it).
+        if r["chunks_truncated"]:
+            windows = ", ".join(f"[{w['start']}, {w['end']})" for w in r["truncated_windows"])
+            logger.warning(
+                "%s: %d chunk(s) truncated at CHUNK_LIMIT -- affected window(s): %s. "
+                "Re-run this dataset over these window(s) with a smaller --chunk-days "
+                "to fill the gap.",
+                r["dataset"],
+                r["chunks_truncated"],
+                windows,
+            )
     logger.info(
-        "Backfill complete: %d total row(s) saved across %d dataset(s).",
+        "Backfill complete: %d total row(s) saved across %d dataset(s) " "(%d chunk(s) truncated).",
         summary["total_rows_saved"],
         len(summary["datasets"]),
+        summary["total_chunks_truncated"],
     )
     return summary
 
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
-    asyncio.run(_run(args))
+    summary = asyncio.run(_run(args))
+
+    truncated_datasets = [r["dataset"] for r in summary["datasets"] if r["chunks_truncated"]]
+    failed_datasets = [r["dataset"] for r in summary["datasets"] if r["chunks_failed"]]
+
+    if not truncated_datasets and not failed_datasets:
+        logger.info("Backfill finished cleanly: no truncated or failed chunks.")
+        return
+
+    # A truncated backfill is not a successful one -- it silently produced
+    # incomplete data (see shared/backfill.py's truncation-detector comments
+    # and this script's per-dataset summary above for the affected windows),
+    # which is worse than failing loudly, since downstream work (e.g. a BESS
+    # backtest) would otherwise proceed on a gap-riddled dataset unaware
+    # anything was wrong. Same reasoning applies to any chunk that failed to
+    # fetch/save outright. Exit non-zero either way so a caller (cron, CI, an
+    # operator's shell) can't mistake this for a clean run.
+    if truncated_datasets:
+        logger.error(
+            "Backfill incomplete: %s had chunk(s) silently truncated at CHUNK_LIMIT by "
+            "Energinet's sort+limit behavior -- records in the affected window(s) logged "
+            "above were NOT saved. Re-run the affected dataset(s) over those window(s) "
+            "with a smaller --chunk-days to fill the gap.",
+            ", ".join(truncated_datasets),
+        )
+    if failed_datasets:
+        logger.error(
+            "Backfill incomplete: %s had chunk(s) fail to fetch or save (see the errors "
+            "logged above). Re-run the affected dataset(s), optionally with a smaller "
+            "--chunk-days.",
+            ", ".join(failed_datasets),
+        )
+    sys.exit(1)
 
 
 if __name__ == "__main__":
