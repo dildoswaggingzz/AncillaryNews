@@ -108,11 +108,24 @@ deliverable out of stored energy for the standby period, and down-reserve must h
 Σ_m cap_dn[m,t] · T_act ≤ (soc_max − soc[t]) / η            # down-absorption feasible into SoC
 ```
 
-`T_act` is the assumed sustained activation duration (hours) a reserve MW must be able to deliver —
-a config parameter (default e.g. 1 h for FCR-style products; documented, not hard-coded). This is
-the exact "subtract committed net position before offering capacity" rule from the references,
-expressed as an SoC-headroom bound. It is what makes the battery unable to sell up-reserve while
-draining itself for arbitrage.
+`T_act` is the **energy-endurance** duration (hours) a reserve MW must be able to *sustain* out of
+SoC — **not** a ramp/response time. A BESS's full-activation time is seconds (it ramps
+near-instantly and easily meets every FAT requirement), so ramp is never the binding constraint;
+the only thing that limits how much reserve it can honestly commit is how much *energy* backs the
+MW. **Default: `T_act = 0.25 h` (one 15-min MTU)** — a fast-delivering battery need only hold a
+quarter-hour of energy per MW of reserve, not a full hour. Configurable per product, since
+endurance requirements differ (some FCR products define a longer minimum sustain window than one
+MTU). This is the exact "subtract committed net position before offering capacity" rule from the
+references, expressed as an SoC-headroom bound; it is what makes the battery unable to sell
+up-reserve while draining itself for arbitrage.
+
+> **Sanity check the 0.25 h default gives.** A 1 MW / 2 MWh unit has 1.6 MWh usable (10–90 % band),
+> so energetically it could back up to `1.6 / 0.25 = 6.4 MW` of up-reserve — far above its 1 MW
+> power rating. The **power budget** (`ch + dis + Σcap ≤ power_mw`), not the energy-headroom bound,
+> is therefore what binds for a 0.5C battery on 15-min products. That is the correct, realistic
+> behaviour: a fast battery's reserve offer is power-limited, not energy-limited. A longer `T_act`
+> (or a lower-C battery) shifts the binding constraint back to energy — which the LP handles
+> automatically.
 
 **Cycle cap** (carried over from `max_cycles_per_day`): rolling-24 h discharge energy ≤
 `capacity_mwh · max_cycles_per_day`, expressed as a sliding sum of `dis[t]·dt[t]`.
@@ -274,9 +287,11 @@ residual) — P3 fixes the exact DA↔imbalance coupling.
 
 ## 9. Risks & open questions
 
-- **`T_act` calibration.** The activation-duration parameter driving the headroom bound is a
-  modeling choice per product (FCR vs. aFRR have different sustain requirements). P1 sets defensible
-  defaults and exposes them on `BessConfig`; it materially affects how much capacity is feasible.
+- **`T_act` calibration.** The energy-endurance parameter driving the headroom bound (§2) —
+  **not** a ramp time; BESS ramp in seconds. Default `0.25 h` (one 15-min MTU), at which a 0.5C
+  battery is power-limited rather than energy-limited on its reserve offer. Exposed per product on
+  `BessConfig`; a longer minimum-sustain window on a specific FCR product would raise it and make
+  energy the binding constraint again.
 - **DA↔imbalance coupling (P3).** Whether imbalance is a passive settlement of DA-schedule
   deviation or a second dispatchable market changes the LP. Leaning passive-settlement (realistic
   for a price-taker BESS); to be finalized in P3.
