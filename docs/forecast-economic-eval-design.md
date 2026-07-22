@@ -93,9 +93,14 @@ Both asset configs from the allocation design: **1 MW / 2 MWh (0.5C)** and **1 M
 tilts toward arbitrage and the 0.5C toward capacity — P4 is where that prediction is tested. Note
 whether it holds.
 
-**Currency:** FCR-D DK2 and day-ahead DK2 are both **EUR** — clean comparison, no FX. (The
-simulator's per-currency buckets already prevent EUR/DKK conflation; this config avoids the issue
-entirely by staying in one zone/currency.)
+**Currency:** ~~both EUR — clean comparison, no FX.~~ **[CORRECTED 2026-07-22, verified against
+`shared/datasets.py`:** FCR-D DK2 capacity is **EUR/MW/h** but day-ahead DK2 is **DKK/MWh**
+(`DayAheadPriceDKK`). This design's original EUR claim was wrong — asserted without checking the
+registry. So the capacity-vs-arbitrage decision *does* cross currencies, and the two legs must be
+reported in **separate currency buckets, never summed** (the simulator's per-currency machinery,
+allocation design §2's FX warning). Within-leg allocation quality — the band metric §2 — is
+currency-clean; the cross-currency capacity-vs-arbitrage *split* is the one place FX matters and
+is treated as a known limitation rather than papered over with a hardcoded rate.]
 
 **Eval window:** the FCR-D ∩ day-ahead overlap, **2025-09-30 → present** (~10 months). This is
 the post-collapse regime, which is the deployment-relevant one anyway.
