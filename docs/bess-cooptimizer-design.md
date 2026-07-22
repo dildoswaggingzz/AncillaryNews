@@ -101,12 +101,22 @@ ch[t] + dis[t] + Σ_m(cap_up+cap_dn)[m,t] ≤ power_mw          # ONE power budg
 ```
 
 **No-double-selling (the constraint the current code lacks):** committed up-reserve must be
-deliverable out of stored energy for the standby period, and down-reserve must have room to absorb:
+deliverable out of stored energy for the standby period, and down-reserve must have room to absorb —
+and this must hold *after* the period's committed arbitrage flow, not just at its start (the
+references' "subtract committed net position before offering capacity"). SoC moves monotonically
+within a period (constant power), so binding on **both** the start SoC `soc[t]` and the end SoC
+`soc[t+1]` guarantees deliverability throughout the period:
 
 ```
-Σ_m cap_up[m,t] · T_act ≤ (soc[t] − soc_min) · η            # up-delivery feasible from SoC
-Σ_m cap_dn[m,t] · T_act ≤ (soc_max − soc[t]) / η            # down-absorption feasible into SoC
+Σ_m cap_up[m,t] · T_act ≤ (soc[t]   − soc_min) · η          # up: deliverable at period start
+Σ_m cap_up[m,t] · T_act ≤ (soc[t+1] − soc_min) · η          #     …and after the committed discharge
+Σ_m cap_dn[m,t] · T_act ≤ (soc_max − soc[t])   / η          # down: absorbable at period start
+Σ_m cap_dn[m,t] · T_act ≤ (soc_max − soc[t+1]) / η          #     …and after the committed charge
 ```
+
+Binding on `soc[t]` alone would let the LP discharge to `soc_min` for arbitrage *and* book up-reserve
+off the higher start-of-period SoC in the same period — a residual within-period double-sell. The
+`soc[t+1]` pair closes it.
 
 `T_act` is the **energy-endurance** duration (hours) a reserve MW must be able to *sustain* out of
 SoC — **not** a ramp/response time. A BESS's full-activation time is seconds (it ramps

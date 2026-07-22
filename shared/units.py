@@ -48,6 +48,22 @@ from shared.datasets import DATASETS, DatasetConfig, SeriesConfig
 # means "zone-agnostic" -- see module docstring's "Resolution order".
 _UnitKey = tuple[str, str | None, str]
 
+# Fixed ERM II central-rate peg (DKK is pegged to EUR at ~7.46038, held
+# inside a +/-2.25% band, +/-0.5% in practice) -- an accounting convenience
+# for *labelled, combined* headline totals only (see
+# `shared/bess_dispatch_milp.py`'s module docstring and
+# `shared/bess_simulator.py:BacktestResult.total_revenue_all_dkk`/
+# `total_revenue_all_eur`). Never used to compare or trade a EUR figure
+# against a DKK figure inside any optimization objective or per-currency
+# revenue bucket -- those stay unconverted and separate (this module's
+# whole reason for existing, see module docstring). A *fixed* policy peg is
+# not the same class of bug as the floating-market-price mixing this module
+# guards against elsewhere, since it is not a market variable that could
+# silently drift; it is surfaced explicitly wherever it is used ("converted
+# at fixed 7.46 DKK/EUR"), alongside the raw per-currency buckets, never in
+# place of them.
+DKK_PER_EUR = 7.46
+
 
 def _effective_zone(dataset: DatasetConfig, series: SeriesConfig) -> str | None:
     """

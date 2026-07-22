@@ -1793,6 +1793,30 @@ files = [
 ]
 
 [[package]]
+name = "pulp"
+version = "3.3.2"
+description = "PuLP is an LP modeler written in python. PuLP can generate MPS or LP files and call GLPK, COIN CLP/CBC, CPLEX, and GUROBI to solve linear problems."
+optional = false
+python-versions = ">=3.10"
+groups = ["main"]
+files = [
+    {file = "pulp-3.3.2-py3-none-any.whl", hash = "sha256:631b166f72086971a9597f7a0233ababa99bb8d50a01cd543f7758be5a9f86c0"},
+    {file = "pulp-3.3.2.tar.gz", hash = "sha256:d0904700c207ac11e25e3b1213b70eae1d6fb25faa719d75f3f15054901258c0"},
+]
+
+[package.extras]
+cbc = ["cbcbox"]
+copt = ["coptpy"]
+cplex = ["cplex ; sys_platform != \"darwin\" or python_full_version < \"3.12.0\""]
+gurobi = ["gurobipy"]
+highs = ["highspy (==1.13)"]
+mosek = ["mosek"]
+open-py = ["highspy (==1.13)", "pyscipopt"]
+public-py = ["coptpy", "cplex ; sys_platform != \"darwin\" or python_full_version < \"3.12.0\"", "gurobipy", "xpress"]
+scip = ["pyscipopt"]
+xpress = ["xpress"]
+
+[[package]]
 name = "py-rust-stemmers"
 version = "0.1.8"
 description = "Fast and parallel snowball stemmer"
@@ -2826,4 +2850,4 @@ dev = ["black (>=19.3b0) ; python_version >= \"3.6\"", "pytest (>=4.6.2)"]
 [metadata]
 lock-version = "2.1"
 python-versions = "^3.12"
-content-hash = "d927d225f6a94755e7a48bc43c49cbf5fd2909add25016b4f3b07086d6e1ce72"
+content-hash = "bb389e1aead83fd6e5f25bfdf0451ccbb52b1987b82267f98a5970eac42b2436"

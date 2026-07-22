@@ -132,7 +132,7 @@ from datetime import datetime, timedelta
 from typing import Literal
 
 from shared.db_manager import DatabaseManager
-from shared.units import currency_for
+from shared.units import DKK_PER_EUR, currency_for
 
 # Mirrors shared/rule_engine.py's MIN_HISTORY_POINTS pattern: below this many
 # trailing price points, the arbitrage strategy has no baseline to compare
@@ -242,6 +242,41 @@ class BessConfig:
     # estimates (shared/bess_estimator.py) want a capped-by-default result.
     max_cycles_per_day: float | None = 1.5
 
+    # --- strategy selection ---
+    # "threshold" (the default, and the only strategy this field's addition
+    # changes anything about) is the causal z-score heuristic documented
+    # above -- every existing stored run's persisted `config` JSONB
+    # (`shared/db_manager.py:save_bess_run`) omits this field entirely, and
+    # `dataclasses.asdict` under an *older* code version never wrote it, so
+    # defaulting here to "threshold" is what makes an old persisted config
+    # keep reproducing identically when re-run (json.load simply supplies
+    # the default for a key that isn't present). "cooptimized" routes
+    # `run_backtest` to `shared/bess_dispatch_milp.py`'s perfect-foresight
+    # linear program instead -- see that module's docstring for the
+    # formulation. This is a pure strategy switch: every other `BessConfig`
+    # field (`power_mw`, `capacity_mwh`, SoC band, `round_trip_efficiency`,
+    # `capacity_markets`, ...) means the same physical battery under either
+    # strategy. `capacity_commit_mw`/`capacity_allocation` are threshold-only
+    # concepts, though -- the co-optimizer decides period-by-period how much
+    # (if any) capacity to reserve itself (that fixed-then-co-optimized
+    # split is exactly the defect docs/bess-cooptimizer-design.md §0 point 2
+    # describes), so those two fields are read but not acted on by
+    # "cooptimized" runs.
+    strategy: Literal["threshold", "cooptimized"] = "threshold"
+
+    # --- shared with the co-optimizer only (docs/bess-cooptimizer-design.md §2) ---
+    # T_act: the *energy-endurance* duration (hours) a committed reserve MW
+    # must be able to sustain out of stored SoC before the co-optimizer will
+    # let it be offered -- **not** a ramp/response time (a BESS ramps in
+    # seconds and trivially meets every FAT requirement; energy endurance,
+    # not speed, is what actually limits how much reserve it can honestly
+    # commit). Meaningless to, and ignored by, the "threshold" strategy
+    # (which has no such headroom constraint at all -- the exact defect the
+    # co-optimizer exists to fix). Default 0.25 h (one 15-min MTU) -- see
+    # `shared/bess_dispatch_milp.py` module docstring for the worked sanity
+    # check of when this does/doesn't bind relative to `power_mw`.
+    activation_endurance_hours: float = 0.25
+
     def __post_init__(self):
         if self.power_mw <= 0:
             raise ValueError("power_mw must be positive")
@@ -274,6 +309,12 @@ class BessConfig:
                 f"capacity_allocation must be 'even' or 'price_ranked', "
                 f"got {self.capacity_allocation!r}"
             )
+        if self.strategy not in ("threshold", "cooptimized"):
+            raise ValueError(
+                f"strategy must be 'threshold' or 'cooptimized', got {self.strategy!r}"
+            )
+        if self.activation_endurance_hours <= 0:
+            raise ValueError("activation_endurance_hours must be positive")
 
 
 @dataclass
@@ -386,6 +427,39 @@ class BacktestResult:
         if self.total_capacity_revenue_eur != 0.0:
             currencies.add("EUR")
         return frozenset(currencies)
+
+    @property
+    def total_revenue_all_dkk(self) -> float:
+        """
+        Combined headline total at the fixed ERM II peg
+        (`shared.units.DKK_PER_EUR`), in DKK -- a *presentation-layer*
+        convenience on top of, never a replacement for, the unconverted
+        per-currency totals above (docs/bess-cooptimizer-design.md §4.1).
+        The EUR-denominated totals (`total_capacity_revenue_eur`,
+        `total_afrr_activation_revenue_eur`) are converted at the fixed peg
+        and added to the DKK-native totals; nothing here feeds back into any
+        optimization objective or per-currency bucket -- see
+        `shared/bess_dispatch_milp.py`'s module docstring for why a fixed
+        policy peg is not the same class of bug as the floating-market-price
+        mixing `shared/units.py` otherwise guards against. Always show this
+        figure alongside the raw per-currency buckets, never in place of
+        them (`currencies_present` flags when that matters).
+        """
+        return (self.total_arbitrage_revenue_dkk + self.total_capacity_revenue_dkk) + (
+            self.total_capacity_revenue_eur + self.total_afrr_activation_revenue_eur
+        ) * DKK_PER_EUR
+
+    @property
+    def total_revenue_all_eur(self) -> float:
+        """
+        The same combined headline total as `total_revenue_all_dkk`, for a
+        EUR-thinking reader: the DKK-native totals are converted at the
+        fixed peg instead, and the EUR-native totals added directly. See
+        that property's docstring for the full rationale.
+        """
+        return (
+            self.total_arbitrage_revenue_dkk + self.total_capacity_revenue_dkk
+        ) / DKK_PER_EUR + (self.total_capacity_revenue_eur + self.total_afrr_activation_revenue_eur)
 
     @property
     def total_discharged_mwh(self) -> float:
@@ -591,6 +665,16 @@ def run_backtest(
     treating an unlabelled leg as "no currency"/0, since a silently
     unlabelled leg is exactly the kind of gap that let DKK and EUR get
     summed together in the first place (see module docstring §2).
+
+    `config.strategy` (default `"threshold"`) selects between this module's
+    causal heuristic (documented above) and `"cooptimized"`, which fetches
+    the identical series (this function still owns every DB call either
+    way) and delegates to `shared/bess_dispatch_milp.py`'s perfect-foresight
+    linear program instead -- see that module's docstring for the
+    formulation and docs/bess-cooptimizer-design.md for the full design.
+    Both strategies return the same `BacktestResult`/`BessTick` shape, so
+    every caller (the dashboard, `shared/bess_estimator.py`,
+    `save_bess_run`) consumes either with no changes.
     """
     config = config or BessConfig()
 
@@ -634,6 +718,30 @@ def run_backtest(
         if "aFRR_capacity" in legs_by_group
         else []
     )
+
+    if config.strategy == "cooptimized":
+        # Deferred import: `shared/bess_dispatch_milp.py` imports several
+        # names from *this* module (`BessConfig`, `BessTick`,
+        # `BacktestResult`, `_value_at_or_before`) at its own module level,
+        # so importing it back here at this module's top level would be a
+        # circular import. All the DB-touching work (fetching every series,
+        # resolving currencies, the ValueError-on-unknown-currency check
+        # above) is already done above and reused as-is -- the LP module
+        # itself stays pure (no DB, no network; see its own docstring),
+        # exactly the "fetch here, solve there" split
+        # docs/bess-cooptimizer-design.md's P1 scope calls for.
+        from shared.bess_dispatch_milp import solve_cooptimized_dispatch
+
+        return solve_cooptimized_dispatch(
+            zone=zone,
+            start_time=start_time,
+            end_time=end_time,
+            config=config,
+            price_series=price_series,
+            capacity_series_by_leg=capacity_series_by_leg,
+            leg_currency=leg_currency,
+            activation_price_series=activation_price_series,
+        )
 
     soc_min = config.soc_min_fraction * config.capacity_mwh
     soc_max = config.soc_max_fraction * config.capacity_mwh
