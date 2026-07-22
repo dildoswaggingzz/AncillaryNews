@@ -119,13 +119,20 @@ MTU). This is the exact "subtract committed net position before offering capacit
 references, expressed as an SoC-headroom bound; it is what makes the battery unable to sell
 up-reserve while draining itself for arbitrage.
 
+> **Two independent axes — do not conflate them.** The battery is fully described by two user
+> inputs: `power_mw` (the rated-duty ceiling) and `capacity_mwh` (the stored energy). Their ratio
+> is the **C-rate** — a *descriptor only* (1 MW / 2 MWh = 0.5C), never a separate input or
+> constraint. Duty-cycle compliance is enforced entirely by the single power ceiling
+> `ch + dis + Σcap ≤ power_mw`; the model never references a C-rate as such. `T_act` (market
+> endurance) is a completely separate axis and is not derived from, or coupled to, the C-rate.
+>
 > **Sanity check the 0.25 h default gives.** A 1 MW / 2 MWh unit has 1.6 MWh usable (10–90 % band),
 > so energetically it could back up to `1.6 / 0.25 = 6.4 MW` of up-reserve — far above its 1 MW
-> power rating. The **power budget** (`ch + dis + Σcap ≤ power_mw`), not the energy-headroom bound,
-> is therefore what binds for a 0.5C battery on 15-min products. That is the correct, realistic
-> behaviour: a fast battery's reserve offer is power-limited, not energy-limited. A longer `T_act`
-> (or a lower-C battery) shifts the binding constraint back to energy — which the LP handles
-> automatically.
+> power rating. So the **power ceiling binds, not the energy-headroom bound**: this battery's
+> reserve offer is capped at its rated 1 MW, exactly as physical duty-cycle compliance requires.
+> Only a longer `T_act` or a larger `capacity_mwh`-to-`power_mw` gap would move the binding
+> constraint onto energy — and the LP switches between the two automatically, with no C-rate term
+> anywhere.
 
 **Cycle cap** (carried over from `max_cycles_per_day`): rolling-24 h discharge energy ≤
 `capacity_mwh · max_cycles_per_day`, expressed as a sliding sum of `dis[t]·dt[t]`.
@@ -288,10 +295,11 @@ residual) — P3 fixes the exact DA↔imbalance coupling.
 ## 9. Risks & open questions
 
 - **`T_act` calibration.** The energy-endurance parameter driving the headroom bound (§2) —
-  **not** a ramp time; BESS ramp in seconds. Default `0.25 h` (one 15-min MTU), at which a 0.5C
-  battery is power-limited rather than energy-limited on its reserve offer. Exposed per product on
-  `BessConfig`; a longer minimum-sustain window on a specific FCR product would raise it and make
-  energy the binding constraint again.
+  **not** a ramp time; BESS ramp in seconds. Default `0.25 h` (one 15-min MTU), at which the reserve
+  offer is limited by the `power_mw` ceiling rather than by SoC energy. Exposed per product on
+  `BessConfig`, and kept strictly separate from the battery's C-rate (just `power_mw / capacity_mwh`,
+  a descriptor, not a knob); a longer minimum-sustain window on a specific FCR product raises `T_act`
+  and makes energy the binding constraint again.
 - **DA↔imbalance coupling (P3).** Whether imbalance is a passive settlement of DA-schedule
   deviation or a second dispatchable market changes the LP. Leaning passive-settlement (realistic
   for a price-taker BESS); to be finalized in P3.
