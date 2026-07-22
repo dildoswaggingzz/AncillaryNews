@@ -1,6 +1,22 @@
 """
 M6 P2: the baselines P3 must clear (docs/forecast-baseline-design.md).
 
+**M6 P3b update (docs/forecast-day-ahead-design.md):** the target this
+module reads is no longer hardcoded to FCR-D DK2. `TargetConfig` (below)
+generalises `market`/`zone`/`products` plus an optional 15-min->hourly
+aggregation step into a small config; `FCR_D_TARGET` and `DAY_AHEAD_TARGET`
+are its two declared instances, and `fetch_target_series` takes an explicit
+`config` (defaulting to `FCR_D_TARGET`, so nothing below changes for
+existing FCR-D callers). Everything else in this module -- the coverage
+gate, `walk_forward_folds`/`trailing_folds`, `pinball_loss`,
+`fit_seasonal_naive`, `fit_conditional_climatology(_rolling)`,
+`run_walk_forward` -- was already a pure function of the `(series, folds,
+train_start, train_end, ...)` values passed in, never of the `TARGET_*`
+constants directly, so day-ahead flows through every one of them completely
+unmodified; only the target-fetch layer needed to change (day-ahead
+design §3's "do not fork the harness" mandate). The FCR-D-specific
+paragraphs below describe that original, still-exact target.
+
 Target: **FCR-D DK2 capacity price** (`market='FCR'`, `zone='DK2'`,
 `product` in `('up', 'down')`), hourly, EUR/MW/h (design §1). Two
 baselines, both emitting **quantile** forecasts at `QUANTILES` (design §3):
@@ -121,11 +137,75 @@ from shared.db_manager import DatabaseManager
 
 logger = logging.getLogger(__name__)
 
-# --- target (design §1) ---------------------------------------------------
+# --- target (design §1; generalised for M6 P3b, docs/forecast-day-ahead-design.md §3) ---
 
-TARGET_MARKET = "FCR"
-TARGET_ZONE = "DK2"
-TARGET_PRODUCTS: tuple[str, ...] = ("up", "down")
+
+@dataclass(frozen=True)
+class TargetConfig:
+    """
+    M6 P3b's generalisation of this module's original hardcoded
+    `TARGET_MARKET = "FCR"` / `TARGET_ZONE = "DK2"` / directional-products
+    trio into a small, explicit config -- so FCR-D and day-ahead flow
+    through the exact same fold generator (`walk_forward_folds`), pinball
+    loss (`pinball_loss`), coverage gate (`assert_full_daily_coverage`/
+    `fetch_and_assert_daily_coverage`, already market/zone-parameterised and
+    untouched by this change), and baseline fits
+    (`fit_seasonal_naive`/`fit_conditional_climatology*`) -- rather than a
+    second, forked copy of any of them (day-ahead design §3's explicit
+    "do not fork the harness" mandate).
+
+    `aggregate_hourly` is the one new, genuinely target-specific step this
+    generalisation adds (day-ahead design §1): day-ahead DK2 price is
+    natively 15-minute (96 points/day), while `shared/feature_store.py`'s
+    grid -- and every FCR-D series this module has ever read -- is hourly.
+    `fetch_target_series` aggregates 15-min points to hourly by mean when
+    this is `True`, via `_aggregate_hourly_mean` below, so the joined
+    dataset lines up with `build_features`'s `mtu_start` grid. This is a
+    documented v1 simplification (hourly loses day-ahead's intraday shape,
+    a real cost for a battery that ultimately cares about the 15-min
+    curve) -- not something FCR-D (already hourly, `aggregate_hourly=False`)
+    needs or uses.
+    """
+
+    market: str
+    zone: str
+    products: tuple[str, ...]
+    aggregate_hourly: bool = False
+
+
+# FCR-D DK2 capacity price (design §1) -- this module's original target,
+# preserved byte-for-byte as a config so every existing caller of the
+# constants/functions below keeps working unmodified (see
+# `TARGET_MARKET`/`TARGET_ZONE`/`TARGET_PRODUCTS` aliases immediately below,
+# and `fetch_target_series`'s `config: TargetConfig = FCR_D_TARGET` default).
+FCR_D_TARGET = TargetConfig(market="FCR", zone="DK2", products=("up", "down"))
+
+# Day-ahead DK2 energy price (docs/forecast-day-ahead-design.md §1) -- a
+# single series, not directional, hence one product not two; 15-min source,
+# hourly-aggregated to meet the feature grid (see `TargetConfig`'s
+# docstring). Unit note: `shared/datasets.py`'s `day_ahead_prices` registry
+# entry (and `shared/units.py`'s derived index) declares this series
+# DKK/MWh (`DayAheadPriceDKK`), not EUR/MWh as the design doc's §1 states --
+# verified live 2026-07-22 (typical DK2 day-ahead values ~300-900, the
+# DKK/MWh magnitude at the live ~7.46 DKK/EUR rate, not EUR/MWh's ~30-100).
+# No currency conversion is applied here (out of scope for this retarget --
+# design §5 authorises no new data-handling step beyond the 15-min->hourly
+# aggregation); every day-ahead number in this module and
+# `docs/forecast-day-ahead-results.md` is DKK/MWh, flagged as a design-doc
+# discrepancy rather than silently "fixed" by assuming a conversion the
+# design never asked for.
+DAY_AHEAD_TARGET = TargetConfig(
+    market="day_ahead", zone="DK2", products=("price",), aggregate_hourly=True
+)
+
+# Backward-compatible aliases to `FCR_D_TARGET`'s fields -- every existing
+# caller (`scripts/generate_baseline_report.py`, `scripts/
+# generate_forecast_report.py`, `tests/test_baselines.py`) imports these
+# three names directly; they are untouched by the `TargetConfig`
+# generalisation above, not merely equivalent to it.
+TARGET_MARKET = FCR_D_TARGET.market
+TARGET_ZONE = FCR_D_TARGET.zone
+TARGET_PRODUCTS: tuple[str, ...] = FCR_D_TARGET.products
 # Matches P1's D-1 default (design §1). Purely documentary/contextual here:
 # neither baseline below consults a decision-time cutoff the way
 # shared/feature_store.py's RULE-A/RULE-B joins do -- B1's shortest lag
@@ -214,30 +294,71 @@ def fetch_and_assert_daily_coverage(
     assert_full_daily_coverage(present_days, start.date(), end.date())
 
 
-def fetch_target_series(
-    db: DatabaseManager, product: str, start: datetime, end: datetime
+def _aggregate_hourly_mean(
+    series: list[tuple[datetime, float]],
 ) -> list[tuple[datetime, float]]:
     """
-    Ascending-by-time `(time, value)` pairs for FCR-D DK2 `product`
-    (`'up'`/`'down'`) in `[start, end]`, nulls dropped, deduped to the
-    latest revision per `time` via `fetch_series_values(history=False)`'s
-    `market_data` view read (design §2.2). Callers must run
-    `fetch_and_assert_daily_coverage` over the same window first.
+    Aggregates a sub-hourly series (day-ahead's native 15-min cadence) to
+    hourly by mean, bucketed by flooring each point's time to the top of
+    its own hour (`TargetConfig.aggregate_hourly`'s v1 simplification --
+    see that dataclass's docstring). Returns one `(hour_start, mean_value)`
+    pair per hour that has at least one observation in `series`, ascending
+    by time -- an hour with fewer than the full 4 quarter-hour points still
+    gets a value (the mean of whatever is present), never dropped or
+    padded, since the day-level coverage gate (`assert_full_daily_coverage`)
+    is what this module already relies on to catch a genuine data gap, not
+    this aggregation step. `hour_start` lands exactly on the hourly grid
+    `shared/feature_store.py`'s `build_features` uses (`mtu_start.replace(
+    minute=0, second=0, microsecond=0)`), so the aggregated series joins
+    directly against feature rows with no further alignment.
     """
-    if product not in TARGET_PRODUCTS:
-        raise ValueError(f"product must be one of {TARGET_PRODUCTS}, got {product!r}")
+    buckets: dict[datetime, list[float]] = defaultdict(list)
+    for t, value in series:
+        buckets[t.replace(minute=0, second=0, microsecond=0)].append(value)
+    return [(hour, statistics.mean(values)) for hour, values in sorted(buckets.items())]
+
+
+def fetch_target_series(
+    db: DatabaseManager,
+    product: str,
+    start: datetime,
+    end: datetime,
+    config: TargetConfig = FCR_D_TARGET,
+) -> list[tuple[datetime, float]]:
+    """
+    Ascending-by-time `(time, value)` pairs for `config`'s `(market, zone)`
+    -- `FCR_D_TARGET` by default, so every pre-existing caller that never
+    passes `config` reads the exact same FCR-D DK2 series this function
+    always has -- for `product` (must be one of `config.products`) in
+    `[start, end]`, nulls dropped, deduped to the latest revision per `time`
+    via `fetch_series_values(history=False)`'s `market_data` view read
+    (design §2.2). When `config.aggregate_hourly` is set (day-ahead's 15-min
+    source, `DAY_AHEAD_TARGET`), the deduped series is aggregated to hourly
+    by mean (`_aggregate_hourly_mean`) before being returned -- FCR-D's own
+    `config.aggregate_hourly=False` leaves this function's output identical
+    to its pre-generalisation behaviour, byte for byte (see
+    `tests/test_day_ahead_target.py`'s
+    `test_fetch_target_series_default_config_reproduces_original_fcr_d_behavior`
+    regression test). Callers must run `fetch_and_assert_daily_coverage`
+    over the same window first, against `config.market`/`config.zone`.
+    """
+    if product not in config.products:
+        raise ValueError(f"product must be one of {config.products}, got {product!r}")
     rows = db.fetch_series_values(
-        TARGET_MARKET,
-        TARGET_ZONE,
+        config.market,
+        config.zone,
         product,
         limit=200_000,
         time_from=start,
         time_to=end,
         history=False,
     )
-    return sorted(
+    series = sorted(
         ((r["time"], r["value"]) for r in rows if r["value"] is not None), key=lambda kv: kv[0]
     )
+    if config.aggregate_hourly:
+        series = _aggregate_hourly_mean(series)
+    return series
 
 
 # --- pinball loss and empirical quantiles -----------------------------------
