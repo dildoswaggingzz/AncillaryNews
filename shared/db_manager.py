@@ -32,6 +32,21 @@ TRIGGER_INSERT_QUERY = """
     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
 """
 
+# M6+: supply-event features (docs/supply-event-features-design.md §2,
+# init-db/08-market-events.sql). `ON CONFLICT (event_id) DO NOTHING` --
+# `event_id` is deterministic (shared/event_extractor.py callers build it the
+# same way shared/vector_store.py's `_claim_point_id` builds claim IDs), so a
+# re-crawl of the same article is a no-op here rather than a duplicate or a
+# silent overwrite of a previously-extracted event.
+MARKET_EVENT_INSERT_QUERY = """
+    INSERT INTO market_events
+        (event_id, event_type, market, zone, direction, magnitude_mw, effective_from,
+         known_at, confidence, source_url, source_title, source_tier, raw_excerpt,
+         extracted_at)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT (event_id) DO NOTHING;
+"""
+
 # Startup schema-completeness check (Stage 0's migration-runner fix,
 # `scripts/migrate.py`). `docker-compose.yml` mounts `init-db/` at
 # `/docker-entrypoint-initdb.d`, which Postgres only executes against a
@@ -1194,6 +1209,119 @@ class DatabaseManager:
         finally:
             self._pool.putconn(conn)
         return {zone: count for zone, count in rows}
+
+    def save_market_event(
+        self,
+        event_id: str,
+        event_type: str,
+        market: str | None,
+        zone: str | None,
+        direction: str | None,
+        magnitude_mw: float | None,
+        effective_from,
+        known_at: datetime,
+        confidence: float,
+        source_url: str,
+        source_title: str | None,
+        source_tier: str | None,
+        raw_excerpt: str,
+        extracted_at: datetime,
+    ) -> None:
+        """
+        Persists one extracted supply/demand/regime event
+        (init-db/08-market-events.sql,
+        docs/supply-event-features-design.md §2/§4) additively alongside the
+        crawler's existing Qdrant claim storage -- the crawler must call this
+        only from a code path that swallows and logs its own failures, so an
+        event-storage error never affects claim storage or the crawl cycle
+        (design §4). `ON CONFLICT (event_id) DO NOTHING`
+        (`MARKET_EVENT_INSERT_QUERY`) makes a re-crawl of the same article
+        idempotent rather than duplicating.
+
+        `known_at` and `extracted_at` are taken as given, never computed
+        here -- the caller (services/crawler/main.py) assigns `known_at`
+        from `ArticleRef.published` (falling back to crawl time), per design
+        §1/§3: the model that extracts the event's other fields must never
+        be trusted to date it.
+        """
+        conn = self._pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    MARKET_EVENT_INSERT_QUERY,
+                    (
+                        event_id,
+                        event_type,
+                        market,
+                        zone,
+                        direction,
+                        magnitude_mw,
+                        effective_from,
+                        known_at,
+                        confidence,
+                        source_url,
+                        source_title,
+                        source_tier,
+                        raw_excerpt,
+                        extracted_at,
+                    ),
+                )
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Market event insertion failed for {event_id}: {e}")
+            raise
+        finally:
+            self._pool.putconn(conn)
+
+    def fetch_market_events(self, known_at_before: datetime) -> list[dict]:
+        """
+        Returns every `market_events` row with `known_at <= known_at_before`,
+        as dicts -- the raw read `shared/feature_store.py`'s leak-safe as-of
+        join (design §1) is built on.
+
+        Deliberately filters only on `known_at` here, leaving
+        market/zone/direction matching and the `effective_from`-windowed
+        aggregation to the feature store itself, in memory -- the same
+        fetch-broad-then-join-per-row shape as this module's other RULE-B
+        raw-series reads (`shared/feature_store.py`'s
+        `_fetch_sorted_series`/`_at_or_before`). Current event volume
+        (design §0: ~1 month of news, a low double-digit row count) makes one
+        broad query per `build_features` call cheap, and keeps every
+        leak-safety decision in the one module already responsible for all
+        the others, rather than splitting the as-of logic across two
+        modules.
+        """
+        conn = self._pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT event_id, event_type, market, zone, direction, magnitude_mw,
+                           effective_from, known_at, confidence, source_tier
+                    FROM market_events
+                    WHERE known_at <= %s;
+                    """,
+                    (known_at_before,),
+                )
+                rows = cur.fetchall()
+        finally:
+            self._pool.putconn(conn)
+        return [
+            {
+                "event_id": r[0],
+                "event_type": r[1],
+                "market": r[2],
+                "zone": r[3],
+                "direction": r[4],
+                "magnitude_mw": r[5],
+                "effective_from": r[6],
+                "known_at": r[7],
+                "confidence": r[8],
+                "source_tier": r[9],
+            }
+            for r in rows
+        ]
 
     def check_expected_columns(self) -> list[tuple[str, str]]:
         """

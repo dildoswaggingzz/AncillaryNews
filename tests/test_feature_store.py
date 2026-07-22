@@ -32,6 +32,7 @@ def _make_fake_db(
     series: dict[tuple[str, str, str], list[dict]] | None = None,
     zone_counts: dict[str, int] | None = None,
     forbid_products: set[str] | None = None,
+    events: list[dict] | None = None,
 ):
     """
     Builds a MagicMock `DatabaseManager` whose `fetch_series_values` answers
@@ -44,9 +45,18 @@ def _make_fake_db(
     discovered via the database (`build_features` reads the declared
     `KNOWN_BORDER_CORRIDORS` registry instead, per the schema-determinism
     fix), so there is no corridor-seeding knob here any more.
+
+    `events` (M6+, docs/supply-event-features-design.md) seeds
+    `fetch_market_events`, matching
+    `shared.db_manager.DatabaseManager.fetch_market_events`'s own contract:
+    every event dict with `known_at <= known_at_before` is returned,
+    regardless of zone/market/type -- the same "fetch broad, filter in
+    `build_features`" shape the real method uses, so these fixtures exercise
+    the same code path the real DB read would.
     """
     series = dict(series or {})
     forbid_products = forbid_products or set()
+    events = list(events or [])
     db = MagicMock()
 
     def fetch_series_values(
@@ -64,10 +74,41 @@ def _make_fake_db(
             rows = [r for r in rows if r["time"] <= time_to]
         return rows
 
+    def fetch_market_events(known_at_before):
+        return [e for e in events if e["known_at"] <= known_at_before]
+
     db.fetch_series_values.side_effect = fetch_series_values
     db.fetch_zone_counts.return_value = zone_counts or {"DK1": 5, "DK2": 5}
+    db.fetch_market_events.side_effect = fetch_market_events
 
     return db
+
+
+def _event(
+    event_id="evt-1",
+    event_type="prequalification",
+    market="FCR",
+    zone="DK2",
+    direction=None,
+    magnitude_mw=50.0,
+    effective_from=None,
+    known_at=None,
+    confidence=0.9,
+    source_tier="tier1",
+):
+    """A synthetic `market_events` row, shaped like `fetch_market_events`'s return value."""
+    return {
+        "event_id": event_id,
+        "event_type": event_type,
+        "market": market,
+        "zone": zone,
+        "direction": direction,
+        "magnitude_mw": magnitude_mw,
+        "effective_from": effective_from,
+        "known_at": known_at,
+        "confidence": confidence,
+        "source_tier": source_tier,
+    }
 
 
 # --- §2.1: leaky column is absent at every horizon --------------------------
@@ -274,6 +315,297 @@ def test_corridor_with_no_data_in_window_still_gets_none_valued_columns():
     assert row["atc_export_SE4_DK2"] is None
 
 
+# --- M6+: supply-event features (docs/supply-event-features-design.md) -----
+#
+# §1's leak rule, different from the RULE-B "source-time cutoff" tests
+# above: an event's `known_at` (article publish time; the crawler's
+# assignment, never the model's) gates availability, and `effective_from`
+# (when the announced capacity lands) is a VALUE inside the feature, never
+# the availability key. Written before any of `build_features`'s event-column
+# implementation existed, per the task's "write the leak test first"
+# instruction -- exactly as P1's own horizon tests (§2.1-§2.4 above) were.
+
+
+def test_event_known_at_after_decision_time_never_leaks_into_that_mtus_features():
+    """
+    THE core leak test (design §1). An event whose `known_at` is one minute
+    AFTER the decision time (`mtu_start - horizon`) must never surface in
+    that MTU's features -- even though its `effective_from` already lies
+    safely in the *past* relative to the decision time. That combination is
+    exactly design §1's "the trap": a builder that (wrongly) keyed
+    availability on `effective_from` instead of `known_at` would let this
+    event through, because "capacity already effective" looks safe if you
+    don't check when the information became public.
+    """
+    mtu = BASE
+    horizon = timedelta(hours=12)
+    decision_time = mtu - horizon
+
+    leaky_event = _event(
+        magnitude_mw=99999.0,  # distinctive -- must never appear anywhere in the row
+        effective_from=(decision_time - timedelta(days=10)).date(),  # already "in effect"
+        known_at=decision_time + timedelta(minutes=1),  # one minute too late to be knowable
+    )
+    db = _make_fake_db(events=[leaky_event])
+
+    row = build_features(db, "DK2", mtu, mtu + timedelta(hours=1), horizon)[0]
+
+    assert row["announced_mw_entering_90d"] is None
+    assert row["days_since_last_supply_event"] is None
+    assert 99999.0 not in row.values()
+
+
+def test_event_known_at_exactly_the_decision_time_boundary_is_included():
+    """`known_at <= decision_time` (design §1) -- the boundary itself is inclusive."""
+    mtu = BASE
+    horizon = timedelta(hours=12)
+    decision_time = mtu - horizon
+
+    event = _event(
+        magnitude_mw=42.0,
+        effective_from=(decision_time + timedelta(days=30)).date(),
+        known_at=decision_time,  # exactly at the cutoff
+        confidence=1.0,
+    )
+    db = _make_fake_db(events=[event])
+
+    row = build_features(db, "DK2", mtu, mtu + timedelta(hours=1), horizon)[0]
+
+    assert row["announced_mw_entering_90d"] == 42.0
+
+
+def test_event_known_well_in_advance_of_its_future_effective_date_is_included():
+    """
+    Design §1's trap paragraph, the affirmative case: an event *reported*
+    well before the decision time but whose capacity only becomes
+    *effective* well after it (e.g. reported 2026-07-15 about capacity
+    landing 2026-09-01) is knowable from `known_at` onward and must be
+    counted -- proving `effective_from` is read purely as a value describing
+    how soon the capacity lands, never as the gate for whether the event is
+    visible at all.
+    """
+    mtu = BASE
+    horizon = timedelta(hours=12)
+    decision_time = mtu - horizon
+
+    event = _event(
+        magnitude_mw=240.0,
+        known_at=decision_time - timedelta(days=5),  # reported well in advance
+        effective_from=(decision_time + timedelta(days=45)).date(),  # lands well after
+        confidence=1.0,
+    )
+    db = _make_fake_db(events=[event])
+
+    row = build_features(db, "DK2", mtu, mtu + timedelta(hours=1), horizon)[0]
+
+    assert row["announced_mw_entering_90d"] == 240.0
+
+
+def test_event_outside_the_90d_forward_window_is_excluded():
+    mtu = BASE
+    horizon = timedelta(hours=1)
+    decision_time = mtu - horizon
+
+    event = _event(
+        magnitude_mw=15.0,
+        known_at=decision_time - timedelta(days=1),
+        effective_from=(decision_time + timedelta(days=200)).date(),  # far beyond 90d
+    )
+    db = _make_fake_db(events=[event])
+
+    row = build_features(db, "DK2", mtu, mtu + timedelta(hours=1), horizon)[0]
+
+    assert row["announced_mw_entering_90d"] is None
+
+
+def test_event_zone_mismatch_excluded_from_zone_specific_columns():
+    """
+    `build_features` has no `market`/`direction` parameter at all (its grain
+    is `(zone, horizon)`) -- so event matching here is on `zone` alone. A
+    DK1 event must never feed a DK2 row's columns.
+    """
+    mtu = BASE
+    horizon = timedelta(hours=1)
+    decision_time = mtu - horizon
+
+    event = _event(
+        zone="DK1",
+        magnitude_mw=77.0,
+        known_at=decision_time - timedelta(days=1),
+        effective_from=(decision_time + timedelta(days=5)).date(),
+    )
+    db = _make_fake_db(events=[event])
+
+    row = build_features(db, "DK2", mtu, mtu + timedelta(hours=1), horizon)[0]
+
+    assert row["announced_mw_entering_90d"] is None
+
+
+def test_announced_mw_entering_90d_confidence_weighted_and_type_filtered():
+    mtu = BASE
+    horizon = timedelta(hours=1)
+    decision_time = mtu - horizon
+
+    prequal = _event(
+        event_id="evt-prequal",
+        event_type="prequalification",
+        magnitude_mw=100.0,
+        confidence=0.5,  # Tier-2-capped, e.g.
+        known_at=decision_time - timedelta(days=2),
+        effective_from=(decision_time + timedelta(days=10)).date(),
+    )
+    commissioning = _event(
+        event_id="evt-commission",
+        event_type="capacity_commissioning",
+        magnitude_mw=40.0,
+        confidence=1.0,
+        known_at=decision_time - timedelta(days=1),
+        effective_from=(decision_time + timedelta(days=20)).date(),
+    )
+    retirement = _event(
+        event_id="evt-retire",
+        event_type="capacity_retirement",  # not "entering" -- must not be summed here
+        magnitude_mw=1000.0,
+        confidence=1.0,
+        known_at=decision_time - timedelta(days=1),
+        effective_from=(decision_time + timedelta(days=20)).date(),
+    )
+    db = _make_fake_db(events=[prequal, commissioning, retirement])
+
+    row = build_features(db, "DK2", mtu, mtu + timedelta(hours=1), horizon)[0]
+
+    assert row["announced_mw_entering_90d"] == 100.0 * 0.5 + 40.0 * 1.0
+
+
+def test_net_demand_volume_change_30d_signed_confidence_weighted_sum():
+    mtu = BASE
+    horizon = timedelta(hours=1)
+    decision_time = mtu - horizon
+
+    increase = _event(
+        event_id="evt-up",
+        event_type="demand_volume_change",
+        magnitude_mw=20.0,
+        confidence=1.0,
+        known_at=decision_time - timedelta(days=5),
+    )
+    decrease = _event(
+        event_id="evt-down",
+        event_type="demand_volume_change",
+        magnitude_mw=-8.0,
+        confidence=0.5,
+        known_at=decision_time - timedelta(days=10),
+    )
+    too_old = _event(
+        event_id="evt-old",
+        event_type="demand_volume_change",
+        magnitude_mw=1000.0,
+        confidence=1.0,
+        known_at=decision_time - timedelta(days=45),  # outside the trailing 30d window
+    )
+    db = _make_fake_db(events=[increase, decrease, too_old])
+
+    row = build_features(db, "DK2", mtu, mtu + timedelta(hours=1), horizon)[0]
+
+    assert row["net_demand_volume_change_30d"] == 20.0 * 1.0 + (-8.0) * 0.5
+
+
+def test_regime_change_within_horizon_true_when_known_and_effective_in_window():
+    mtu = BASE
+    horizon = timedelta(hours=1)
+    decision_time = mtu - horizon
+
+    event = _event(
+        event_type="regime_change",
+        magnitude_mw=None,
+        confidence=0.8,
+        known_at=decision_time - timedelta(days=2),
+        effective_from=(decision_time + timedelta(days=20)).date(),
+    )
+    db = _make_fake_db(events=[event])
+
+    row = build_features(db, "DK2", mtu, mtu + timedelta(hours=1), horizon)[0]
+
+    assert row["regime_change_within_horizon"] is True
+
+
+def test_regime_change_within_horizon_false_when_none_present():
+    db = _make_fake_db(events=[])
+    row = build_features(db, "DK2", BASE, BASE + timedelta(hours=1), timedelta(hours=1))[0]
+    assert row["regime_change_within_horizon"] is False
+
+
+def test_days_since_last_supply_event_computed_from_most_recent_known_event():
+    mtu = BASE
+    horizon = timedelta(hours=1)
+    decision_time = mtu - horizon
+
+    older = _event(
+        event_id="evt-older",
+        event_type="outage",
+        magnitude_mw=None,
+        known_at=decision_time - timedelta(days=10),
+    )
+    newer = _event(
+        event_id="evt-newer",
+        event_type="prequalification",
+        magnitude_mw=5.0,
+        known_at=decision_time - timedelta(days=3),
+    )
+    db = _make_fake_db(events=[older, newer])
+
+    row = build_features(db, "DK2", mtu, mtu + timedelta(hours=1), horizon)[0]
+
+    assert row["days_since_last_supply_event"] == 3
+
+
+def test_days_since_last_supply_event_none_when_no_event_ever_known():
+    db = _make_fake_db(events=[])
+    row = build_features(db, "DK2", BASE, BASE + timedelta(hours=1), timedelta(hours=1))[0]
+    assert row["days_since_last_supply_event"] is None
+
+
+def test_event_columns_always_present_with_honest_defaults_when_no_events_at_all():
+    """
+    Design §5's schema-determinism guarantee, applied to the event columns:
+    present on every row -- null/0/false where none, never omitted -- even
+    when `fetch_market_events` returns nothing at all (the ordinary case
+    today, design §0).
+    """
+    db = _make_fake_db(events=[])
+    row = build_features(db, "DK2", BASE, BASE + timedelta(hours=1), timedelta(hours=1))[0]
+
+    assert row["announced_mw_entering_90d"] is None
+    assert row["net_demand_volume_change_30d"] is None
+    assert row["regime_change_within_horizon"] is False
+    assert row["days_since_last_supply_event"] is None
+
+
+def test_event_feature_fill_rate_is_logged(caplog):
+    """
+    Design §5's mandatory honesty requirement: `build_features` must log the
+    event columns' fill rate over the requested window, so a 99%-null
+    reality (design §0) is visible in the logs, never silently shipped as if
+    the columns carried more signal than they do.
+    """
+    mtu = BASE
+    horizon = timedelta(hours=1)
+    decision_time = mtu - horizon
+    event = _event(
+        known_at=decision_time - timedelta(days=1),
+        effective_from=(decision_time + timedelta(days=5)).date(),
+    )
+    db = _make_fake_db(events=[event])
+
+    with caplog.at_level("INFO"):
+        build_features(db, "DK2", mtu, mtu + timedelta(hours=5), horizon)
+
+    assert any(
+        "fill rate" in record.message.lower() and "event" in record.message.lower()
+        for record in caplog.records
+    )
+
+
 # --- schema determinism (coordinator review, post-smoke-run) ----------------
 
 
@@ -286,6 +618,10 @@ def test_schema_is_identical_across_windows_with_the_same_zone_and_horizon():
     money" failure class as a leak, one layer up. Two calls below use
     disjoint windows and completely different (one populated, one empty)
     underlying data; their row's key sets must still match exactly.
+
+    Extended (M6+) to also seed `events=[...]` on the populated side and
+    none on the empty side -- the event columns (design §5) must be part of
+    this same guarantee, not a schema-drift exception to it.
     """
     horizon = timedelta(hours=1)
 
@@ -293,9 +629,15 @@ def test_schema_is_identical_across_windows_with_the_same_zone_and_horizon():
         series={
             ("wind_solar_forecast", "DK2", "offshore_wind_1hour"): [{"time": BASE, "value": 1.0}],
             ("aFRR_border_atc", "SE4-DK2", "import"): [{"time": BASE, "value": 5.0}],
-        }
+        },
+        events=[
+            _event(
+                known_at=BASE - timedelta(hours=2),
+                effective_from=(BASE + timedelta(days=5)).date(),
+            )
+        ],
     )
-    empty_db = _make_fake_db(series={})
+    empty_db = _make_fake_db(series={}, events=[])
 
     window_a_start = BASE
     window_b_start = BASE + timedelta(days=90)  # a completely disjoint window
