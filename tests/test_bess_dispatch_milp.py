@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
@@ -35,6 +36,7 @@ def _db_with_series(
     fcr_down: list[dict] | None = None,
     afrr: list[dict] | None = None,
     activation: list[dict] | None = None,
+    imbalance: list[dict] | None = None,
 ):
     db = MagicMock()
 
@@ -51,6 +53,8 @@ def _db_with_series(
             return afrr or []
         if market == "aFRR_energy":
             return activation or []
+        if market == "imbalance" and product == "imbalance_price":
+            return imbalance or []
         raise AssertionError(f"unexpected market/product {market!r}/{product!r} requested")
 
     db.fetch_series_values.side_effect = fetch_series_values
@@ -567,6 +571,233 @@ def test_phantom_capacity_revenue_buckets_dk2_mixed_currency_stack_separately():
     # phantom_revenue = phantom_mw * 20.0 EUR/MW/h * 1h
     assert diagnostic["phantom_capacity_revenue_eur"] == pytest.approx(132.53807658307457)
     assert diagnostic["phantom_fraction_eur"] == pytest.approx(132.53807658307457 / 200.0)
+
+
+# --- P3 Part A: imbalance as a second dispatchable energy market ---------------
+
+
+def test_imbalance_discharge_beats_day_ahead_only_when_imbalance_price_is_higher():
+    """2 hourly periods: flat/tied prices at hour 0, imbalance far above
+    day-ahead at hour 1 (500 vs. 10). A day_ahead-only co-optimized run can
+    only ever sell into day-ahead; a run with `energy_markets=("day_ahead",
+    "imbalance")` must route hour 1's discharge into imbalance instead
+    (the shared power budget means it picks the higher-paying market, not
+    both), so its total energy revenue strictly exceeds the day_ahead-only
+    run over the identical window."""
+    day_ahead_values = [10.0, 10.0]
+    imbalance_values = [10.0, 500.0]
+    day_ahead = _price_rows(day_ahead_values)
+    imbalance = _price_rows(imbalance_values)
+
+    base_kwargs = dict(
+        strategy="cooptimized",
+        capacity_commit_mw=0.0,
+        capacity_markets=(),
+        power_mw=1.0,
+        capacity_mwh=10.0,
+        starting_soc_fraction=0.5,
+    )
+
+    db_da_only = _db_with_series(day_ahead)
+    config_da_only = BessConfig(**base_kwargs)
+    result_da_only = run_backtest(
+        db_da_only, "DK1", BASE_TIME, BASE_TIME + timedelta(hours=2), config_da_only
+    )
+
+    db_two_markets = _db_with_series(day_ahead, imbalance=imbalance)
+    config_two_markets = BessConfig(**base_kwargs, energy_markets=("day_ahead", "imbalance"))
+    result_two_markets = run_backtest(
+        db_two_markets, "DK1", BASE_TIME, BASE_TIME + timedelta(hours=2), config_two_markets
+    )
+
+    assert (
+        result_two_markets.total_arbitrage_revenue_dkk
+        > result_da_only.total_arbitrage_revenue_dkk
+    )
+    # Hour 1 (index 1) must have been settled at the higher imbalance price,
+    # not day-ahead's -- the discharge revenue there can only be explained
+    # by having sold into imbalance.
+    hour1 = result_two_markets.ticks[1]
+    assert hour1.action == "discharge"
+    assert hour1.arbitrage_revenue_dkk > hour1.energy_discharged_mwh * day_ahead_values[1] + 1e-6
+
+
+def test_soc_feasible_with_two_energy_markets():
+    """SoC must stay within the usable band at every tick when the LP is
+    routing flows across two energy markets simultaneously (day-ahead and
+    imbalance alternately the more attractive one)."""
+    day_ahead = _price_rows([10.0, 500.0, 5.0, 800.0, 20.0, 1.0])
+    imbalance = _price_rows([500.0, 10.0, 900.0, 4.0, 3.0, 700.0])
+    db = _db_with_series(day_ahead, imbalance=imbalance)
+    config = BessConfig(
+        strategy="cooptimized",
+        capacity_commit_mw=0.0,
+        capacity_markets=(),
+        power_mw=2.0,
+        capacity_mwh=3.0,
+        starting_soc_fraction=0.5,
+        energy_markets=("day_ahead", "imbalance"),
+        max_cycles_per_day=None,
+    )
+    result = run_backtest(db, "DK1", BASE_TIME, BASE_TIME + timedelta(hours=6), config)
+
+    soc_min = config.soc_min_fraction * config.capacity_mwh
+    soc_max = config.soc_max_fraction * config.capacity_mwh
+    assert len(result.ticks) == 6
+    for tick in result.ticks:
+        assert soc_min - 1e-6 <= tick.soc_mwh <= soc_max + 1e-6
+
+
+def test_day_ahead_only_energy_markets_reproduces_prior_p1_p2_behaviour():
+    """`energy_markets=("day_ahead",)` (the default) must be behaviourally
+    identical to `solve_cooptimized_dispatch` before this field existed --
+    calling it via `run_backtest`'s new energy-markets wiring must match
+    calling it directly with the old (pre-P3) single-series call
+    convention, tick for tick."""
+    prices = [30.0, 200.0, 10.0]
+    price_series = _series(prices)
+    config = BessConfig(
+        power_mw=1.0,
+        capacity_mwh=1.0,
+        round_trip_efficiency=1.0,
+        soc_min_fraction=0.1,
+        soc_max_fraction=0.9,
+        starting_soc_fraction=0.5,
+        capacity_commit_mw=0.0,
+        capacity_markets=(),
+        max_cycles_per_day=None,
+        strategy="cooptimized",
+    )
+
+    # Old (pre-P3) call convention: no energy_series_by_market at all.
+    result_old_style = solve_cooptimized_dispatch(
+        "DK1", BASE_TIME, BASE_TIME + timedelta(hours=3), config, price_series, {}, {}, []
+    )
+    # New explicit equivalent.
+    result_explicit = solve_cooptimized_dispatch(
+        "DK1",
+        BASE_TIME,
+        BASE_TIME + timedelta(hours=3),
+        config,
+        price_series,
+        {},
+        {},
+        [],
+        energy_series_by_market={"day_ahead": price_series},
+    )
+
+    assert result_old_style.total_arbitrage_revenue_dkk == pytest.approx(148.0, abs=1e-6)
+    assert result_explicit.total_arbitrage_revenue_dkk == pytest.approx(148.0, abs=1e-6)
+    for t1, t2 in zip(result_old_style.ticks, result_explicit.ticks, strict=True):
+        assert t1.soc_mwh == pytest.approx(t2.soc_mwh)
+        assert t1.action == t2.action
+        assert t1.arbitrage_revenue_dkk == pytest.approx(t2.arbitrage_revenue_dkk)
+
+
+# --- P3 Part B: post (perfect) vs. pre (forecast) foresight ---------------------
+
+
+def test_pre_leq_post_on_multiple_windows():
+    """Two windows, each with a genuine price excursion at hour >= 24 whose
+    lag-24h source (the same hour, the day before) does NOT show the
+    excursion -- the forecast schedule genuinely misses it, so the
+    perfect-foresight ("post") total captures real extra revenue the
+    forecast-driven ("pre") schedule cannot: `pre <= post` must hold, and
+    should hold with a real (not merely trivial-equality) gap."""
+    values_spike = [100.0] * 30 + [1000.0] + [100.0] * 17  # spike at hour 30
+    values_trough = [200.0] * 40 + [5.0] + [200.0] * 7  # trough at hour 40
+
+    gaps = []
+    for values in (values_spike, values_trough):
+        day_ahead = _price_rows(values)
+        db = _db_with_series(day_ahead)
+        config = BessConfig(strategy="cooptimized", capacity_commit_mw=0.0, capacity_markets=())
+        perfect = run_backtest(
+            db, "DK1", BASE_TIME, BASE_TIME + timedelta(hours=len(values)), config
+        )
+        forecast = run_backtest(
+            db,
+            "DK1",
+            BASE_TIME,
+            BASE_TIME + timedelta(hours=len(values)),
+            replace(config, foresight="forecast"),
+        )
+        assert forecast.total_revenue_all_dkk <= perfect.total_revenue_all_dkk + 1e-6
+        gaps.append(perfect.total_revenue_all_dkk - forecast.total_revenue_all_dkk)
+
+    assert any(gap > 1e-6 for gap in gaps)
+
+
+def test_perfect_foresight_explicit_schedule_matches_omitted_schedule():
+    """`foresight="perfect"` means schedule == settlement -- passing the
+    SAME series explicitly as `schedule_energy_series_by_market`/
+    `schedule_capacity_series_by_leg` must give byte-identical results to
+    omitting them (the `None`-defaults-to-settlement path)."""
+    prices = [30.0, 200.0, 10.0]
+    price_series = _series(prices)
+    config = BessConfig(
+        power_mw=1.0,
+        capacity_mwh=1.0,
+        round_trip_efficiency=1.0,
+        soc_min_fraction=0.1,
+        soc_max_fraction=0.9,
+        starting_soc_fraction=0.5,
+        capacity_commit_mw=0.0,
+        capacity_markets=(),
+        max_cycles_per_day=None,
+        strategy="cooptimized",
+        foresight="perfect",
+    )
+
+    result_omitted = solve_cooptimized_dispatch(
+        "DK1", BASE_TIME, BASE_TIME + timedelta(hours=3), config, price_series, {}, {}, []
+    )
+    result_explicit = solve_cooptimized_dispatch(
+        "DK1",
+        BASE_TIME,
+        BASE_TIME + timedelta(hours=3),
+        config,
+        price_series,
+        {},
+        {},
+        [],
+        energy_series_by_market={"day_ahead": price_series},
+        schedule_energy_series_by_market={"day_ahead": price_series},
+        schedule_capacity_series_by_leg={},
+    )
+
+    assert result_omitted.total_arbitrage_revenue_dkk == pytest.approx(
+        result_explicit.total_arbitrage_revenue_dkk
+    )
+    for t1, t2 in zip(result_omitted.ticks, result_explicit.ticks, strict=True):
+        assert t1.soc_mwh == pytest.approx(t2.soc_mwh)
+        assert t1.action == t2.action
+        assert t1.arbitrage_revenue_dkk == pytest.approx(t2.arbitrage_revenue_dkk)
+
+
+def test_foresight_rejects_invalid_value():
+    with pytest.raises(ValueError, match="foresight"):
+        BessConfig(foresight="oracle")
+
+
+def test_energy_markets_rejects_unknown_market():
+    with pytest.raises(ValueError, match="energy_markets"):
+        BessConfig(energy_markets=("day_ahead", "FCR"))
+
+
+def test_energy_markets_rejects_excluded_market():
+    with pytest.raises(ValueError, match="not eligible"):
+        BessConfig(energy_markets=("mFRR_capacity",))
+
+
+def test_energy_markets_rejects_empty():
+    with pytest.raises(ValueError, match="energy_markets"):
+        BessConfig(energy_markets=())
+
+
+def test_energy_markets_rejects_duplicates():
+    with pytest.raises(ValueError, match="duplicates"):
+        BessConfig(energy_markets=("day_ahead", "day_ahead"))
 
 
 # --- no data / empty window -------------------------------------------------------

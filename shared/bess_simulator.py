@@ -167,6 +167,19 @@ PRICE_RANKED_BASELINE_MULTIPLIER = 4
 # doesn't change what a BESS can bid into.
 EXCLUDED_MARKETS = frozenset({"mFRR_capacity", "mFRR_EAM", "mFRR_capacity_extra"})
 
+# Product string for every energy market `BessConfig.energy_markets` can name
+# OTHER than the day-ahead-driving series itself (day-ahead's own product is
+# `price_market`/`price_product` above, never this table -- one source of
+# truth for the series that drives the tick timeline). P3
+# (docs/bess-cooptimizer-design.md §6): `imbalance`'s product is
+# `imbalance_price` per `shared/datasets.py`'s `imbalance_price` dataset
+# (`ImbalancePriceDKK`, DKK/MWh -- the same currency as day_ahead, so no new
+# currency handling is needed for it anywhere in this module or
+# `shared/bess_dispatch_milp.py`).
+ENERGY_MARKET_PRODUCT: dict[str, str] = {
+    "imbalance": "imbalance_price",
+}
+
 
 @dataclass(frozen=True)
 class BessConfig:
@@ -277,6 +290,53 @@ class BessConfig:
     # check of when this does/doesn't bind relative to `power_mw`.
     activation_endurance_hours: float = 0.25
 
+    # --- co-optimizer-only: dispatchable energy markets (docs/bess-cooptimizer-design.md §6) ---
+    # Every energy market the co-optimizer's LP is allowed to dispatch
+    # against, sharing the ONE SoC/power budget with each other --
+    # `("day_ahead",)` (the default) reproduces P1/P2's single-energy-market
+    # behaviour exactly (regression-tested,
+    # tests/test_bess_dispatch_milp.py). Adding `"imbalance"` (P3) lets the
+    # LP route discharge to whichever of {day_ahead, imbalance} pays more
+    # and charge to whichever costs less, each period, since a BESS is a
+    # *controllable* asset that CHOOSES its imbalance exposure rather than
+    # merely settling a forecast-error deviation the way a non-dispatchable
+    # generator would (the design doc's earlier "passive settlement" lean,
+    # its §9, was correct for that case but wrong for a battery, and is
+    # superseded -- see its §6). `imbalance`'s product is `imbalance_price`,
+    # DKK/MWh -- the SAME currency as day_ahead (`ENERGY_MARKET_PRODUCT`
+    # above), so both energy markets live entirely inside
+    # `shared/bess_dispatch_milp.py`'s Solve 1 -- no new currency handling.
+    # **Threshold-strategy runs ignore this field entirely** (same posture
+    # as `activation_endurance_hours` above) -- that engine stays
+    # day_ahead-only, reading `price_market`/`price_product` exactly as it
+    # did before this field existed.
+    energy_markets: tuple[str, ...] = ("day_ahead",)
+
+    # --- co-optimizer-only: post vs. pre foresight (docs/bess-cooptimizer-design.md §5) ---
+    # "perfect" (the default) is P1/P2's behaviour: the LP optimises
+    # against, and every tick's revenue is reported at, the SAME actual/
+    # realised prices -- a perfect-foresight oracle, not a deployable
+    # policy. "forecast" is P3's pre mode: the LP optimises against a
+    # CAUSAL forecast of each schedulable series (P3's concrete source is
+    # lag-24h persistence, `_lag24h_forecast` below) to fix a schedule
+    # (`ch`/`dis`/`cap`), then that FIXED schedule's revenue is reported at
+    # actual/settlement prices (`Σ actual_price · scheduled_flow`) --
+    # `shared/bess_dispatch_milp.py`'s module docstring documents the
+    # schedule/settlement mechanism in full. The post − pre gap is the
+    # monetary value of forecast skill; with the lag-24h forecast this gap
+    # is a conservative *floor* on that value (a richer forecast, e.g. the
+    # M6 LightGBM models in `shared/forecast_model.py`, is a documented
+    # later hook, not P3 scope, and could only narrow the gap further).
+    # `foresight="forecast"`'s realised total is always <=
+    # `foresight="perfect"`'s on the same window: the fixed forecast-driven
+    # schedule is itself one feasible schedule the perfect-foresight problem
+    # could also have chosen, so its actual-settled value can never exceed
+    # the perfect-foresight optimum (tests/test_bess_dispatch_milp.py's
+    # `pre <= post` gate). **Threshold-strategy runs ignore this field
+    # entirely** -- there is no schedule/settlement split in that engine,
+    # it always reads and reports actual prices tick by tick.
+    foresight: Literal["perfect", "forecast"] = "perfect"
+
     def __post_init__(self):
         if self.power_mw <= 0:
             raise ValueError("power_mw must be positive")
@@ -315,6 +375,25 @@ class BessConfig:
             )
         if self.activation_endurance_hours <= 0:
             raise ValueError("activation_endurance_hours must be positive")
+        if not self.energy_markets:
+            raise ValueError("energy_markets must not be empty")
+        if len(set(self.energy_markets)) != len(self.energy_markets):
+            raise ValueError(
+                f"energy_markets must not contain duplicates, got {self.energy_markets!r}"
+            )
+        for market in self.energy_markets:
+            if market in EXCLUDED_MARKETS:
+                raise ValueError(
+                    f"energy market {market!r} is not eligible for BESS participation "
+                    "(mFRR_capacity/mFRR_EAM are excluded — see module docstring)"
+                )
+            if market not in ("day_ahead", "imbalance"):
+                raise ValueError(
+                    "energy_markets entries must be one of ('day_ahead', 'imbalance') for P3 "
+                    f"(the tuple is kept general for a future intraday entry, P4), got {market!r}"
+                )
+        if self.foresight not in ("perfect", "forecast"):
+            raise ValueError(f"foresight must be 'perfect' or 'forecast', got {self.foresight!r}")
 
 
 @dataclass
@@ -514,6 +593,40 @@ def _value_at_or_before(sorted_series: list[tuple[datetime, float]], t: datetime
             break
         result = value
     return result
+
+
+def _lag24h_forecast(actual_series: list[tuple[datetime, float]]) -> list[tuple[datetime, float]]:
+    """
+    P3's pre-mode forecast source (docs/bess-cooptimizer-design.md §5,
+    `BessConfig.foresight`): a causal lag-24h persistence of `actual_series`
+    -- for each `(t, v)` point, the forecast value AT `t` is whatever
+    `actual_series` itself carried at `t - 24h` (via `_value_at_or_before`,
+    this module's usual carry-forward convention), falling back to the
+    tick's own actual value `v` only when no `t - 24h` value exists at all
+    (cold start -- the first ~24h of any window, before there is a full
+    day of trailing history to lag from). Both branches are causal: the lag
+    branch only ever reads a value from >=24h in the past; the cold-start
+    fallback reads the CURRENT tick's own actual value, which is not
+    lookahead (it is exactly what perfect-foresight mode would already use
+    for that same tick) but does mean the very first day of a
+    "forecast"-mode window isn't actually forecast-driven -- an explicit,
+    honest limitation (docs/bess-cooptimizer-design.md §5 already frames
+    the lag-24h gap as a floor estimate of forecast value, not an exact
+    one, and this cold-start fallback only ever narrows that gap further,
+    consistent with the "pre <= post" guarantee).
+
+    A small, no-model-training, swappable-later helper -- wiring a richer
+    forecast source (e.g. the M6 LightGBM day-ahead/FCR-D models,
+    `shared/forecast_model.py`) as `run_backtest`'s schedule-price source is
+    a documented future hook, not P3 scope; nothing about
+    `shared/bess_dispatch_milp.py`'s schedule/settlement mechanism assumes
+    this particular forecast function.
+    """
+    forecast: list[tuple[datetime, float]] = []
+    for t, v in actual_series:
+        lag_value = _value_at_or_before(actual_series, t - timedelta(hours=24))
+        forecast.append((t, lag_value if lag_value is not None else v))
+    return forecast
 
 
 def _leg_relative_strength(short_history: deque[float], baseline_history: deque[float]) -> float:
@@ -720,6 +833,45 @@ def run_backtest(
     )
 
     if config.strategy == "cooptimized":
+        # Energy markets (P3, docs/bess-cooptimizer-design.md §6): the
+        # day-ahead-driving series (`price_series`, from `price_market`/
+        # `price_product` above) is reused for whichever `energy_markets`
+        # entry matches `config.price_market` (almost always "day_ahead"),
+        # avoiding a duplicate fetch of the identical rows; every other
+        # configured energy market (e.g. "imbalance") is fetched fresh via
+        # `ENERGY_MARKET_PRODUCT`'s product string.
+        energy_series_by_market: dict[str, list[tuple[datetime, float]]] = {}
+        for market in config.energy_markets:
+            if market == config.price_market:
+                energy_series_by_market[market] = price_series
+            else:
+                product = ENERGY_MARKET_PRODUCT.get(market)
+                if product is None:
+                    raise ValueError(
+                        f"no known product string for energy market {market!r} -- add it to "
+                        "ENERGY_MARKET_PRODUCT"
+                    )
+                energy_series_by_market[market] = _fetch_series(
+                    db, market, zone, product, start_time, end_time
+                )
+
+        # Pre mode (P3, docs/bess-cooptimizer-design.md §5): a causal
+        # lag-24h persistence forecast of every schedulable series -- energy
+        # markets and capacity legs (`_lag24h_forecast`). `None` (perfect
+        # mode, the default) tells `solve_cooptimized_dispatch` to schedule
+        # against the same actual series it settles at -- P1/P2's behaviour,
+        # unchanged.
+        schedule_energy_series_by_market: dict[str, list[tuple[datetime, float]]] | None = None
+        schedule_capacity_series_by_leg: dict[str, list[tuple[datetime, float]]] | None = None
+        if config.foresight == "forecast":
+            schedule_energy_series_by_market = {
+                market: _lag24h_forecast(series)
+                for market, series in energy_series_by_market.items()
+            }
+            schedule_capacity_series_by_leg = {
+                key: _lag24h_forecast(series) for key, series in capacity_series_by_leg.items()
+            }
+
         # Deferred import: `shared/bess_dispatch_milp.py` imports several
         # names from *this* module (`BessConfig`, `BessTick`,
         # `BacktestResult`, `_value_at_or_before`) at its own module level,
@@ -741,6 +893,9 @@ def run_backtest(
             capacity_series_by_leg=capacity_series_by_leg,
             leg_currency=leg_currency,
             activation_price_series=activation_price_series,
+            energy_series_by_market=energy_series_by_market,
+            schedule_energy_series_by_market=schedule_energy_series_by_market,
+            schedule_capacity_series_by_leg=schedule_capacity_series_by_leg,
         )
 
     soc_min = config.soc_min_fraction * config.capacity_mwh

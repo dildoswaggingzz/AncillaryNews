@@ -62,6 +62,25 @@ for that leg simply earns 0 that period, per `_value_at_or_before`), and
 several of these legs' confirmed-live history is genuinely shorter than
 day-ahead's; the generated report says so explicitly rather than silently
 padding.
+
+**P3 addition: imbalance + post/pre foresight.** For every (config, zone,
+window) above, two further co-optimized runs are added, both with
+`energy_markets=("day_ahead", "imbalance")` (docs/bess-cooptimizer-design.md
+§6 -- a BESS *chooses* its imbalance exposure, so it is a second
+dispatchable energy market sharing the one SoC/power budget with
+day-ahead, not passive settlement): `foresight="perfect"` (the oracle,
+settled and scheduled on actuals) and `foresight="forecast"` (pre mode,
+scheduled on a causal lag-24h-persistence forecast of every schedulable
+series, settled on actuals -- `shared/bess_simulator.py:_lag24h_forecast`).
+Two headline figures follow: the **imbalance uplift** (perfect-foresight
+total WITH imbalance minus the day-ahead-only co-optimized total already
+computed above) and the **post − pre gap** (perfect minus forecast
+foresight, both with imbalance enabled) -- the monetary value of forecast
+skill, a *floor* given the lag-24h forecast (docs/bess-cooptimizer-design.md
+§5: a richer forecast could only narrow it). `imbalance`'s own confirmed-
+live history (~35 days at generation time) is shorter than day-ahead's, so
+these two figures are reported with the same data-coverage caveat as the
+capacity legs -- see §5's own notes.
 """
 
 import logging
@@ -206,10 +225,23 @@ def main() -> None:
                 capacity_series = _capacity_series_by_leg(db, zone, config, start, end)
                 phantom = phantom_capacity_revenue(threshold_result, config, capacity_series)
 
+                # P3: imbalance-enabled perfect- and forecast-foresight runs,
+                # same config/zone/window (module docstring's P3 paragraph).
+                imbalance_config = replace(
+                    cooptimized_config, energy_markets=("day_ahead", "imbalance")
+                )
+                perfect_imbalance_result: BacktestResult = run_backtest(
+                    db, zone, start, end, imbalance_config
+                )
+                forecast_imbalance_result: BacktestResult = run_backtest(
+                    db, zone, start, end, replace(imbalance_config, foresight="forecast")
+                )
+
                 logger.info(
                     "%s / %s / %s: threshold total_all_dkk=%.2f cooptimized total_all_dkk=%.2f "
                     "phantom_dkk=%.2f (%.1f%% of threshold capacity_dkk) phantom_eur=%.2f "
-                    "(%.1f%% of threshold capacity_eur)",
+                    "(%.1f%% of threshold capacity_eur) perfect+imbalance total_all_dkk=%.2f "
+                    "forecast+imbalance total_all_dkk=%.2f",
                     config_label,
                     zone,
                     window_label,
@@ -219,6 +251,8 @@ def main() -> None:
                     phantom["phantom_fraction_dkk"] * 100,
                     phantom["phantom_capacity_revenue_eur"],
                     phantom["phantom_fraction_eur"] * 100,
+                    perfect_imbalance_result.total_revenue_all_dkk,
+                    forecast_imbalance_result.total_revenue_all_dkk,
                 )
 
                 records.append(
@@ -231,6 +265,8 @@ def main() -> None:
                         "threshold": threshold_result,
                         "cooptimized": cooptimized_result,
                         "phantom": phantom,
+                        "perfect_imbalance": perfect_imbalance_result,
+                        "forecast_imbalance": forecast_imbalance_result,
                     }
                 )
 
@@ -315,6 +351,38 @@ def _eur_crowd_out_cases(records: list[dict]) -> list[dict]:
         if threshold_eur > 0 and cooptimized_eur < 0.01 * threshold_eur:
             cases.append(r)
     return cases
+
+
+def _pre_leq_post_violations(records: list[dict]) -> list[dict]:
+    """
+    Sanity check (never expected to fire, per `foresight="forecast"`'s
+    docstring guarantee): a forecast-foresight total that EXCEEDS the
+    perfect-foresight total on the same (config, zone, window) would mean
+    the theoretical `pre <= post` guarantee failed on real data -- computed
+    and reported explicitly rather than assumed.
+    """
+    return [
+        r
+        for r in records
+        if r["forecast_imbalance"].total_revenue_all_dkk
+        > r["perfect_imbalance"].total_revenue_all_dkk + 1e-6
+    ]
+
+
+def _negative_imbalance_uplift_cases(records: list[dict]) -> list[dict]:
+    """
+    Sanity check: adding a second dispatchable energy market to the SAME
+    shared power/SoC budget can never make the perfect-foresight optimum
+    WORSE (the day-ahead-only schedule is itself always still feasible once
+    imbalance is added as an option) -- a negative uplift here would be a
+    genuine bug, not an expected outcome, so it's surfaced explicitly.
+    """
+    return [
+        r
+        for r in records
+        if r["perfect_imbalance"].total_revenue_all_dkk
+        < r["cooptimized"].total_revenue_all_dkk - 1e-6
+    ]
 
 
 def _render_report(*, records: list[dict], skipped_zones: list[str]) -> list[str]:
@@ -548,6 +616,107 @@ def _render_report(*, records: list[dict], skipped_zones: list[str]) -> list[str
         "co-optimized capacity/activation totals equally, so it does not bias the phantom",
         "fraction (a ratio of the threshold's own booked revenue) but does mean the absolute DKK/",
         "EUR figures above are a floor, not a ceiling, on what a fully-covered history would show.",
+        "",
+    ]
+
+    # --- §5: P3 -- imbalance uplift + post/pre foresight gap --------------------
+    total_imbalance_uplift = sum(
+        r["perfect_imbalance"].total_revenue_all_dkk - r["cooptimized"].total_revenue_all_dkk
+        for r in records
+    )
+    total_post_pre_gap = sum(
+        r["perfect_imbalance"].total_revenue_all_dkk
+        - r["forecast_imbalance"].total_revenue_all_dkk
+        for r in records
+    )
+    lines += [
+        "## 5. P3: imbalance uplift + post − pre foresight gap",
+        "",
+        "Two further co-optimized runs per (config, zone, window) row above, both with",
+        '`energy_markets=("day_ahead", "imbalance")` -- a BESS *chooses* its imbalance exposure,',
+        "so it is a second dispatchable energy market sharing the day-ahead leg's power/SoC",
+        "budget, not passive settlement (docs/bess-cooptimizer-design.md §6).",
+        "",
+        f"**Imbalance uplift (perfect foresight):** {_fmt(total_imbalance_uplift)} DKK, summed",
+        "across every row -- perfect-foresight total WITH imbalance minus the day-ahead-only",
+        "co-optimized total already shown in §3. Can never be negative (adding a second",
+        "dispatchable market to the same shared budget can only weakly improve the optimum) --",
+        "see the sanity check below.",
+        "",
+        f"**Post − pre foresight gap:** {_fmt(total_post_pre_gap)} DKK, summed across every",
+        "row -- perfect minus forecast foresight, both with imbalance enabled. This is the",
+        "monetary value of forecast skill; with the lag-24h-persistence forecast",
+        "(`shared/bess_simulator.py:_lag24h_forecast`) this is a conservative *floor* on that",
+        "value (docs/bess-cooptimizer-design.md §5) -- a richer forecast (e.g. the M6 LightGBM",
+        "day-ahead/FCR-D models) could only narrow it, never widen it beyond what this lag-24h",
+        "floor already shows.",
+        "",
+        "| config | zone | window | day-ahead-only (perfect) | +imbalance (perfect) | "
+        "imbalance uplift | +imbalance (forecast) | post − pre gap | gap % of post |",
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
+    for r in records:
+        da_only = r["cooptimized"].total_revenue_all_dkk
+        perfect_imb = r["perfect_imbalance"].total_revenue_all_dkk
+        forecast_imb = r["forecast_imbalance"].total_revenue_all_dkk
+        uplift = perfect_imb - da_only
+        gap = perfect_imb - forecast_imb
+        gap_pct = (gap / abs(perfect_imb)) if perfect_imb else float("nan")
+        lines.append(
+            f"| {r['config_label']} | {r['zone']} | {r['window_label']} | {_fmt(da_only)} | "
+            f"{_fmt(perfect_imb)} | {_fmt(uplift)} | {_fmt(forecast_imb)} | {_fmt(gap)} | "
+            f"{_fmt_pct(gap_pct)} |"
+        )
+    lines.append("")
+
+    pre_leq_post_violations = _pre_leq_post_violations(records)
+    negative_uplift_cases = _negative_imbalance_uplift_cases(records)
+    lines += [
+        "**Sanity checks (computed, not assumed):**",
+        "",
+    ]
+    if pre_leq_post_violations:
+        lines.append(
+            f"- **`pre <= post` VIOLATED on {len(pre_leq_post_violations)} row(s)** -- this "
+            "should be impossible per `foresight=\"forecast\"`'s own guarantee and would "
+            "indicate a real bug, not an expected finding:"
+        )
+        for r in pre_leq_post_violations:
+            lines.append(
+                f"  - {r['config_label']} / {r['zone']} / {r['window_label']}: forecast "
+                f"{_fmt(r['forecast_imbalance'].total_revenue_all_dkk)} > perfect "
+                f"{_fmt(r['perfect_imbalance'].total_revenue_all_dkk)}"
+            )
+    else:
+        lines.append(
+            f"- `pre <= post` holds on all {len(records)} row(s) -- no forecast-foresight total "
+            "exceeds its own row's perfect-foresight total."
+        )
+    if negative_uplift_cases:
+        lines.append(
+            f"- **Imbalance uplift NEGATIVE on {len(negative_uplift_cases)} row(s)** -- should "
+            "be impossible (a second dispatchable market can only weakly improve the perfect-"
+            "foresight optimum) and would indicate a real bug:"
+        )
+        for r in negative_uplift_cases:
+            lines.append(
+                f"  - {r['config_label']} / {r['zone']} / {r['window_label']}: +imbalance "
+                f"{_fmt(r['perfect_imbalance'].total_revenue_all_dkk)} < day-ahead-only "
+                f"{_fmt(r['cooptimized'].total_revenue_all_dkk)}"
+            )
+    else:
+        lines.append(
+            f"- Imbalance uplift is >= 0 on all {len(records)} row(s) -- adding imbalance never "
+            "made the perfect-foresight optimum worse."
+        )
+    lines.append("")
+    lines += [
+        "**Data-coverage caveat (P3).** `imbalance`'s own confirmed-live history is shorter than",
+        "day-ahead's at generation time (~35 days vs. day-ahead's ~297) -- the 90d window rows",
+        "above therefore only have imbalance prices to dispatch against for part of the window",
+        "(no price that period simply means 0 MW dispatched there, same convention as every",
+        "other leg in this report), so both the imbalance uplift and the post − pre gap are a",
+        "floor on what a fully-covered imbalance history would show, not a ceiling.",
         "",
     ]
 

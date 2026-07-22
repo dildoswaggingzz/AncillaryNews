@@ -1,5 +1,6 @@
 """
-Perfect-foresight ("post") linear-program co-optimizer for BESS dispatch.
+Perfect-foresight ("post") and forecast-driven ("pre") linear-program
+co-optimizer for BESS dispatch.
 
 `shared/bess_simulator.py:run_backtest`'s `"threshold"` strategy computes
 energy arbitrage, capacity reservation, and aFRR activation as three
@@ -9,37 +10,44 @@ same MW and the same MWh (see that module's docstring §0 for the exact
 defects this causes, most importantly *double-selling*: booking capacity
 payments for MW the battery has no stored energy left to actually deliver).
 This module fixes that by solving **one linear program per backtest
-window**, over *actual* historical prices (a perfect-foresight oracle, not a
-deployable policy -- see `docs/bess-cooptimizer-design.md` §5 for the
-post/pre distinction; only "post" is built here, P1).
+window** -- see `docs/bess-cooptimizer-design.md` §5 for the post/pre
+distinction (both built here, as of P3) and §6 for the multi-market energy
+stack (day-ahead + imbalance, as of P3).
 
 Exposed through the *existing* `run_backtest` entry point as
 `BessConfig(strategy="cooptimized")` -- `run_backtest` still owns every DB
 call (this module is pure: no DB, no network, so it is unit-testable with
 synthetic series) and passes the already-fetched series in.
 
-**The LP** (docs/bess-cooptimizer-design.md §2). Periods `t = 0..T-1` over
-the day-ahead price timeline (same period/dt_hours convention as the
-threshold engine). Decision variables, all >= 0: `ch[t]`/`dis[t]` (grid
-charge/discharge power, MW), `soc[t]` (state of charge, MWh), and one
-`cap[m, t]` per configured capacity leg `m` (MW committed that period).
-Constraints: SoC balance with split round-trip efficiency
-(`leg_efficiency = round_trip_efficiency ** 0.5`); the usable SoC band;
-ONE shared power budget `ch[t] + dis[t] + sum(cap[m, t] for m) <=
-power_mw`; and the no-double-selling headroom bound -- committed up-reserve
-must be deliverable out of currently stored energy for
+**The LP** (docs/bess-cooptimizer-design.md §2/§6). Periods `t = 0..T-1`
+over the day-ahead price timeline (same period/dt_hours convention as the
+threshold engine). Decision variables, all >= 0: `ch[e, t]`/`dis[e, t]`
+(grid charge/discharge power, MW, **one pair per configured energy market**
+`e` -- `BessConfig.energy_markets`, e.g. `"day_ahead"` and, as of P3,
+`"imbalance"`), `soc[t]` (state of charge, MWh), and one `cap[m, t]` per
+configured capacity leg `m` (MW committed that period). Constraints: SoC
+balance with split round-trip efficiency (`leg_efficiency =
+round_trip_efficiency ** 0.5`), now summed across every energy market:
+
+    soc[t+1] = soc[t] + eta * sum(ch[e, t] for e) * dt[t]
+                       - sum(dis[e, t] for e) * dt[t] / eta
+
+the usable SoC band; ONE shared power budget across every energy market and
+every capacity leg: `sum(ch[e, t] + dis[e, t] for e) + sum(cap[m, t] for m)
+<= power_mw`; and the no-double-selling headroom bound -- committed
+up-reserve must be deliverable out of currently stored energy for
 `activation_endurance_hours` (`T_act`, an *energy-endurance* duration, not a
 ramp time -- a BESS ramps in seconds; see `BessConfig.activation_endurance_hours`'s
 docstring), and committed down-reserve must have room to absorb. **The
 reference rule this implements -- "subtract committed net position before
 offering capacity" -- means the reserve must stay deliverable for the
 *whole* period, not just at its start**: `soc` moves monotonically within a
-period (charge/discharge power is constant over `[t, t+1)`), so binding the
-headroom bound at *both* the start-of-period SoC (`soc[t]`) and the
+period (net charge/discharge power is constant over `[t, t+1)`), so binding
+the headroom bound at *both* the start-of-period SoC (`soc[t]`) and the
 end-of-period SoC (`soc[t+1]`, i.e. after that period's own committed
-arbitrage flow has been applied) is sufficient to guarantee deliverability
+energy flows have been applied) is sufficient to guarantee deliverability
 throughout the whole period -- a single start-only bound leaves a residual
-within-period double-sell (the arbitrage leg discharges toward `soc_min`
+within-period double-sell (the energy legs discharge toward `soc_min`
 *during* the period while the reserve was sized off the higher start-of-period
 SoC):
 
@@ -55,41 +63,105 @@ A leg's direction (`_leg_direction`) is resolved from its product string:
 once, but is paid for (and counted against the power budget) exactly once,
 matching the physical reality of a single symmetric reserve band. A rolling
 24-hour cap on discharge energy is added when `config.max_cycles_per_day`
-is set, mirroring the threshold engine's cycle cap (arbitrage discharge
-only -- capacity commitments are not "cycled" in this estimate, same as
-the threshold engine).
+is set, summed across every energy market's discharge (a physical
+duty-cycle limit on the battery, not a per-market one), mirroring the
+threshold engine's cycle cap.
 
-No binary variable is needed to forbid simultaneous charge/discharge:
-`round_trip_efficiency < 1` makes any `ch[t] > 0 and dis[t] > 0` strictly
-revenue-losing (paying the round-trip loss for no price gain), so the LP
-relaxation's optimum never does it (docs/bess-cooptimizer-design.md §3).
+No binary variable is needed to forbid simultaneous charge/discharge on any
+one energy market: `round_trip_efficiency < 1` makes any `ch[e, t] > 0 and
+dis[e, t] > 0` for the SAME `e` strictly revenue-losing (paying the
+round-trip loss for no price gain), so the LP relaxation's optimum never
+does it (docs/bess-cooptimizer-design.md §3). Simultaneously charging on
+one market and discharging on another in the same period is never optimal
+either, by an identical argument (it nets out to a smaller, loss-incurring
+version of just doing the more profitable one directly) -- but nothing
+*forbids* the solver from momentarily representing it that way at a
+degenerate tie; only the NET flow (and hence `action`/`energy_discharged_mwh`,
+derived from the summed flows) is ever reported.
+
+**Multiple dispatchable energy markets (P3, docs/bess-cooptimizer-design.md
+§6).** Day-ahead alone (`BessConfig.energy_markets = ("day_ahead",)`, the
+default) reproduces P1/P2's single-energy-market behaviour exactly
+(regression-tested). Adding `"imbalance"` lets the LP route discharge to
+whichever of {day-ahead, imbalance} pays more and charge to whichever costs
+less, each period, subject to the ONE shared power/SoC budget above -- this
+models a BESS as the *controllable* asset it is: unlike a wind farm (which
+merely settles a forecast-error deviation against the imbalance price), a
+battery *chooses* its imbalance exposure, so it belongs alongside day-ahead
+as a second dispatchable price, not a passive settlement stream (the design
+doc's earlier "passive-settlement" lean, its §9, is superseded -- see its
+§6). `imbalance` is DKK/MWh, the SAME currency as day-ahead
+(`shared/bess_simulator.py`'s `ENERGY_MARKET_PRODUCT`), so every energy
+market lives entirely inside Solve 1 below -- no new currency handling.
+`BessTick.arbitrage_revenue_dkk` remains the TOTAL energy revenue across
+every configured energy market that tick (the field's meaning is
+unchanged: "energy arbitrage revenue"); a per-market split is not
+persisted (`capacity_revenue_by_market`'s dict shape is a *capacity-leg*
+concept and is deliberately not reused for this -- a future, explicitly
+separate field if ever needed).
+
+**Post vs. pre foresight (P3, docs/bess-cooptimizer-design.md §5).** Every
+price series this module optimises against -- every energy market and
+every capacity leg -- has two roles: a **schedule** price (what the LP's
+objective is built from, i.e. what decides `ch`/`dis`/`cap`) and a
+**settlement** price (what the resulting FIXED schedule's revenue is
+actually reported at, on every `BessTick`). `BessConfig.foresight ==
+"perfect"` (the default) passes the same actual/realised series for both
+roles, so nothing changes from P1/P2's behaviour byte-for-byte.
+`foresight == "forecast"` (pre mode) has `run_backtest` build a causal
+lag-24h-persistence forecast of each schedulable series
+(`shared/bess_simulator.py:_lag24h_forecast`) and pass it in as the
+`schedule_*` parameters below, while the `energy_series_by_market`/
+`capacity_series_by_leg` parameters keep carrying the actual/settlement
+series throughout -- so the LP schedules against what was *expected*, and
+every tick's reported revenue is `Σ actual_price · scheduled_flow`, the
+realistic "you bid on your forecast, you get paid what happened"
+evaluation. The post − pre gap is the monetary value of forecast skill,
+and is guaranteed `>= 0` (`foresight="forecast"` <= `foresight="perfect"`
+on the same window, tests/test_bess_dispatch_milp.py's `pre <= post`
+gate): the fixed forecast-driven schedule is itself one feasible schedule
+the perfect-foresight problem could also have chosen (identical physical
+constraints either way), so its actual-settled value can never exceed the
+perfect-foresight optimum. **aFRR activation revenue is the one exception,
+by design, not oversight**: it is never part of either solve's objective
+in the first place (see the currency-decomposition section below), so
+there is nothing for a "schedule" price to influence -- it is always
+computed from whatever `aFRR_capacity` commitment resulted (decided for
+other, DKK/EUR-capacity-revenue reasons) and the SAME `activation_price_series`
+parameter in both foresight modes; a `schedule_activation_price_series`
+parameter would be a pure no-op, so this module deliberately doesn't add
+one.
 
 **Currency decomposition (docs/bess-cooptimizer-design.md §4) -- P1's
-choice.** A single scalar LP objective can never contain both a DKK term
-and a EUR term without implicitly asserting some exchange rate between
-them -- exactly the unit-mixing bug `shared/units.py` and the threshold
-engine's per-currency buckets exist to prevent. Day-ahead arbitrage is
-unconditionally DKK (the only `price_market` this module reads is
-DKK-denominated per `shared/datasets.py`'s registry), so it can never be
-combined with a EUR capacity term in one objective either. This module
-therefore solves **two separate LPs that share the battery's physical
-trajectory only through the DKK energy leg**, not two independent
-optimizations of the same physical battery:
+choice, unchanged by P3.** A single scalar LP objective can never contain
+both a DKK term and a EUR term without implicitly asserting some exchange
+rate between them -- exactly the unit-mixing bug `shared/units.py` and the
+threshold engine's per-currency buckets exist to prevent. Every configured
+energy market is unconditionally DKK (day-ahead and imbalance both are, per
+`shared/datasets.py`'s registry), so none of them can ever be combined with
+a EUR capacity term in one objective either. This module therefore solves
+**two separate LPs that share the battery's physical trajectory only
+through the DKK energy legs**, not two independent optimizations of the
+same physical battery:
 
-1.  **Solve 1 (DKK)** -- variables `ch`, `dis`, `soc`, and `cap[m, t]` for
-    every DKK-currency leg. Objective: arbitrage revenue + DKK capacity
-    revenue. Subject to the full power budget and headroom bounds (using
-    only the DKK legs, since EUR legs do not exist in this solve at all).
-    This solve's `ch`/`dis`/`soc` trajectory is authoritative for every
-    tick's `action`/`soc_mwh`/`energy_discharged_mwh`/
-    `arbitrage_revenue_dkk` fields -- there is exactly one physical
-    trajectory reported, never two competing ones.
+1.  **Solve 1 (DKK)** -- variables `ch[e, t]`/`dis[e, t]` for every energy
+    market, `soc`, and `cap[m, t]` for every DKK-currency capacity leg.
+    Objective: total energy revenue (across every energy market, at
+    SCHEDULE prices) + DKK capacity revenue (at SCHEDULE prices). Subject
+    to the full power budget and headroom bounds (using only the DKK legs,
+    since EUR legs do not exist in this solve at all). This solve's
+    `ch`/`dis`/`soc` trajectory is authoritative for every tick's
+    `action`/`soc_mwh`/`energy_discharged_mwh` fields -- there is exactly
+    one physical trajectory reported, never two competing ones;
+    `arbitrage_revenue_dkk` is then computed by re-valuing that FIXED
+    trajectory at SETTLEMENT prices (perfect mode: identical to the
+    schedule prices, so this is a no-op re-valuation).
 2.  **Solve 2 (EUR)**, only built if any EUR-currency leg is configured --
     variables `cap[m, t]` for every EUR-currency leg *only*. `ch`, `dis`,
     and `soc` are no longer variables here: they are the fixed numeric
     values Solve 1 already committed to, so Solve 2's power-budget and
     headroom constraints use *leftover* numeric bounds (`power_mw` minus
-    Solve 1's `ch[t] + dis[t] + sum(DKK cap[m, t])`, and the DKK legs'
+    Solve 1's total energy flow across every market, and the DKK legs'
     already-claimed share of headroom subtracted out) -- plain numbers
     derived from Solve 1, not LP variables, so **no DKK quantity is ever a
     decision variable, coefficient, or comparison operand in Solve 2's
@@ -102,24 +174,19 @@ optimizations of the same physical battery:
     `soc_star[t]` and `soc_star[t+1]` and the **tighter (minimum)** of the
     two is what Solve 2 gets to use -- an EUR leg's own commitment must
     stay deliverable throughout the period against Solve 1's already-fixed
-    trajectory, exactly like a same-currency leg would have to.
+    trajectory, exactly like a same-currency leg would have to. Solve 2's
+    objective is likewise built from SCHEDULE prices, and its committed
+    `cap_eur` is re-valued at SETTLEMENT prices for reporting.
 
 This is a deliberate, documented simplification, not the only valid
 decomposition (docs/bess-cooptimizer-design.md §4 leaves the exact choice
 to P1): Solve 1 does not "know about" the EUR legs' revenue potential when
-deciding how much headroom/power to leave for arbitrage vs. its own DKK
-legs, so the combined result is not necessarily the *global* joint optimum
-across both currencies -- but it is always feasible (no double-selling,
-ever, across the whole stack, since Solve 2's bounds are literally what's
-left over after Solve 1's real commitments) and it never mixes currency
-magnitudes. **aFRR activation revenue** (module docstring's aFRR_energy
-price, always EUR per the registry, see
-`shared/bess_simulator.py` module docstring §3) is **not** optimized in
-either solve's objective -- like the threshold engine, it is a derived
-bonus computed *after* solving, from whichever solve committed the
-`"aFRR_capacity"` leg(s) (that market's own currency, resolved via
-`leg_currency`, determines which solve that is), so it never has to be
-weighed against a DKK or EUR capacity price inside an objective either.
+deciding how much headroom/power to leave for energy dispatch vs. its own
+DKK legs, so the combined result is not necessarily the *global* joint
+optimum across both currencies -- but it is always feasible (no
+double-selling, ever, across the whole stack, since Solve 2's bounds are
+literally what's left over after Solve 1's real commitments) and it never
+mixes currency magnitudes.
 
 Solved with PuLP's bundled CBC backend (`pulp.PULP_CBC_CMD`) -- a pure LP
 (no integer variables), so CBC's simplex solve is deterministic for a fixed
@@ -240,6 +307,23 @@ def _assert_currency_partition(
     assert all(leg_currency[k] == "EUR" for k in eur_keys)
 
 
+def _assert_energy_markets_match(
+    energy_markets: tuple[str, ...], energy_series_by_market: dict[str, list]
+) -> None:
+    """
+    `energy_series_by_market`'s keys must be exactly `config.energy_markets`
+    -- a caller (in practice only `run_backtest`, or a test) passing a
+    series dict that doesn't match the configured markets is a genuine
+    caller bug (a market the LP will build variables for with no price
+    series, or a fetched series the LP will never look at), so this fails
+    loud rather than silently ignoring the mismatch either direction.
+    """
+    assert set(energy_series_by_market.keys()) == set(energy_markets), (
+        f"energy_series_by_market's keys {sorted(energy_series_by_market.keys())!r} must "
+        f"exactly match config.energy_markets {sorted(energy_markets)!r}"
+    )
+
+
 def phantom_capacity_revenue(
     result: BacktestResult,
     config: BessConfig,
@@ -264,6 +348,9 @@ def phantom_capacity_revenue(
     corrected framing: a lower co-optimized total on a double-selling
     window is not a co-optimizer regression, and this function is what
     separates "phantom revenue removed" from "real revenue foregone").
+    Unaffected by P3 (multi-market energy, post/pre foresight) -- the
+    threshold engine this function replays stays day_ahead-only and has no
+    schedule/settlement split at all.
 
     For each tick, per configured leg, the maximum MW that leg could
     honestly have committed is bounded by the same headroom rule, evaluated
@@ -389,15 +476,40 @@ def solve_cooptimized_dispatch(
     capacity_series_by_leg: dict[str, list[tuple[datetime, float]]],
     leg_currency: dict[str, str],
     activation_price_series: list[tuple[datetime, float]],
+    energy_series_by_market: dict[str, list[tuple[datetime, float]]] | None = None,
+    schedule_energy_series_by_market: dict[str, list[tuple[datetime, float]]] | None = None,
+    schedule_capacity_series_by_leg: dict[str, list[tuple[datetime, float]]] | None = None,
 ) -> BacktestResult:
     """
-    Solves the perfect-foresight co-optimized dispatch LP (module
-    docstring) over already-fetched series and returns a `BacktestResult`
-    identical in shape to the threshold engine's -- one `BessTick` per
-    `price_series` point, same fields, so `save_bess_run` and the dashboard
-    consume it unchanged. Pure: no DB access, no network -- every input is
-    an in-memory series, so this function is unit-testable with synthetic
+    Solves the co-optimized dispatch LP (module docstring) over
+    already-fetched series and returns a `BacktestResult` identical in
+    shape to the threshold engine's -- one `BessTick` per `price_series`
+    point, same fields, so `save_bess_run` and the dashboard consume it
+    unchanged. Pure: no DB access, no network -- every input is an
+    in-memory series, so this function is unit-testable with synthetic
     data (see `tests/test_bess_dispatch_milp.py`).
+
+    `price_series` still drives the tick timeline (`times`/`dt`/`T`) and
+    the `day_ahead_price` tick field, exactly as in P1/P2 -- unchanged.
+
+    `energy_series_by_market` (P3): every energy market's actual/settlement
+    series, keyed by market name (`config.energy_markets`). Defaults to
+    `None`, in which case (backward-compatible with every P1/P2 call site,
+    including this module's own tests) it is built as
+    `{config.energy_markets[0]: price_series}` -- only valid when
+    `energy_markets` has exactly one entry; a caller configuring more than
+    one energy market MUST pass this explicitly (there is no way to guess
+    which series is which from `price_series` alone).
+
+    `schedule_energy_series_by_market`/`schedule_capacity_series_by_leg`
+    (P3, post/pre foresight -- module docstring): the series each solve's
+    OBJECTIVE is built from (what decides `ch`/`dis`/`cap`), as opposed to
+    `energy_series_by_market`/`capacity_series_by_leg` (the SETTLEMENT
+    series every tick's reported revenue is computed from, once the
+    schedule is fixed). Both default to `None`, meaning "same as
+    settlement" -- `BessConfig.foresight == "perfect"`'s behaviour, and
+    byte-identical to omitting them entirely (tests/test_bess_dispatch_milp.py
+    covers this explicitly).
 
     `capacity_allocation`/`capacity_allocation_fell_back_to_even` are
     threshold-only concepts (that strategy's fixed-split allocator, module
@@ -435,21 +547,54 @@ def solve_cooptimized_dispatch(
     )
     windows = _rolling_24h_window_indices(times) if cap_mwh_per_window is not None else None
 
+    # --- P3: energy markets (module docstring) --------------------------
+    if energy_series_by_market is None:
+        if len(config.energy_markets) != 1:
+            raise ValueError(
+                "energy_series_by_market must be provided explicitly when "
+                f"config.energy_markets has more than one entry (got {config.energy_markets!r})"
+            )
+        energy_series_by_market = {config.energy_markets[0]: price_series}
+    _assert_energy_markets_match(config.energy_markets, energy_series_by_market)
+    energy_markets = list(config.energy_markets)
+
+    # --- P3: schedule vs. settlement (module docstring) -- perfect mode
+    # (the default) makes both identical, so nothing below changes from
+    # P1/P2's behaviour. ---
+    if schedule_energy_series_by_market is None:
+        schedule_energy_series_by_market = energy_series_by_market
+    if schedule_capacity_series_by_leg is None:
+        schedule_capacity_series_by_leg = capacity_series_by_leg
+
+    energy_settlement_price_at_t: dict[str, list[float | None]] = {
+        m: [_value_at_or_before(energy_series_by_market[m], t) for t in times]
+        for m in energy_markets
+    }
+    energy_schedule_price_at_t: dict[str, list[float | None]] = {
+        m: [_value_at_or_before(schedule_energy_series_by_market[m], t) for t in times]
+        for m in energy_markets
+    }
+
     leg_keys = list(capacity_series_by_leg.keys())
     leg_direction: dict[str, Literal["up", "down", "symmetric"]] = {
         key: _leg_direction(*key.split(":", 1)) for key in leg_keys
     }
-    # Per-leg, per-period clearing price (None where no price is available
-    # that period) -- computed once, reused by both solves' objectives and
-    # by the zero-price-period accounting below.
-    leg_price_at_t: dict[str, list[float | None]] = {
+    # Per-leg, per-period clearing price -- SETTLEMENT (what every tick's
+    # reported revenue, and `zero_price_periods_by_leg`, is computed from)
+    # and SCHEDULE (what each solve's objective is built from, i.e. what
+    # decides `cap`) are kept separate; perfect mode makes them identical.
+    leg_settlement_price_at_t: dict[str, list[float | None]] = {
         key: [_value_at_or_before(capacity_series_by_leg[key], t) for t in times]
+        for key in leg_keys
+    }
+    leg_schedule_price_at_t: dict[str, list[float | None]] = {
+        key: [_value_at_or_before(schedule_capacity_series_by_leg[key], t) for t in times]
         for key in leg_keys
     }
 
     zero_price_periods_by_leg: dict[str, int] = defaultdict(int)
     for key in leg_keys:
-        for price in leg_price_at_t[key]:
+        for price in leg_settlement_price_at_t[key]:
             if price == 0.0:
                 zero_price_periods_by_leg[key] += 1
 
@@ -463,12 +608,33 @@ def solve_cooptimized_dispatch(
     eur_down = [k for k in eur_keys if leg_direction[k] in ("down", "symmetric")]
 
     # ---------------------------------------------------------------
-    # Solve 1: arbitrage (DKK) + DKK-currency capacity legs.
+    # Solve 1: energy dispatch (every configured energy market, DKK) +
+    # DKK-currency capacity legs.
     # ---------------------------------------------------------------
     prob1 = pulp.LpProblem("bess_cooptimized_dkk", pulp.LpMaximize)
 
-    ch = [pulp.LpVariable(f"ch_{i}", lowBound=0) for i in range(T)]
-    dis = [pulp.LpVariable(f"dis_{i}", lowBound=0) for i in range(T)]
+    ch: dict[str, list[pulp.LpVariable]] = {}
+    dis: dict[str, list[pulp.LpVariable]] = {}
+    for m in energy_markets:
+        ch_vars = []
+        dis_vars = []
+        for i in range(T):
+            ch_var = pulp.LpVariable(f"ch_{m}_{i}", lowBound=0)
+            dis_var = pulp.LpVariable(f"dis_{m}_{i}", lowBound=0)
+            if energy_schedule_price_at_t[m][i] is None:
+                # No SCHEDULE price known this period for this energy
+                # market -- never dispatch against it then (mirrors the
+                # capacity legs' None-price handling below): pinned to 0
+                # rather than left to an arbitrary zero-objective-
+                # coefficient vertex, for a deterministic, reproducible
+                # solve.
+                ch_var.upBound = 0
+                dis_var.upBound = 0
+            ch_vars.append(ch_var)
+            dis_vars.append(dis_var)
+        ch[m] = ch_vars
+        dis[m] = dis_vars
+
     # soc[0] is the fixed starting SoC (a plain number, not a variable);
     # soc[1..T] are the LP's SoC-at-end-of-period variables, bounded to the
     # usable band throughout.
@@ -481,8 +647,8 @@ def solve_cooptimized_dispatch(
         variables = []
         for i in range(T):
             var = pulp.LpVariable(f"cap_{key.replace(':', '_')}_{i}", lowBound=0)
-            if leg_price_at_t[key][i] is None:
-                # No clearing price known this period -- never offer this
+            if leg_schedule_price_at_t[key][i] is None:
+                # No SCHEDULE price known this period -- never offer this
                 # leg then (module docstring: pinned to 0 rather than left
                 # to an arbitrary zero-objective-coefficient vertex, for a
                 # deterministic, reproducible solve).
@@ -491,15 +657,20 @@ def solve_cooptimized_dispatch(
         cap_dkk[key] = variables
 
     for i in range(T):
-        # SoC balance, split round-trip efficiency (module docstring).
-        prob1 += soc[i + 1] == soc[i] + eta * ch[i] * dt[i] - (dis[i] * dt[i]) / eta
-        # One shared power budget across arbitrage and every DKK leg.
+        total_ch_i = pulp.lpSum(ch[m][i] for m in energy_markets)
+        total_dis_i = pulp.lpSum(dis[m][i] for m in energy_markets)
+        # SoC balance, split round-trip efficiency, summed across every
+        # energy market (module docstring).
+        prob1 += soc[i + 1] == soc[i] + eta * total_ch_i * dt[i] - (total_dis_i * dt[i]) / eta
+        # One shared power budget across every energy market and every DKK
+        # leg.
         prob1 += (
-            ch[i] + dis[i] + pulp.lpSum(cap_dkk[k][i] for k in dkk_keys) <= config.power_mw
+            total_ch_i + total_dis_i + pulp.lpSum(cap_dkk[k][i] for k in dkk_keys)
+            <= config.power_mw
         )
         # No-double-selling headroom, bound at BOTH the start-of-period SoC
-        # (soc[i], before this period's own charge/discharge) and the
-        # end-of-period SoC (soc[i+1], after it) -- see module docstring:
+        # (soc[i], before this period's own energy flows) and the
+        # end-of-period SoC (soc[i+1], after them) -- see module docstring:
         # SoC moves monotonically within a period at constant power, so
         # binding both endpoints guarantees deliverability throughout the
         # whole period, closing the residual within-period double-sell a
@@ -513,12 +684,19 @@ def solve_cooptimized_dispatch(
 
     if cap_mwh_per_window is not None:
         for i in range(T):
-            prob1 += pulp.lpSum(dis[j] * dt[j] for j in windows[i]) <= cap_mwh_per_window
+            prob1 += (
+                pulp.lpSum(dis[m][j] * dt[j] for m in energy_markets for j in windows[i])
+                <= cap_mwh_per_window
+            )
 
-    objective1 = pulp.lpSum(prices[i] * (dis[i] - ch[i]) * dt[i] for i in range(T))
+    objective1 = pulp.lpSum(
+        (energy_schedule_price_at_t[m][i] or 0.0) * (dis[m][i] - ch[m][i]) * dt[i]
+        for m in energy_markets
+        for i in range(T)
+    )
     for key in dkk_keys:
         objective1 += pulp.lpSum(
-            (leg_price_at_t[key][i] or 0.0) * cap_dkk[key][i] * dt[i] for i in range(T)
+            (leg_schedule_price_at_t[key][i] or 0.0) * cap_dkk[key][i] * dt[i] for i in range(T)
         )
     prob1 += objective1
 
@@ -530,8 +708,8 @@ def solve_cooptimized_dispatch(
             f"[{start_time}, {end_time}]"
         )
 
-    ch_star = [pulp.value(v) or 0.0 for v in ch]
-    dis_star = [pulp.value(v) or 0.0 for v in dis]
+    ch_star = {m: [pulp.value(v) or 0.0 for v in ch[m]] for m in energy_markets}
+    dis_star = {m: [pulp.value(v) or 0.0 for v in dis[m]] for m in energy_markets}
     soc_star = [starting_soc] + [pulp.value(v) or 0.0 for v in soc[1:]]
     cap_dkk_star = {k: [pulp.value(v) or 0.0 for v in cap_dkk[k]] for k in dkk_keys}
 
@@ -551,14 +729,17 @@ def solve_cooptimized_dispatch(
             variables = []
             for i in range(T):
                 var = pulp.LpVariable(f"cap_{key.replace(':', '_')}_{i}", lowBound=0)
-                if leg_price_at_t[key][i] is None:
+                if leg_schedule_price_at_t[key][i] is None:
                     var.upBound = 0
                 variables.append(var)
             cap_eur[key] = variables
 
         for i in range(T):
+            total_energy_flow_i = sum(ch_star[m][i] + dis_star[m][i] for m in energy_markets)
             dkk_committed = sum(cap_dkk_star[k][i] for k in dkk_keys)
-            power_leftover = max(config.power_mw - ch_star[i] - dis_star[i] - dkk_committed, 0.0)
+            power_leftover = max(
+                config.power_mw - total_energy_flow_i - dkk_committed, 0.0
+            )
             prob2 += pulp.lpSum(cap_eur[k][i] for k in eur_keys) <= power_leftover
 
             # Leftover headroom, same start/end-of-period reasoning as
@@ -582,7 +763,7 @@ def solve_cooptimized_dispatch(
             prob2 += pulp.lpSum(cap_eur[k][i] for k in eur_down) * t_act <= down_headroom_leftover
 
         objective2 = pulp.lpSum(
-            (leg_price_at_t[key][i] or 0.0) * cap_eur[key][i] * dt[i]
+            (leg_schedule_price_at_t[key][i] or 0.0) * cap_eur[key][i] * dt[i]
             for key in eur_keys
             for i in range(T)
         )
@@ -600,7 +781,11 @@ def solve_cooptimized_dispatch(
         cap_eur_star = {}
 
     # ---------------------------------------------------------------
-    # Walk the combined solution into one BessTick per period.
+    # Walk the combined solution into one BessTick per period. Every
+    # reported revenue figure re-values the FIXED schedule (ch_star/
+    # dis_star/cap_dkk_star/cap_eur_star) at SETTLEMENT prices (P3) --
+    # in perfect mode settlement == schedule, so this is a no-op
+    # re-valuation and every number is identical to P1/P2.
     # ---------------------------------------------------------------
     ticks: list[BessTick] = []
     cumulative_arbitrage = 0.0
@@ -609,7 +794,8 @@ def solve_cooptimized_dispatch(
     cumulative_afrr_activation = 0.0
 
     for i in range(T):
-        ch_i, dis_i = ch_star[i], dis_star[i]
+        ch_i = sum(ch_star[m][i] for m in energy_markets)
+        dis_i = sum(dis_star[m][i] for m in energy_markets)
         if dis_i > _EPS and dis_i >= ch_i:
             action = "discharge"
         elif ch_i > _EPS:
@@ -618,7 +804,12 @@ def solve_cooptimized_dispatch(
             action = "idle"
 
         energy_discharged_mwh = dis_i * dt[i] if action == "discharge" else 0.0
-        arbitrage_revenue = prices[i] * (dis_i - ch_i) * dt[i]
+        arbitrage_revenue = sum(
+            (energy_settlement_price_at_t[m][i] or 0.0)
+            * (dis_star[m][i] - ch_star[m][i])
+            * dt[i]
+            for m in energy_markets
+        )
         cumulative_arbitrage += arbitrage_revenue
 
         capacity_revenue_by_market: dict[str, float] = {}
@@ -630,7 +821,7 @@ def solve_cooptimized_dispatch(
         for key in dkk_keys:
             mw = cap_dkk_star[key][i]
             capacity_reserved_mw += mw
-            revenue = (leg_price_at_t[key][i] or 0.0) * mw * dt[i]
+            revenue = (leg_settlement_price_at_t[key][i] or 0.0) * mw * dt[i]
             capacity_revenue_by_market[key] = revenue
             capacity_revenue_dkk_tick += revenue
             if key.split(":", 1)[0] == "aFRR_capacity":
@@ -638,7 +829,7 @@ def solve_cooptimized_dispatch(
         for key in eur_keys:
             mw = cap_eur_star[key][i]
             capacity_reserved_mw += mw
-            revenue = (leg_price_at_t[key][i] or 0.0) * mw * dt[i]
+            revenue = (leg_settlement_price_at_t[key][i] or 0.0) * mw * dt[i]
             capacity_revenue_by_market[key] = revenue
             capacity_revenue_eur_tick += revenue
             if key.split(":", 1)[0] == "aFRR_capacity":
@@ -649,7 +840,10 @@ def solve_cooptimized_dispatch(
 
         # aFRR activation revenue (module docstring): a derived bonus from
         # whichever solve committed the aFRR_capacity leg(s), never itself
-        # part of either solve's objective.
+        # part of either solve's objective -- and, unlike every other
+        # revenue figure here, never has a schedule/settlement split
+        # either (module docstring's post/pre section): `activation_price_series`
+        # is always the actual/settlement series, in both foresight modes.
         activation_price = (
             _value_at_or_before(activation_price_series, times[i]) if afrr_committed_mw else None
         )
@@ -665,7 +859,9 @@ def solve_cooptimized_dispatch(
 
         cycle_cap_binding = False
         if cap_mwh_per_window is not None:
-            rolling_discharged = sum(dis_star[j] * dt[j] for j in windows[i])
+            rolling_discharged = sum(
+                dis_star[m][j] * dt[j] for m in energy_markets for j in windows[i]
+            )
             cycle_cap_binding = rolling_discharged >= cap_mwh_per_window - _EPS
 
         ticks.append(
