@@ -1531,3 +1531,136 @@ def test_fetch_daily_aggregates_returns_mapped_rows(db, pooled_conn):
     assert result[0]["sample_count"] == 24
     query = cursor.execute.call_args.args[0]
     assert "GROUP BY day" in query
+
+
+# --- M6+ supply-event features (docs/supply-event-features-design.md §2/§4) --
+
+
+def test_save_market_event_inserts_all_fields(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    known_at = datetime(2026, 7, 15, 7, 11, 50, tzinfo=UTC)
+    extracted_at = datetime(2026, 7, 20, 12, 0, tzinfo=UTC)
+    db.save_market_event(
+        event_id="evt-1",
+        event_type="prequalification",
+        market="FCR",
+        zone="DK2",
+        direction="up",
+        magnitude_mw=20.0,
+        effective_from=date(2026, 9, 1),
+        known_at=known_at,
+        confidence=0.9,
+        source_url="https://example.test/article",
+        source_title="A battery prequalifies",
+        source_tier="tier1",
+        raw_excerpt="A 20 MW battery prequalified.",
+        extracted_at=extracted_at,
+    )
+
+    cursor.execute.assert_called_once()
+    query, params = cursor.execute.call_args.args
+    assert "INSERT INTO market_events" in query
+    assert "ON CONFLICT (event_id) DO NOTHING" in query
+    assert params == (
+        "evt-1",
+        "prequalification",
+        "FCR",
+        "DK2",
+        "up",
+        20.0,
+        date(2026, 9, 1),
+        known_at,
+        0.9,
+        "https://example.test/article",
+        "A battery prequalifies",
+        "tier1",
+        "A 20 MW battery prequalified.",
+        extracted_at,
+    )
+    conn.commit.assert_called_once()
+    mock_pool.putconn.assert_called_once_with(conn)
+
+
+def test_save_market_event_rolls_back_and_reraises_on_failure(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.execute.side_effect = RuntimeError("insert failed")
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    with pytest.raises(RuntimeError):
+        db.save_market_event(
+            event_id="evt-1",
+            event_type="outage",
+            market=None,
+            zone="DK1",
+            direction=None,
+            magnitude_mw=None,
+            effective_from=None,
+            known_at=datetime(2026, 7, 15, tzinfo=UTC),
+            confidence=0.5,
+            source_url="https://example.test/article",
+            source_title=None,
+            source_tier=None,
+            raw_excerpt="An outage occurred.",
+            extracted_at=datetime(2026, 7, 20, tzinfo=UTC),
+        )
+
+    conn.rollback.assert_called_once()
+    mock_pool.putconn.assert_called_once_with(conn)
+
+
+def test_fetch_market_events_maps_rows_and_filters_by_known_at(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [
+        (
+            "evt-1",
+            "prequalification",
+            "FCR",
+            "DK2",
+            "up",
+            20.0,
+            date(2026, 9, 1),
+            datetime(2026, 7, 15, tzinfo=UTC),
+            0.9,
+            "tier1",
+        ),
+    ]
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    cutoff = datetime(2026, 7, 20, tzinfo=UTC)
+    result = db.fetch_market_events(known_at_before=cutoff)
+
+    query, params = cursor.execute.call_args.args
+    assert "FROM market_events" in query
+    assert "known_at <=" in query
+    assert params == (cutoff,)
+    assert result == [
+        {
+            "event_id": "evt-1",
+            "event_type": "prequalification",
+            "market": "FCR",
+            "zone": "DK2",
+            "direction": "up",
+            "magnitude_mw": 20.0,
+            "effective_from": date(2026, 9, 1),
+            "known_at": datetime(2026, 7, 15, tzinfo=UTC),
+            "confidence": 0.9,
+            "source_tier": "tier1",
+        }
+    ]
+    mock_pool.putconn.assert_called_once_with(conn)
+
+
+def test_fetch_market_events_returns_empty_list_when_none_match(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.fetchall.return_value = []
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    result = db.fetch_market_events(known_at_before=datetime(2026, 7, 20, tzinfo=UTC))
+
+    assert result == []

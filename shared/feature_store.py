@@ -114,6 +114,48 @@ same idea, applied to every column after all rows are built: an all-null
 column is logged (real operational signal -- a corridor/series with a data
 gap covering the whole window) but never dropped from the schema.
 
+**M6+ supply-event features** (`docs/supply-event-features-design.md`,
+`init-db/08-market-events.sql`, `shared/event_extractor.py`,
+`services/crawler/main.py`): a *second*, deliberately different leak rule
+from the RULE-A/RULE-B ones above -- an event's `known_at` (the article's
+`published` timestamp, assigned by the crawler, never the model) gates
+availability for a decision at `decision_time`; `effective_from` (when the
+announced capacity actually lands) is a **value** inside the feature, never
+the availability key (design §1's "the trap": keying on `effective_from`
+instead would leak the future -- an event about capacity effective
+2026-09-01 but reported 2026-07-15 is knowable *from* 2026-07-15, not from
+2026-09-01). `_fetch_events`/`_event_features` below implement this: one
+broad `db.fetch_market_events(known_at_before=<latest decision_time in this
+call>)` read (mirroring the RULE-B "fetch wide, join narrow per row" shape),
+then a strict `known_at <= decision_time` filter applied again per row (the
+actual leak gate; the DB-layer bound is only an upper-bound optimization,
+never itself relied on for correctness -- see `tests/test_feature_store.py`'s
+dedicated M6+ section, written before this code, per the task's "write the
+leak test first" instruction).
+
+Matching is on **zone alone** -- `build_features` has no `market` or
+`direction` parameter at all (its grain is `(zone, horizon)`), so despite
+design §5's "matched to the row's market/zone/direction" phrasing, only the
+zone dimension actually exists to match against here; a null-zone event is
+conservatively excluded from zone-specific columns rather than assumed to
+apply to every zone. Flagged here as a genuine design-doc/interface gap, not
+silently resolved.
+
+**Honesty over false population** (design §0/§5's "do not make the sparse
+columns look more populated than they are"): `announced_mw_entering_90d`,
+`net_demand_volume_change_30d`, and `days_since_last_supply_event` default to
+`None` -- not `0.0` -- when no matching event informs them, specifically so
+`_log_event_feature_fill_rate`'s fill-rate log reflects genuine informedness
+(design's own example: "event features non-null in 2.1% of rows"). Defaulting
+a summed column to `0.0` would make every row look 100%-populated with a
+real, asserted zero, which overstates what a crawler running ~1 month
+(design §0) can actually know: "no event observed in our news sample" is not
+the same claim as "zero really happened". `regime_change_within_horizon` is
+the one exception -- a boolean flag is naturally two-valued (`False` is
+itself the correct, real default absent evidence, the same convention
+`_calendar_features`'s `is_danish_public_holiday` already uses), so it is
+never `None`; its fill rate is instead logged as "fraction `True`".
+
 **`atc_saturated` was removed** (coordinator review): design §5 asks for a
 flag comparing realised cross-border flow against `aFRR_border_atc`'s
 import/export limits, but that dataset (`AfrrBorderAvailableTransferCapacity`)
@@ -207,6 +249,50 @@ KNOWN_BORDER_CORRIDORS: tuple[str, ...] = ("DK1-DE", "DK1-NL", "DK2-DE", "DK2-DK
 MAX_FORECAST_ERROR_LOOKBACK_HOURS = 24
 
 COPENHAGEN_TZ = ZoneInfo("Europe/Copenhagen")
+
+# --- M6+ supply-event feature constants (docs/supply-event-features-design.md §5) ---
+
+# "Σ magnitude_mw of prequalification/commissioning events" (design §5,
+# stated verbatim) -- `announced_mw_entering_90d`'s event-type filter.
+SUPPLY_ENTERING_EVENT_TYPES = frozenset({"prequalification", "capacity_commissioning"})
+
+# Types counted toward `days_since_last_supply_event`'s recency: physical
+# capacity/availability change events. Deliberately excludes
+# `demand_volume_change` (a demand-side, not supply-side, signal -- it has
+# its own column) and `regime_change`/`other` (not a capacity event at all).
+# The design names the column "supply event" but does not enumerate the set
+# precisely -- this is a documented, reasoned choice, not a design-doc fact.
+SUPPLY_EVENT_TYPES = frozenset(
+    {"prequalification", "capacity_commissioning", "capacity_retirement", "outage"}
+)
+
+# `announced_mw_entering_90d`'s forward window (design §5, stated verbatim:
+# "effective_from ∈ [decision_time, decision_time + 90d]").
+ANNOUNCED_MW_FORWARD_WINDOW = timedelta(days=90)
+
+# `net_demand_volume_change_30d`'s trailing window (design §5, stated
+# verbatim: "known in the trailing 30 days").
+DEMAND_VOLUME_TRAILING_WINDOW = timedelta(days=30)
+
+# `regime_change_within_horizon`'s "configured forward window" (design §5
+# asks for one but does not name a value) -- deliberately set equal to
+# `ANNOUNCED_MW_FORWARD_WINDOW` for consistency with the other forward-
+# looking event column rather than inventing an unrelated number; flagged as
+# a build-time choice, not a design-doc fact.
+REGIME_CHANGE_FORWARD_WINDOW = timedelta(days=90)
+
+# `days_since_last_supply_event`'s cap (design §5: "capped/null when none",
+# no value named) -- one year is long enough to be uninformative either way
+# for a market that moves on weeks-to-months timescales, so a duller signal
+# beyond it is deliberately clipped rather than left to grow unbounded.
+DAYS_SINCE_SUPPLY_EVENT_CAP = 365
+
+EVENT_COLUMN_NAMES: tuple[str, ...] = (
+    "announced_mw_entering_90d",
+    "net_demand_volume_change_30d",
+    "regime_change_within_horizon",
+    "days_since_last_supply_event",
+)
 
 
 @dataclass(frozen=True)
@@ -470,6 +556,122 @@ def _wind_forecast_error_lag_1(
     return None
 
 
+# --- M6+ supply-event feature helpers -----------------------------------------
+
+
+def _fetch_events(db: DatabaseManager, latest_decision_time: datetime) -> list[dict]:
+    """
+    One broad `fetch_market_events(known_at_before=latest_decision_time)`
+    read for the whole `build_features` call -- `latest_decision_time` is
+    `mtu_grid[-1] - horizon`, the latest (least restrictive) decision time
+    any row in this call can have, so this single fetch is guaranteed to
+    contain every event any row could legitimately use. The strict,
+    per-row `known_at <= decision_time` gate is re-applied in
+    `_event_features` below for every individual row -- this fetch is an
+    upper-bound optimization only, never itself the leak-safety boundary
+    (mirrors the RULE-B "fetch wide, join narrow" shape used for raw series
+    elsewhere in this module).
+    """
+    return db.fetch_market_events(known_at_before=latest_decision_time)
+
+
+def _event_features(events: list[dict], zone: str, decision_time: datetime) -> dict:
+    """
+    Design §5's four derived event columns, computed for one row's own
+    `decision_time`. Every event considered here is first required to pass
+    `known_at <= decision_time` (design §1's leak gate, re-applied per row --
+    see `_fetch_events`) and `event["zone"] == zone` (this module's grain has
+    no market/direction dimension to match on; see module docstring).
+
+    Always returns all four keys -- schema determinism (design §5.2) does
+    not bend for event columns any more than it does for anything else in
+    this module.
+    """
+    knowable = [e for e in events if e["known_at"] <= decision_time and e["zone"] == zone]
+
+    entering_window_end = decision_time + ANNOUNCED_MW_FORWARD_WINDOW
+    entering_terms = [
+        e["magnitude_mw"] * e["confidence"]
+        for e in knowable
+        if e["event_type"] in SUPPLY_ENTERING_EVENT_TYPES
+        and e["magnitude_mw"] is not None
+        and e["effective_from"] is not None
+        and decision_time.date() <= e["effective_from"] <= entering_window_end.date()
+    ]
+    announced_mw_entering_90d = sum(entering_terms) if entering_terms else None
+
+    demand_window_start = decision_time - DEMAND_VOLUME_TRAILING_WINDOW
+    demand_terms = [
+        e["magnitude_mw"] * e["confidence"]
+        for e in knowable
+        if e["event_type"] == "demand_volume_change"
+        and e["magnitude_mw"] is not None
+        and demand_window_start <= e["known_at"] <= decision_time
+    ]
+    net_demand_volume_change_30d = sum(demand_terms) if demand_terms else None
+
+    regime_window_end = decision_time + REGIME_CHANGE_FORWARD_WINDOW
+    regime_change_within_horizon = any(
+        e["event_type"] == "regime_change"
+        and e["effective_from"] is not None
+        and decision_time.date() <= e["effective_from"] <= regime_window_end.date()
+        for e in knowable
+    )
+
+    supply_known_ats = [e["known_at"] for e in knowable if e["event_type"] in SUPPLY_EVENT_TYPES]
+    if supply_known_ats:
+        most_recent = max(supply_known_ats)
+        days_since = (decision_time - most_recent).total_seconds() / 86400
+        days_since_last_supply_event = min(days_since, DAYS_SINCE_SUPPLY_EVENT_CAP)
+    else:
+        days_since_last_supply_event = None
+
+    return {
+        "announced_mw_entering_90d": announced_mw_entering_90d,
+        "net_demand_volume_change_30d": net_demand_volume_change_30d,
+        "regime_change_within_horizon": regime_change_within_horizon,
+        "days_since_last_supply_event": days_since_last_supply_event,
+    }
+
+
+def _log_event_feature_fill_rate(
+    zone: str, horizon: timedelta, start: datetime, end: datetime, rows: list[dict]
+) -> None:
+    """
+    Design §5's mandatory honesty requirement: logs what fraction of rows
+    actually carry event-derived signal, so a 99%-null reality (design §0:
+    ~1 month of crawled news, forward-accrual only) is visible in the logs
+    rather than silently shipped as if these columns carried historical
+    signal they do not have yet. INFO, not WARNING -- sparse-to-empty is the
+    *expected* state today (design §0), not an operational problem to
+    escalate on, unlike `_log_all_null_columns`'s data-gap warning.
+    """
+    if not rows:
+        return
+    n = len(rows)
+    non_null_rate = {
+        col: sum(1 for r in rows if r[col] is not None) / n
+        for col in ("announced_mw_entering_90d", "net_demand_volume_change_30d")
+    }
+    days_since_rate = sum(1 for r in rows if r["days_since_last_supply_event"] is not None) / n
+    regime_true_rate = sum(1 for r in rows if r["regime_change_within_horizon"]) / n
+    logger.info(
+        "build_features(zone=%s, horizon=%s) event feature fill rate over [%s, %s] (n=%d rows): "
+        "announced_mw_entering_90d non-null %.1f%%, net_demand_volume_change_30d non-null %.1f%%, "
+        "days_since_last_supply_event non-null %.1f%%, regime_change_within_horizon true %.1f%% "
+        "-- expected to be near-zero while event history accrues (design §0)",
+        zone,
+        horizon,
+        start,
+        end,
+        n,
+        non_null_rate["announced_mw_entering_90d"] * 100,
+        non_null_rate["net_demand_volume_change_30d"] * 100,
+        days_since_rate * 100,
+        regime_true_rate * 100,
+    )
+
+
 # --- the builder -------------------------------------------------------------
 
 
@@ -589,6 +791,11 @@ def build_features(
             )
         corridor_series[corridor] = entry
 
+    # --- M6+ supply-event features (design §5): one broad fetch, gated ---
+    # --- per row against `decision_time` (leak-safe, design §1) ---
+    latest_decision_time = mtu_grid[-1] - horizon
+    events = _fetch_events(db, latest_decision_time)
+
     rows: list[dict] = []
     for mtu_start in mtu_grid:
         decision_time = mtu_start - horizon
@@ -662,8 +869,12 @@ def build_features(
             realised_exact, forecast_maps, decision_time
         )
 
+        # --- M6+ supply-event features (design §5), leak-safe (design §1) ---
+        row.update(_event_features(events, zone, decision_time))
+
         rows.append(row)
 
     _log_all_null_columns(zone, horizon, start, end, rows)
+    _log_event_feature_fill_rate(zone, horizon, start, end, rows)
 
     return rows

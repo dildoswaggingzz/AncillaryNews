@@ -18,7 +18,9 @@ import asyncio
 import logging
 import os
 import time
-from datetime import datetime
+import uuid
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -27,10 +29,12 @@ from qdrant_client import AsyncQdrantClient
 
 from shared.article_extractor import extract_markdown, fetch_article_html
 from shared.claim_extractor import extract_claims
+from shared.db_manager import DatabaseManager
+from shared.event_extractor import ExtractedEvent, extract_events
 from shared.logging_config import configure_logging
 from shared.metrics import start_metrics_server
 from shared.rss_feeds import RSS_FEEDS
-from shared.rss_reader import fetch_feed_entries
+from shared.rss_reader import ArticleRef, fetch_feed_entries
 from shared.vector_store import QdrantStore
 
 configure_logging()
@@ -49,14 +53,118 @@ ARTICLE_PROCESSED_TOTAL = Counter(
     "Per-article processing outcomes",
     ["status"],
 )
+# M6+ supply-event features (docs/supply-event-features-design.md §4): counts
+# the additive, non-fatal event-storage path separately from
+# ARTICLE_PROCESSED_TOTAL, since one article can both succeed at claim
+# storage and fail at event storage (or vice versa -- see `_store_events`).
+EVENT_STORAGE_TOTAL = Counter(
+    "crawler_event_storage_total",
+    "Per-article event-storage outcomes (design §4: additive, non-fatal)",
+    ["status"],
+)
 
 
-async def process_article(article, http_client: httpx.AsyncClient, store: QdrantStore) -> int:
+def _known_at(article: ArticleRef) -> datetime:
+    """
+    Design §1: an event's leak-safe availability key (`known_at`) is the
+    article's publish time, falling back to crawl time when `published` is
+    null or unparseable. Assigned HERE, by the crawler -- never by
+    `shared/event_extractor.py`'s model, which must not be trusted to date
+    events (design §1/§3).
+
+    `ArticleRef.published` is whatever raw string `feedparser` handed back
+    (shared/rss_reader.py) -- typically an RFC 822 date
+    (`email.utils.parsedate_to_datetime` is the same format Python's own
+    `email` module parses feed dates with), but feeds are not obligated to
+    conform, so any parse failure falls back to crawl time rather than
+    raising. A naive (no explicit offset) parse result is treated as UTC --
+    conservative and consistent with every other timestamp this module
+    produces.
+    """
+    if article.published:
+        try:
+            parsed = parsedate_to_datetime(article.published)
+        except (TypeError, ValueError):
+            parsed = None
+        if parsed is not None:
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            return parsed
+    return datetime.now(UTC)
+
+
+def _event_id(url: str, index: int) -> str:
+    """
+    Deterministic per-event ID (design §2), mirroring
+    `shared/vector_store.py:_claim_point_id`'s `uuid5(NAMESPACE_URL, ...)`
+    construction exactly -- re-crawling the same article regenerates the
+    same IDs, so `DatabaseManager.save_market_event`'s
+    `ON CONFLICT (event_id) DO NOTHING` makes storage idempotent rather than
+    duplicating.
+    """
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{url}#event:{index}"))
+
+
+async def _store_events(article: ArticleRef, text: str, db: DatabaseManager) -> int:
+    """
+    Extracts supply/demand/regime events from `text` (design §4: "the same
+    text" already used for claim extraction) and stores them in Postgres
+    (init-db/08-market-events.sql). Returns the number of events stored.
+
+    Deliberately narrow: every exception this raises is caught by
+    `process_article`'s caller (never here) -- see that function's own
+    handling for why event-path failures must never affect claim storage.
+    """
+    events: list[ExtractedEvent] | None = await extract_events(text, article)
+    if not events:
+        return 0
+
+    known_at = _known_at(article)
+    extracted_at = datetime.now(UTC)
+    stored = 0
+    for i, event in enumerate(events):
+        db.save_market_event(
+            event_id=_event_id(article.url, i),
+            event_type=event.event_type,
+            market=event.market,
+            zone=event.zone,
+            direction=event.direction,
+            magnitude_mw=event.magnitude_mw,
+            effective_from=event.effective_from,
+            known_at=known_at,
+            confidence=event.confidence,
+            source_url=article.url,
+            source_title=article.title,
+            source_tier=article.feed_tier,
+            raw_excerpt=event.raw_excerpt,
+            extracted_at=extracted_at,
+        )
+        stored += 1
+
+    logger.info("Extracted and stored %d event(s) for %s", stored, article.url)
+    return stored
+
+
+async def process_article(
+    article, http_client: httpx.AsyncClient, store: QdrantStore, db: DatabaseManager | None = None
+) -> int:
     """
     Fetches, extracts, and stores one article. Any failure is logged and
     swallowed. Returns the number of claims extracted and stored for this
     article (`0` for every skip/raw-stored/failure path) -- used by
     `run_crawl_cycle` to build its `claims_extracted` on-demand-run summary.
+
+    `db` (M6+, design §4) is optional and additive: when provided, the same
+    article `text` is also passed through `shared/event_extractor.py` and
+    stored in Postgres (init-db/08-market-events.sql), *after* the existing
+    claim path above runs, over both the "stored raw" and "stored claims"
+    branches -- claim extraction success/failure is independent of whether
+    events are found. Any failure on this path (extraction or storage) is
+    logged and swallowed here, exactly like the article-fetch/markdown-
+    extraction failures above, and never affects the `saved` claims count
+    this function returns or the calling crawl cycle. `db=None` (no
+    `DATABASE_URL` configured, see `run_crawl_cycle`) skips the event path
+    entirely -- claim storage is unaffected either way.
     """
     if await store.is_processed(article.url):
         logger.debug("Already processed %s; skipping", article.url)
@@ -80,12 +188,53 @@ async def process_article(article, http_client: httpx.AsyncClient, store: Qdrant
         await store.upsert_raw_article(article, text)
         logger.info("Stored raw article (no claim extraction) for %s", article.url)
         ARTICLE_PROCESSED_TOTAL.labels(status="stored_raw").inc()
-        return 0
+        saved = 0
+    else:
+        saved = await store.upsert_claims(article, extraction.claims)
+        logger.info("Extracted and stored %d claim(s) for %s", saved, article.url)
+        ARTICLE_PROCESSED_TOTAL.labels(status="stored_claims").inc()
 
-    saved = await store.upsert_claims(article, extraction.claims)
-    logger.info("Extracted and stored %d claim(s) for %s", saved, article.url)
-    ARTICLE_PROCESSED_TOTAL.labels(status="stored_claims").inc()
+    # M6+ event path (design §4): additive and non-fatal by construction --
+    # this except-block is the entire contract. Whatever goes wrong here
+    # (a bad LLM response, a DB error, anything) is logged and swallowed;
+    # `saved` (this function's return value, driving claim-storage bookkeeping
+    # in `run_crawl_cycle`) is never touched by this block.
+    if db is not None:
+        try:
+            events_stored = await _store_events(article, text, db)
+            EVENT_STORAGE_TOTAL.labels(
+                status="stored" if events_stored else "no_events_found"
+            ).inc()
+        except Exception:
+            logger.exception(
+                "Event extraction/storage failed for %s (claims unaffected)", article.url
+            )
+            EVENT_STORAGE_TOTAL.labels(status="failed").inc()
+
     return saved
+
+
+def _get_db() -> DatabaseManager | None:
+    """
+    Best-effort `DatabaseManager` construction for the M6+ event-storage
+    path (design §4: "wire it in following the existing dependency
+    pattern" -- `services/ingestor/main.py`/`services/orchestrator/main.py`
+    both construct one fresh per cycle). Unlike those services, the crawler
+    has run without a Postgres dependency since M3, and `DatabaseManager()`
+    raises `ValueError` when `DATABASE_URL` isn't set -- letting that raise
+    uncaught here would turn "no DB configured" into "no crawling happens
+    at all", which is exactly the kind of event-path failure design §4
+    requires to be non-fatal. Returns `None` (event storage skipped for
+    this cycle, claims unaffected) rather than raising.
+    """
+    try:
+        return DatabaseManager()
+    except Exception:
+        logger.warning(
+            "DatabaseManager unavailable (DATABASE_URL not set?) -- event storage disabled "
+            "for this crawl cycle; claim extraction/storage is unaffected."
+        )
+        return None
 
 
 async def run_crawl_cycle() -> dict:
@@ -104,9 +253,16 @@ async def run_crawl_cycle() -> dict:
     guard against a mocked `process_article` (which defaults to returning a
     truthy `MagicMock`, not an `int`) miscounting in tests -- see
     `process_article`'s own docstring.
+
+    M6+ (design §4): also constructs a `DatabaseManager` (`_get_db`, `None`
+    if unavailable) and passes it to every `process_article` call, so the
+    additive event-storage path can run alongside the existing Qdrant claim
+    path. Closed in the same `finally` this function already uses to close
+    the Qdrant client.
     """
     qdrant_client = AsyncQdrantClient(url=QDRANT_URL)
     store = QdrantStore(qdrant_client)
+    db = _get_db()
     cycle_start = time.monotonic()
     articles_processed = 0
     claims_extracted = 0
@@ -122,7 +278,7 @@ async def run_crawl_cycle() -> dict:
                     for article in articles:
                         articles_processed += 1
                         try:
-                            result = await process_article(article, http_client, store)
+                            result = await process_article(article, http_client, store, db)
                             if isinstance(result, int):
                                 claims_extracted += result
                         except Exception:
@@ -131,6 +287,8 @@ async def run_crawl_cycle() -> dict:
             finally:
                 await qdrant_client.close()
     finally:
+        if db is not None:
+            db.close()
         CYCLE_DURATION.observe(time.monotonic() - cycle_start)
 
     return {"articles_processed": articles_processed, "claims_extracted": claims_extracted}

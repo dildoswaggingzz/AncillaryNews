@@ -59,9 +59,19 @@ services:
       dockerfile: services/crawler/Dockerfile
     restart: unless-stopped
     depends_on:
+      db:
+        condition: service_healthy
       vector-db:
         condition: service_healthy
     environment:
+      # M6+ supply-event features (docs/supply-event-features-design.md §4):
+      # the crawler's Postgres handle for the additive event-storage path
+      # (init-db/08-market-events.sql) alongside its existing Qdrant claim
+      # store. `_get_db` (services/crawler/main.py) degrades gracefully --
+      # event storage is skipped, claims are unaffected -- if this is ever
+      # unset or unreachable, so this dependency is a "nice to have sooner",
+      # not a hard requirement for the crawler to run.
+      - DATABASE_URL=postgresql://postgres:${DB_PASSWORD:-secret}@db:5432/energy
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - METRICS_PORT=9101
       # Opt-in gate on the scheduler's automatic 30-minute crawl cycle (each

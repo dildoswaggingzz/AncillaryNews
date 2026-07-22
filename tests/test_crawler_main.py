@@ -1,10 +1,12 @@
 import importlib.util
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from shared.claim_extractor import ExtractedClaim, ExtractionResult
+from shared.event_extractor import ExtractedEvent
 from shared.rss_reader import ArticleRef
 
 MAIN_PATH = Path(__file__).parent.parent / "services" / "crawler" / "main.py"
@@ -244,3 +246,269 @@ async def test_process_article_records_stored_claims_metric(store):
 
     after = crawler_main.ARTICLE_PROCESSED_TOTAL.labels(status="stored_claims")._value.get()
     assert after == before + 1
+
+
+# --- M6+ supply-event features: additive, non-fatal event storage ----------
+# (docs/supply-event-features-design.md §4)
+
+
+def test_known_at_parses_rfc822_published_string():
+    known_at = crawler_main._known_at(ARTICLE)
+    assert known_at == datetime(2026, 7, 3, 7, 11, 50, tzinfo=UTC)
+
+
+def test_known_at_falls_back_to_crawl_time_when_published_is_missing():
+    article = ArticleRef(
+        url="https://example.test/no-date",
+        title="No date",
+        author=None,
+        published=None,
+        feed_name="Test Feed",
+        feed_tier="tier1",
+    )
+    before = datetime.now(UTC)
+    known_at = crawler_main._known_at(article)
+    after = datetime.now(UTC)
+    assert before <= known_at <= after
+
+
+def test_known_at_falls_back_to_crawl_time_when_published_is_unparseable():
+    article = ArticleRef(
+        url="https://example.test/bad-date",
+        title="Bad date",
+        author=None,
+        published="not a real date",
+        feed_name="Test Feed",
+        feed_tier="tier1",
+    )
+    before = datetime.now(UTC)
+    known_at = crawler_main._known_at(article)
+    after = datetime.now(UTC)
+    assert before <= known_at <= after
+
+
+def test_event_id_deterministic_and_index_scoped():
+    id_a = crawler_main._event_id("https://example.test/article", 0)
+    id_b = crawler_main._event_id("https://example.test/article", 0)
+    id_c = crawler_main._event_id("https://example.test/article", 1)
+    assert id_a == id_b  # deterministic -- re-crawl regenerates the same ID
+    assert id_a != id_c  # per-event, index-scoped
+
+
+@pytest.fixture
+def db():
+    d = MagicMock()
+    d.save_market_event = MagicMock()
+    return d
+
+
+async def test_process_article_stores_events_additively_alongside_claims(store, db):
+    extraction = ExtractionResult(
+        summary="summary",
+        claims=[ExtractedClaim(claim="claim text", claim_type="fact")],
+    )
+    event = ExtractedEvent(
+        event_type="prequalification",
+        market="FCR",
+        zone="DK2",
+        direction="up",
+        magnitude_mw=20.0,
+        effective_from=None,
+        confidence=0.9,
+        raw_excerpt="A 20 MW battery prequalified.",
+    )
+    with (
+        patch.object(
+            crawler_main, "fetch_article_html", new=AsyncMock(return_value="<html>body</html>")
+        ),
+        patch.object(crawler_main, "extract_markdown", return_value="clean article text"),
+        patch.object(crawler_main, "extract_claims", new=AsyncMock(return_value=extraction)),
+        patch.object(crawler_main, "extract_events", new=AsyncMock(return_value=[event])),
+    ):
+        result = await crawler_main.process_article(
+            ARTICLE, http_client=MagicMock(), store=store, db=db
+        )
+
+    store.upsert_claims.assert_awaited_once_with(ARTICLE, extraction.claims)
+    db.save_market_event.assert_called_once()
+    _, kwargs = db.save_market_event.call_args
+    assert kwargs["event_type"] == "prequalification"
+    assert kwargs["magnitude_mw"] == 20.0
+    assert kwargs["source_url"] == ARTICLE.url
+    assert kwargs["known_at"] == datetime(2026, 7, 3, 7, 11, 50, tzinfo=UTC)
+    assert result == 1  # claims count is unaffected by the event path
+
+
+async def test_process_article_skips_event_path_when_db_is_none(store):
+    extraction = ExtractionResult(
+        summary="summary",
+        claims=[ExtractedClaim(claim="claim text", claim_type="fact")],
+    )
+    with (
+        patch.object(
+            crawler_main, "fetch_article_html", new=AsyncMock(return_value="<html>body</html>")
+        ),
+        patch.object(crawler_main, "extract_markdown", return_value="clean article text"),
+        patch.object(crawler_main, "extract_claims", new=AsyncMock(return_value=extraction)),
+        patch.object(crawler_main, "extract_events", new=AsyncMock()) as mock_extract_events,
+    ):
+        result = await crawler_main.process_article(
+            ARTICLE, http_client=MagicMock(), store=store, db=None
+        )
+
+    mock_extract_events.assert_not_awaited()
+    assert result == 1
+
+
+async def test_process_article_event_extraction_failure_leaves_claim_storage_intact(store, db):
+    """
+    Design §4's core requirement, tested directly: an event-path failure
+    (here, `extract_events` itself raising) must not affect claim storage or
+    prevent `process_article` from returning its normal claims-stored count.
+    """
+    extraction = ExtractionResult(
+        summary="summary",
+        claims=[ExtractedClaim(claim="claim text", claim_type="fact")],
+    )
+    with (
+        patch.object(
+            crawler_main, "fetch_article_html", new=AsyncMock(return_value="<html>body</html>")
+        ),
+        patch.object(crawler_main, "extract_markdown", return_value="clean article text"),
+        patch.object(crawler_main, "extract_claims", new=AsyncMock(return_value=extraction)),
+        patch.object(
+            crawler_main, "extract_events", new=AsyncMock(side_effect=RuntimeError("LLM boom"))
+        ),
+    ):
+        result = await crawler_main.process_article(
+            ARTICLE, http_client=MagicMock(), store=store, db=db
+        )
+
+    store.upsert_claims.assert_awaited_once_with(ARTICLE, extraction.claims)
+    db.save_market_event.assert_not_called()
+    assert result == 1  # claims path fully intact despite the event-path exception
+
+
+async def test_process_article_event_storage_failure_leaves_claim_storage_intact(store, db):
+    """
+    Same guarantee, but the failure is in `db.save_market_event` (a DB
+    error) rather than in extraction itself.
+    """
+    extraction = ExtractionResult(
+        summary="summary",
+        claims=[ExtractedClaim(claim="claim text", claim_type="fact")],
+    )
+    event = ExtractedEvent(
+        event_type="outage",
+        market=None,
+        zone="DK1",
+        direction=None,
+        magnitude_mw=None,
+        effective_from=None,
+        confidence=0.5,
+        raw_excerpt="An outage occurred.",
+    )
+    db.save_market_event.side_effect = RuntimeError("DB down")
+
+    with (
+        patch.object(
+            crawler_main, "fetch_article_html", new=AsyncMock(return_value="<html>body</html>")
+        ),
+        patch.object(crawler_main, "extract_markdown", return_value="clean article text"),
+        patch.object(crawler_main, "extract_claims", new=AsyncMock(return_value=extraction)),
+        patch.object(crawler_main, "extract_events", new=AsyncMock(return_value=[event])),
+    ):
+        result = await crawler_main.process_article(
+            ARTICLE, http_client=MagicMock(), store=store, db=db
+        )
+
+    store.upsert_claims.assert_awaited_once_with(ARTICLE, extraction.claims)
+    assert result == 1
+
+
+async def test_process_article_event_path_runs_even_when_no_api_key_stored_claims_raw(store, db):
+    """
+    Event storage is attempted independently of the claim path's own
+    ANTHROPIC_API_KEY outcome (design §4: "after the existing claim path" --
+    both extractors hit the same key, so in practice both skip together, but
+    the wiring itself does not couple them).
+    """
+    event = ExtractedEvent(
+        event_type="prequalification",
+        market="FCR",
+        zone="DK2",
+        direction=None,
+        magnitude_mw=5.0,
+        effective_from=None,
+        confidence=0.9,
+        raw_excerpt="Prequalified.",
+    )
+    with (
+        patch.object(
+            crawler_main, "fetch_article_html", new=AsyncMock(return_value="<html>body</html>")
+        ),
+        patch.object(crawler_main, "extract_markdown", return_value="clean article text"),
+        patch.object(crawler_main, "extract_claims", new=AsyncMock(return_value=None)),
+        patch.object(crawler_main, "extract_events", new=AsyncMock(return_value=[event])),
+    ):
+        result = await crawler_main.process_article(
+            ARTICLE, http_client=MagicMock(), store=store, db=db
+        )
+
+    store.upsert_raw_article.assert_awaited_once()
+    db.save_market_event.assert_called_once()
+    assert result == 0
+
+
+def test_get_db_returns_none_when_database_url_unset(monkeypatch):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    assert crawler_main._get_db() is None
+
+
+async def test_run_crawl_cycle_closes_db_when_configured():
+    fake_db = MagicMock()
+    with (
+        patch.object(crawler_main, "AsyncQdrantClient") as mock_qdrant_cls,
+        patch.object(crawler_main, "QdrantStore") as mock_store_cls,
+        patch.object(crawler_main, "_get_db", return_value=fake_db),
+        patch.object(crawler_main, "fetch_feed_entries", new=AsyncMock(return_value=[])),
+    ):
+        mock_qdrant_instance = MagicMock()
+        mock_qdrant_instance.close = AsyncMock()
+        mock_qdrant_cls.return_value = mock_qdrant_instance
+
+        mock_store_instance = MagicMock()
+        mock_store_instance.ensure_collection = AsyncMock()
+        mock_store_cls.return_value = mock_store_instance
+
+        await crawler_main.run_crawl_cycle()
+
+    fake_db.close.assert_called_once()
+
+
+async def test_run_crawl_cycle_passes_db_to_process_article():
+    fake_db = MagicMock()
+    with (
+        patch.object(crawler_main, "AsyncQdrantClient") as mock_qdrant_cls,
+        patch.object(crawler_main, "QdrantStore") as mock_store_cls,
+        patch.object(crawler_main, "_get_db", return_value=fake_db),
+        patch.object(crawler_main, "fetch_feed_entries", new=AsyncMock(return_value=[ARTICLE])),
+        patch.object(
+            crawler_main, "process_article", new=AsyncMock(return_value=0)
+        ) as mock_process,
+    ):
+        mock_qdrant_instance = MagicMock()
+        mock_qdrant_instance.close = AsyncMock()
+        mock_qdrant_cls.return_value = mock_qdrant_instance
+
+        mock_store_instance = MagicMock()
+        mock_store_instance.ensure_collection = AsyncMock()
+        mock_store_cls.return_value = mock_store_instance
+
+        await crawler_main.run_crawl_cycle()
+
+    mock_process.assert_awaited_once()
+    call_args = mock_process.await_args.args
+    assert call_args[0] == ARTICLE
+    assert call_args[2] == mock_store_instance
+    assert call_args[3] is fake_db
