@@ -278,7 +278,7 @@ residual) — P3 fixes the exact DA↔imbalance coupling.
 |---|---|---|
 | **P0** | This doc, on `bess-cooptimizer-design`. Nord Pool / ENTSO-E IDA audit (done — §6). | ✅ |
 | **P1** | `shared/bess_dispatch_milp.py`: DA energy + FCR/aFRR capacity (both directions) + aFRR activation, no-double-selling headroom, **post** mode. Wired as `strategy="cooptimized"`. Unit tests incl. a **double-selling regression test**. | LP matches hand-checked tiny window. |
-| **P2** | A/B report: co-optimized vs. threshold revenue on identical windows, quantifying the double-sell overstatement. `scripts/generate_*` report. | Perfect-foresight ≥ threshold on every window. |
+| **P2** | A/B report: co-optimized vs. threshold revenue on identical windows, quantifying the double-sell overstatement. `scripts/generate_cooptimizer_ab_report.py` → `docs/bess-cooptimizer-results.md`. | Co-optimized ≥ threshold on *feasible* windows; on double-sell windows threshold overstates and the report quantifies the phantom revenue (see below). |
 | **P3** | Imbalance as second energy stream + **pre**/forecast mode (schedule on forecast, settle on actuals). Post−pre gap reported. | Pre ≤ Post always. |
 | **P4** | Intraday: ingest ENTSO-E IDA1/2/3 (new ingestor + `datasets.py` entry), plug into the engine's energy-market list. | IDA series validated like other feeds. |
 | **P5** | Migrate morning-brief + `/dashboard/bess` defaults to `strategy="cooptimized"`. | A/B report reviewed. |
@@ -290,15 +290,21 @@ residual) — P3 fixes the exact DA↔imbalance coupling.
 - **Double-selling regression test** — a window where the threshold engine books up-capacity while
   discharging to `soc_min`; assert the co-optimizer cannot (headroom constraint binds, revenue is
   lower and *feasible*).
-- **Perfect-foresight ≥ heuristic** on every test window (an optimum can never underperform a
-  feasible heuristic; if it does, the model is wrong).
+- **Perfect-foresight ≥ any *feasible* dispatch** on every test window (an optimum can never
+  underperform a feasible policy). Note the threshold engine is **not** always feasible — when it
+  double-sells it books capacity revenue for MW it cannot deliver, so on those windows its reported
+  total can *exceed* the co-optimized optimum. That excess is **phantom revenue**, not a co-optimizer
+  regression; P2's report isolates and quantifies it (see §7 P2). The gate holds strictly only on
+  windows where the threshold engine never double-sells.
 - **SoC feasibility** — assert `soc_min ≤ soc[t] ≤ soc_max` and headroom bounds hold at every tick
   of the returned trace.
 - **LP vs. brute force** — on a 3–4 period hand-computable window, the LP optimum equals an
   exhaustive search.
 - **Currency non-mixing** — a DK2 mixed-currency stack reports `currencies_present == {"DKK","EUR"}`
   with separate totals; no EUR MW is ever traded against a DKK MW in allocation.
-- **Reproducibility** — a persisted `config` re-solves to identical dispatch (pinned HiGHS options).
+- **Reproducibility** — a persisted `config` re-solves to identical dispatch (PuLP's bundled CBC on
+  a fixed pure-LP model is deterministic; HiGHS was dropped in P1 in favour of the zero-config CBC
+  backend).
 
 ---
 
