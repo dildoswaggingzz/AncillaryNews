@@ -3,8 +3,12 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from shared.bess_dispatch_milp import _leg_direction, solve_cooptimized_dispatch
-from shared.bess_simulator import BessConfig, run_backtest
+from shared.bess_dispatch_milp import (
+    _leg_direction,
+    phantom_capacity_revenue,
+    solve_cooptimized_dispatch,
+)
+from shared.bess_simulator import BacktestResult, BessConfig, BessTick, run_backtest
 from shared.units import DKK_PER_EUR
 
 BASE_TIME = datetime(2026, 7, 16, tzinfo=UTC)
@@ -443,6 +447,126 @@ def test_combined_total_math_matches_hand_computed_conversion():
     assert result.total_revenue_all_dkk == pytest.approx(expected_all_dkk, rel=1e-9)
     assert result.total_revenue_all_eur == pytest.approx(expected_all_eur, rel=1e-9)
     assert DKK_PER_EUR == pytest.approx(7.46)
+
+
+# --- phantom_capacity_revenue (P2 headline diagnostic) --------------------------
+#
+# Hand-constructed threshold-*like* `BacktestResult`/`BessTick` traces --
+# `phantom_capacity_revenue` only reads `soc_mwh`/`capacity_revenue_by_market`/
+# the cumulative capacity totals, so these are built directly rather than via
+# `run_backtest`, keeping the expected numbers exactly hand-computable.
+
+_PHANTOM_CONFIG = BessConfig(
+    capacity_mwh=2.0,
+    round_trip_efficiency=0.9,
+    soc_min_fraction=0.1,
+    soc_max_fraction=0.9,
+    starting_soc_fraction=0.5,  # starting_soc = 1.0
+    activation_endurance_hours=0.25,
+    capacity_markets=(("aFRR_capacity", "up"),),
+)
+
+
+def _single_tick_result(
+    zone: str,
+    soc_mwh: float,
+    capacity_revenue_by_market: dict[str, float],
+    config: BessConfig = _PHANTOM_CONFIG,
+) -> BacktestResult:
+    capacity_revenue_dkk = sum(
+        v for k, v in capacity_revenue_by_market.items() if k.split(":", 1)[0] == "aFRR_capacity"
+    )
+    capacity_revenue_eur = sum(
+        v for k, v in capacity_revenue_by_market.items() if k.split(":", 1)[0] == "FCR"
+    )
+    tick = BessTick(
+        time=BASE_TIME,
+        soc_mwh=soc_mwh,
+        soc_fraction=soc_mwh / config.capacity_mwh,
+        action="discharge",
+        day_ahead_price=100.0,
+        energy_discharged_mwh=0.0,
+        arbitrage_revenue_dkk=0.0,
+        capacity_reserved_mw=0.0,
+        capacity_revenue_dkk=capacity_revenue_dkk,
+        capacity_revenue_by_market=dict(capacity_revenue_by_market),
+        cumulative_arbitrage_revenue_dkk=0.0,
+        cumulative_capacity_revenue_dkk=capacity_revenue_dkk,
+        cumulative_total_revenue_dkk=capacity_revenue_dkk,
+        capacity_revenue_eur=capacity_revenue_eur,
+        cumulative_capacity_revenue_eur=capacity_revenue_eur,
+    )
+    return BacktestResult(
+        zone=zone,
+        start_time=BASE_TIME,
+        end_time=BASE_TIME + timedelta(hours=1),
+        config=config,
+        ticks=[tick],
+    )
+
+
+def test_phantom_capacity_revenue_exact_amount_when_committed_beyond_headroom():
+    """Starting SoC 1.0 (mid-band), tick ends at soc_min (0.2) -- a full
+    discharge that period. `feasible_up_mw` against the tighter of
+    start/end SoC is `min(1.0, 0.2) = 0.2 = soc_min`, so feasible up-reserve
+    is exactly 0 -- the committed 5.0 MW is *entirely* phantom."""
+    result = _single_tick_result("DK1", soc_mwh=0.2, capacity_revenue_by_market={
+        "aFRR_capacity:up": 500.0  # 5.0 MW committed @ 100 DKK/MW/h, dt=1h
+    })
+    diagnostic = phantom_capacity_revenue(
+        result, _PHANTOM_CONFIG, {"aFRR_capacity:up": [(BASE_TIME, 100.0)]}
+    )
+    assert diagnostic["phantom_capacity_revenue_dkk"] == pytest.approx(500.0)
+    assert diagnostic["phantom_fraction_dkk"] == pytest.approx(1.0)
+    assert diagnostic["phantom_capacity_revenue_eur"] == 0.0
+    assert diagnostic["phantom_fraction_eur"] == 0.0
+
+
+def test_phantom_capacity_revenue_zero_on_a_feasible_trace():
+    """SoC stays at its starting 1.0 MWh (no discharge that tick) -- ample
+    headroom (~3.04 MW) for the modest 0.5 MW committed, so nothing is
+    phantom."""
+    result = _single_tick_result(
+        "DK1", soc_mwh=1.0, capacity_revenue_by_market={"aFRR_capacity:up": 50.0}
+    )
+    diagnostic = phantom_capacity_revenue(
+        result, _PHANTOM_CONFIG, {"aFRR_capacity:up": [(BASE_TIME, 100.0)]}
+    )
+    assert diagnostic["phantom_capacity_revenue_dkk"] == pytest.approx(0.0, abs=1e-9)
+    assert diagnostic["phantom_fraction_dkk"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_phantom_capacity_revenue_buckets_dk2_mixed_currency_stack_separately():
+    """A DK2-style stack: `aFRR_capacity:up` (DKK) fully phantom (same setup
+    as the first test) alongside `FCR:down` (EUR), also over-committed but
+    by a different, independently hand-computed amount -- each currency's
+    phantom total must land in its own bucket, matching
+    `shared/units.py:currency_for`'s DK2 resolution (aFRR_capacity DKK,
+    FCR EUR)."""
+    result = _single_tick_result(
+        "DK2",
+        soc_mwh=0.2,
+        capacity_revenue_by_market={
+            "aFRR_capacity:up": 500.0,  # 5.0 MW @ 100 DKK/MW/h -- feasible_up=0, all phantom
+            "FCR:down": 200.0,  # 10.0 MW @ 20 EUR/MW/h -- feasible_down=3.373..., partly phantom
+        },
+    )
+    diagnostic = phantom_capacity_revenue(
+        result,
+        _PHANTOM_CONFIG,
+        {
+            "aFRR_capacity:up": [(BASE_TIME, 100.0)],
+            "FCR:down": [(BASE_TIME, 20.0)],
+        },
+    )
+    assert diagnostic["phantom_capacity_revenue_dkk"] == pytest.approx(500.0)
+    assert diagnostic["phantom_fraction_dkk"] == pytest.approx(1.0)
+    # feasible_down_mw = (soc_max - max(prev_soc, tick_soc)) / eta / t_act
+    #                  = (1.8 - 1.0) / sqrt(0.9) / 0.25 = 3.3730961708462717
+    # phantom_mw = 10.0 - 3.3730961708462717 = 6.626903829153728
+    # phantom_revenue = phantom_mw * 20.0 EUR/MW/h * 1h
+    assert diagnostic["phantom_capacity_revenue_eur"] == pytest.approx(132.53807658307457)
+    assert diagnostic["phantom_fraction_eur"] == pytest.approx(132.53807658307457 / 200.0)
 
 
 # --- no data / empty window -------------------------------------------------------

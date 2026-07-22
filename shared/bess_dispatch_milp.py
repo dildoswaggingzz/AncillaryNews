@@ -136,6 +136,7 @@ from typing import Literal
 import pulp
 
 from shared.bess_simulator import BacktestResult, BessConfig, BessTick, _value_at_or_before
+from shared.units import currency_for
 
 # Numeric tolerance for classifying a period's action from `ch`/`dis` (which
 # should never both be meaningfully positive at the LP optimum -- see module
@@ -237,6 +238,146 @@ def _assert_currency_partition(
     )
     assert all(leg_currency[k] == "DKK" for k in dkk_keys)
     assert all(leg_currency[k] == "EUR" for k in eur_keys)
+
+
+def phantom_capacity_revenue(
+    result: BacktestResult,
+    config: BessConfig,
+    capacity_series_by_leg: dict[str, list[tuple[datetime, float]]],
+) -> dict[str, float]:
+    """
+    P2's headline overstatement diagnostic (docs/bess-cooptimizer-design.md
+    §7 P2 row / §8): replays a **threshold-strategy** `BacktestResult` trace
+    (`shared/bess_simulator.py`'s module docstring §0 -- that engine books
+    capacity revenue unconditionally, with no requirement that the
+    committed MW is actually deliverable out of stored energy) and measures
+    how much of its booked capacity revenue was **infeasible** under the
+    SAME both-endpoint no-double-selling headroom rule this module's
+    co-optimizer enforces (see the module docstring's headroom equations
+    above). This is computed purely from the threshold trace itself, never
+    from the co-optimizer's own dispatch or strategy choices -- it isolates
+    exactly the double-selling defect and nothing else, which is what makes
+    it the clean, unconfounded "how wrong is the number we currently
+    publish" figure (as opposed to a threshold-vs-cooptimized revenue
+    delta, which is *also* confounded by the co-optimizer's different,
+    better arbitrage timing -- see docs/bess-cooptimizer-design.md §8's
+    corrected framing: a lower co-optimized total on a double-selling
+    window is not a co-optimizer regression, and this function is what
+    separates "phantom revenue removed" from "real revenue foregone").
+
+    For each tick, per configured leg, the maximum MW that leg could
+    honestly have committed is bounded by the same headroom rule, evaluated
+    at whichever of the tick's start-of-period SoC (`prev_soc` -- the
+    previous tick's `soc_mwh`, or `config.starting_soc_fraction *
+    capacity_mwh` for the very first tick) and end-of-period SoC
+    (`tick.soc_mwh`) is TIGHTER for that direction (mirroring Solve 1's own
+    both-endpoint bound, not just a start-of-period check):
+
+        feasible_up_mw   = max((min(prev_soc, tick.soc_mwh) - soc_min) * eta / T_act, 0)
+        feasible_down_mw = max((soc_max - max(prev_soc, tick.soc_mwh)) / eta / T_act, 0)
+
+    A symmetric (`"price"`) leg is bound by the tighter of the two
+    (`min(feasible_up_mw, feasible_down_mw)`), matching `_leg_direction`'s
+    "obligates both sides at once" treatment elsewhere in this module.
+
+    **Known simplification -- per-leg, not per-direction-group.** When
+    multiple legs share a direction that tick (e.g. DK2's `aFRR_capacity:up`
+    and `FCR:up` both drawing on the same physical up-headroom), each leg's
+    feasible bound is computed independently against the *full* headroom,
+    not a joint bound split across every leg contending for it that
+    period. This can UNDERSTATE the true phantom total when several
+    same-direction legs are each individually within the full headroom but
+    jointly exceed it -- a conservative (understating, not overstating)
+    simplification, called out explicitly rather than silently assumed
+    away; a joint per-direction-group accounting is future work if a real
+    run's numbers ever call for it.
+
+    A leg's committed MW isn't stored directly on `BessTick` (only its
+    revenue is, in `capacity_revenue_by_market`) -- recovered here as
+    `revenue / (clearing_price * dt)`, `clearing_price` looked up the
+    identical way `run_backtest`/`solve_cooptimized_dispatch` do
+    (`_value_at_or_before` against `capacity_series_by_leg`, the same
+    already-fetched series `run_backtest` would pass to the co-optimizer)
+    and `dt` the tick's own period duration (`_period_dt_hours`, this
+    module's convention throughout). A leg with no price that tick, or a
+    zero clearing price, is skipped (guards the divide-by-zero -- its
+    revenue, and therefore any phantom contribution, is necessarily 0
+    either way, so there is nothing to attribute).
+
+    Returns:
+
+        {"phantom_capacity_revenue_dkk", "phantom_capacity_revenue_eur",
+         "phantom_fraction_dkk", "phantom_fraction_eur"}
+
+    the DKK/EUR phantom-revenue totals and each as a fraction of that
+    currency's *actual* reported `result.total_capacity_revenue_dkk` /
+    `_eur` (0.0, not NaN, when that total itself is 0 -- there was no
+    revenue booked in that currency at all, so nothing to overstate).
+    Currency is resolved per leg via `shared.units.currency_for(market,
+    result.zone, product)`; a leg that doesn't resolve to DKK or EUR raises
+    `ValueError` -- the same fail-loud posture `run_backtest` takes on an
+    unlabelled capacity leg, rather than silently dropping it from either
+    bucket.
+    """
+    soc_min = config.soc_min_fraction * config.capacity_mwh
+    soc_max = config.soc_max_fraction * config.capacity_mwh
+    eta = config.round_trip_efficiency**0.5
+    t_act = config.activation_endurance_hours
+
+    times = [tick.time for tick in result.ticks]
+    dt = _period_dt_hours(times)
+
+    phantom_dkk = 0.0
+    phantom_eur = 0.0
+    prev_soc = config.starting_soc_fraction * config.capacity_mwh
+
+    for i, tick in enumerate(result.ticks):
+        tick_soc = tick.soc_mwh
+        feasible_up_mw = max((min(prev_soc, tick_soc) - soc_min) * eta / t_act, 0.0)
+        feasible_down_mw = max((soc_max - max(prev_soc, tick_soc)) / eta / t_act, 0.0)
+
+        for key, revenue in tick.capacity_revenue_by_market.items():
+            market, product = key.split(":", 1)
+            direction = _leg_direction(market, product)
+            clearing_price = _value_at_or_before(capacity_series_by_leg.get(key, []), tick.time)
+            if not clearing_price or dt[i] <= 0:
+                # No price (or a real 0 price, or a zero-length period) --
+                # revenue is necessarily 0 either way, nothing to divide by
+                # or attribute.
+                continue
+
+            committed_mw = revenue / (clearing_price * dt[i])
+            if direction == "up":
+                feasible_mw = feasible_up_mw
+            elif direction == "down":
+                feasible_mw = feasible_down_mw
+            else:
+                feasible_mw = min(feasible_up_mw, feasible_down_mw)
+
+            phantom_mw = max(committed_mw - feasible_mw, 0.0)
+            phantom_revenue = phantom_mw * clearing_price * dt[i]
+
+            currency = currency_for(market, result.zone, product)
+            if currency == "DKK":
+                phantom_dkk += phantom_revenue
+            elif currency == "EUR":
+                phantom_eur += phantom_revenue
+            else:
+                raise ValueError(
+                    f"no DKK/EUR currency resolved for capacity leg {key!r} in zone "
+                    f"{result.zone!r} -- add `unit=` to the SeriesConfig in shared/datasets.py"
+                )
+
+        prev_soc = tick_soc
+
+    total_dkk = result.total_capacity_revenue_dkk
+    total_eur = result.total_capacity_revenue_eur
+    return {
+        "phantom_capacity_revenue_dkk": phantom_dkk,
+        "phantom_capacity_revenue_eur": phantom_eur,
+        "phantom_fraction_dkk": (phantom_dkk / total_dkk) if total_dkk else 0.0,
+        "phantom_fraction_eur": (phantom_eur / total_eur) if total_eur else 0.0,
+    }
 
 
 def solve_cooptimized_dispatch(
