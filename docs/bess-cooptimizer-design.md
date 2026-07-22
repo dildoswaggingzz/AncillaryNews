@@ -154,6 +154,30 @@ keep their current meanings.
 > energy leg** (which is single-currency per zone). P1 will settle the exact decomposition; the
 > constraint set above is currency-agnostic and holds either way.
 
+### 4.1 Combined headline total at a fixed peg (7.46)
+
+The per-currency buckets above remain the **unconverted source of truth** — the objective still
+never trades a EUR MW against a DKK MW, and `total_capacity_revenue_dkk` / `_eur` keep their exact
+current meanings. On top of them we add **two derived, explicitly-labelled combined totals** so a
+reader gets one headline number:
+
+```python
+DKK_PER_EUR = 7.46   # fixed ERM II central-rate peg (DKK is pegged to EUR ~7.46038)
+
+total_revenue_all_dkk = (arbitrage_dkk + capacity_dkk)          + (capacity_eur + activation_eur) * DKK_PER_EUR
+total_revenue_all_eur = (arbitrage_dkk + capacity_dkk) / DKK_PER_EUR + (capacity_eur + activation_eur)
+```
+
+Both directions are exposed on `BacktestResult` (`total_revenue_all_dkk`, `total_revenue_all_eur`)
+so a DKK-thinking reader and a EUR-thinking reader each get a single figure. Why a *fixed* rate is
+legitimate here — and why this does **not** reopen the floating-rate mixing bug the module docstring
+§2 exists to prevent: the DKK/EUR rate is not a market variable, it is a **policy peg** held inside
+a ±2.25 % ERM II band (in practice ±0.5 %). A fixed 7.46 is therefore an accounting convenience,
+not a silent market assumption. The constant lives in one place (`shared/units.py`, alongside
+`currency_for`), is surfaced in every report that shows a combined total ("converted at fixed 7.46
+DKK/EUR"), and the raw per-currency buckets are always shown beside it so nothing is hidden. This
+is a **presentation layer on top of** the currency separation, not a removal of it.
+
 ---
 
 ## 5. Post vs. pre — both from one engine
