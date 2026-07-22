@@ -218,14 +218,28 @@ Same LP, different price inputs:
   honest ceiling on what any battery could have earned in the real market over the window — an
   oracle, not a deployable policy. This is the "what it would have made" number.
 
-- **Pre (forecast-driven).** Solve the LP on *forecast* prices (`shared/forecast_model.py`), fix
-  the resulting schedule (`ch`, `dis`, `cap_*`), then **settle that schedule at actual prices.**
-  This is the realistic forecasting evaluation: you bid on what you expected, you get paid what
-  happened. Revenue is `Σ actual_price · scheduled_flow`.
+- **Pre (forecast-driven).** Solve the LP on *forecast* prices, fix the resulting schedule
+  (`ch`, `dis`, `cap_*`), then **settle that schedule at actual prices.** This is the realistic
+  forecasting evaluation: you bid on what you expected, you get paid what happened. Revenue is
+  `Σ actual_price · scheduled_flow`.
+
+**Mechanism (the P3 contribution).** The engine takes two price sets: **schedule prices** (what the
+LP optimises against) and **settlement prices** (what the fixed schedule is valued at). Post mode
+passes actuals for both; pre mode passes a forecast for schedule and actuals for settlement — one
+code path, a `foresight` switch on `BessConfig`. This is forecast-source-agnostic: any series can
+be the schedule price.
+
+**Forecast source for P3: lag-24h persistence.** The concrete pre-mode forecast is a causal
+lag-24h persistence of each price (yesterday's same-MTU value) — a standard, no-lookahead
+day-ahead baseline that matches `shared/baselines.py`'s persistence discipline. It needs no model
+training and is honest as a *floor* on forecast value. Wiring the M6 LightGBM day-ahead / FCR-D
+models (`shared/forecast_model.py`) as a richer schedule-price source is a documented later hook,
+not P3 scope.
 
 The **post − pre gap is the monetary value of forecast skill** — the same headroom logic as the M6
 economic-eval design (`docs/forecast-economic-eval-design.md` §1), now with a *feasible* dispatch
-underneath it instead of an allocation-only lever.
+underneath it instead of an allocation-only lever. With the lag-24h forecast the gap is a
+*conservative* (floor) estimate of that value; a better forecast can only narrow it.
 
 > **Interaction with M6 P4.** The economic-eval doc explicitly built on the current simulator's
 > "capacity always clears, allocation is the only lever" framing (its §0). The co-optimizer widens
@@ -266,9 +280,17 @@ investigation:
 
 The engine is therefore built **intraday-ready**: energy markets are a pluggable list, so adding
 the ENTSO-E IDA series in P4 is a *data* change (new ingestor + registry entry), not an *engine*
-change. Imbalance is modeled as a settlement price the scheduled deviation is exposed to, not a
-freely dispatchable market (a battery schedules in DA/IDA and is settled on imbalance for the
-residual) — P3 fixes the exact DA↔imbalance coupling.
+change.
+
+**Imbalance is a dispatchable second energy price, not passive settlement** (decision confirmed with
+user, P3). A BESS is a *controllable* asset: unlike a wind farm it has no forecast-error deviation
+to settle — its imbalance exposure comes from *choosing* to position against the imbalance price.
+So P3 models imbalance as a second energy market the LP dispatches against, sharing the one SoC/
+power budget with day-ahead: each period the LP routes discharge to whichever of {DA, imbalance}
+pays more and charge to whichever costs less (subject to the shared budget). The earlier
+"passive-settlement" lean (§9) was correct for non-dispatchable assets but wrong for a battery, and
+is superseded. `imbalance` is DKK/MWh (registry), same currency as `day_ahead`, so both live in the
+single-currency energy leg — no new currency handling.
 
 ---
 
@@ -316,9 +338,13 @@ residual) — P3 fixes the exact DA↔imbalance coupling.
   `BessConfig`, and kept strictly separate from the battery's C-rate (just `power_mw / capacity_mwh`,
   a descriptor, not a knob); a longer minimum-sustain window on a specific FCR product raises `T_act`
   and makes energy the binding constraint again.
-- **DA↔imbalance coupling (P3).** Whether imbalance is a passive settlement of DA-schedule
-  deviation or a second dispatchable market changes the LP. Leaning passive-settlement (realistic
-  for a price-taker BESS); to be finalized in P3.
+- **DA↔imbalance coupling — RESOLVED (P3).** Imbalance is a **dispatchable second energy price**,
+  not passive settlement — a BESS is controllable and takes imbalance positions by choice (§6). The
+  earlier passive-settlement lean applied to non-dispatchable assets and is superseded.
+- **P1 currency decomposition understates DK2 EUR capacity.** P2's real-data run showed the
+  sequential DKK-then-EUR solve lets lucrative DKK arbitrage claim the whole power budget, crowding
+  EUR (FCR) capacity to ~0 (`docs/bess-cooptimizer-results.md` §4). Not a claim that EUR capacity is
+  unprofitable — a limitation of the decomposition. A joint or iterated DKK/EUR solve is future work.
 - **Symmetric FCR products.** FCR-N / DK1 FCR are symmetric bands — one commitment obligates *both*
   up and down headroom simultaneously. The headroom constraints must bind on both sides for a
   symmetric leg (tighter than an up-only or down-only aFRR leg). P1 handles product symmetry
