@@ -171,10 +171,18 @@ async def process_article(
         ARTICLE_PROCESSED_TOTAL.labels(status="skipped_already_processed").inc()
         return 0
 
-    html = await fetch_article_html(article.url, http_client)
-    if html is None:
-        ARTICLE_PROCESSED_TOTAL.labels(status="skipped_fetch_failed").inc()
-        return 0
+    # `self_contained` feeds (shared/rss_feeds.py, e.g. ENTSO-E news) deliver
+    # the body inline on the `ArticleRef`; `article.url` is a synthetic
+    # identity anchor, not a fetchable page, so extract from `content`
+    # directly instead of making an HTTP request. All other feeds fetch and
+    # extract their per-article page as before.
+    if article.content is not None:
+        html = article.content
+    else:
+        html = await fetch_article_html(article.url, http_client)
+        if html is None:
+            ARTICLE_PROCESSED_TOTAL.labels(status="skipped_fetch_failed").inc()
+            return 0
 
     text = extract_markdown(html, url=article.url)
     if text is None:

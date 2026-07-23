@@ -15,6 +15,11 @@ spec = importlib.util.spec_from_file_location("crawler_main", MAIN_PATH)
 crawler_main = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(crawler_main)
 
+# Cycle tests pin RSS_FEEDS to a single feed so they exercise cycle mechanics
+# (fetch_feed_entries is mocked, so the feed's identity is irrelevant)
+# independently of how many feeds ship in shared/rss_feeds.py.
+_SINGLE_FEED = object()
+
 ARTICLE = ArticleRef(
     url="https://nordicbalancingmodel.net/some-update",
     title="NBM publishes MARI accession update",
@@ -22,6 +27,19 @@ ARTICLE = ArticleRef(
     published="Fri, 03 Jul 2026 07:11:50 +0000",
     feed_name="Nordic Balancing Model",
     feed_tier="tier1",
+)
+
+
+# A self_contained-feed article (ENTSO-E news): body arrives inline on the
+# ArticleRef; `url` is a synthetic identity anchor, not a fetchable page.
+INLINE_ARTICLE = ArticleRef(
+    url="https://transparency.entsoe.eu/news#deadbeefdeadbeef",
+    title="Publication issue on Wind offshore generation for Belgium",
+    author=None,
+    published="Mon, 20 Jul 2026 14:17:09 GMT",
+    feed_name="ENTSO-E Transparency Platform",
+    feed_tier="tier1",
+    content="<p>Dear Transparency Platform users, Elia has noticed deltas.</p>",
 )
 
 
@@ -77,6 +95,29 @@ async def test_process_article_stores_claims_when_extraction_succeeds(store):
     assert result == 1
 
 
+async def test_process_article_uses_inline_content_without_fetching(store):
+    extraction = ExtractionResult(
+        summary="summary",
+        claims=[ExtractedClaim(claim="claim text", claim_type="fact")],
+    )
+    with (
+        patch.object(crawler_main, "fetch_article_html", new=AsyncMock()) as mock_fetch,
+        patch.object(
+            crawler_main, "extract_markdown", return_value="clean article text"
+        ) as mock_extract,
+        patch.object(crawler_main, "extract_claims", new=AsyncMock(return_value=extraction)),
+    ):
+        result = await crawler_main.process_article(
+            INLINE_ARTICLE, http_client=MagicMock(), store=store
+        )
+
+    # Self-contained feed: no HTTP fetch, extract straight from inline content.
+    mock_fetch.assert_not_awaited()
+    mock_extract.assert_called_once_with(INLINE_ARTICLE.content, url=INLINE_ARTICLE.url)
+    store.upsert_claims.assert_awaited_once_with(INLINE_ARTICLE, extraction.claims)
+    assert result == 1
+
+
 async def test_process_article_skips_when_html_fetch_fails(store):
     with (
         patch.object(crawler_main, "fetch_article_html", new=AsyncMock(return_value=None)),
@@ -108,6 +149,7 @@ async def test_run_crawl_cycle_processes_every_feed_and_closes_client():
     with (
         patch.object(crawler_main, "AsyncQdrantClient") as mock_qdrant_cls,
         patch.object(crawler_main, "QdrantStore") as mock_store_cls,
+        patch.object(crawler_main, "RSS_FEEDS", [_SINGLE_FEED]),
         patch.object(crawler_main, "fetch_feed_entries", new=AsyncMock(return_value=fake_articles)),
         patch.object(crawler_main, "process_article", new=AsyncMock()) as mock_process,
     ):
@@ -130,6 +172,7 @@ async def test_run_crawl_cycle_continues_after_one_article_fails():
     with (
         patch.object(crawler_main, "AsyncQdrantClient") as mock_qdrant_cls,
         patch.object(crawler_main, "QdrantStore") as mock_store_cls,
+        patch.object(crawler_main, "RSS_FEEDS", [_SINGLE_FEED]),
         patch.object(
             crawler_main, "fetch_feed_entries", new=AsyncMock(return_value=[ARTICLE, ARTICLE])
         ),
@@ -198,6 +241,7 @@ async def test_run_crawl_cycle_returns_articles_processed_and_claims_extracted_s
     with (
         patch.object(crawler_main, "AsyncQdrantClient") as mock_qdrant_cls,
         patch.object(crawler_main, "QdrantStore") as mock_store_cls,
+        patch.object(crawler_main, "RSS_FEEDS", [_SINGLE_FEED]),
         patch.object(
             crawler_main, "fetch_feed_entries", new=AsyncMock(return_value=[ARTICLE, ARTICLE])
         ),
@@ -492,6 +536,7 @@ async def test_run_crawl_cycle_passes_db_to_process_article():
         patch.object(crawler_main, "AsyncQdrantClient") as mock_qdrant_cls,
         patch.object(crawler_main, "QdrantStore") as mock_store_cls,
         patch.object(crawler_main, "_get_db", return_value=fake_db),
+        patch.object(crawler_main, "RSS_FEEDS", [_SINGLE_FEED]),
         patch.object(crawler_main, "fetch_feed_entries", new=AsyncMock(return_value=[ARTICLE])),
         patch.object(
             crawler_main, "process_article", new=AsyncMock(return_value=0)

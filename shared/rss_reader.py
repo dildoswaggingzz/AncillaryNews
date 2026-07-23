@@ -8,6 +8,7 @@ is then only handed already-downloaded bytes, which is a pure/offline
 operation and trivial to unit test.
 """
 
+import hashlib
 import logging
 from dataclasses import dataclass
 
@@ -30,6 +31,33 @@ class ArticleRef:
     published: str | None
     feed_name: str
     feed_tier: str
+    # Set only for `self_contained` feeds (shared/rss_feeds.py): the item's
+    # full body as it arrived inline in the RSS `<description>` (HTML). When
+    # present, the crawler extracts from this directly instead of fetching
+    # `url` over HTTP — which for these feeds is a synthetic identity anchor,
+    # not a fetchable page. `None` for ordinary feeds (the crawler fetches
+    # `url` as before).
+    content: str | None = None
+
+
+def _synthetic_url(feed: FeedConfig, entry) -> str:
+    """
+    A stable, unique identity URL for a `self_contained` feed item that
+    publishes no `<link>`/`<guid>` (the ENTSO-E news feed — see
+    shared/rss_feeds.py). This URL is the item's identity everywhere the
+    pipeline keys on `ArticleRef.url` (Qdrant dedup via
+    `QdrantStore.is_processed`, event IDs via `services/crawler/main.py`), so
+    it must be deterministic: the same announcement must hash to the same URL
+    on every crawl, or dedup breaks and each cycle re-extracts it.
+
+    Prefers the entry's own `id`/`guid` when one exists; otherwise derives a
+    digest from the item's title + publish date. Anchored under the ENTSO-E
+    news base so the value is recognisable in stored payloads, even though it
+    does not resolve to a per-item page (the feed offers none).
+    """
+    identity = entry.get("id") or f"{entry.get('title', '')}|{entry.get('published', '')}"
+    digest = hashlib.sha256(f"{feed.url}|{identity}".encode()).hexdigest()[:16]
+    return f"https://transparency.entsoe.eu/news#{digest}"
 
 
 @retry(
@@ -75,7 +103,19 @@ async def fetch_feed_entries(feed: FeedConfig, client: httpx.AsyncClient) -> lis
     articles = []
     for entry in parsed.entries:
         link = entry.get("link")
-        if not link:
+        content = None
+        if feed.self_contained:
+            # These items carry their body inline and publish no link/guid;
+            # skip only when there's no body to work with, and give the item a
+            # deterministic synthetic identity (see `_synthetic_url`).
+            content = entry.get("description") or entry.get("summary")
+            if not content:
+                continue
+            link = link or _synthetic_url(feed, entry)
+        elif not link:
+            # Ordinary feeds need a real per-article URL to fetch; an item
+            # without one is dead weight (see the EnergyWatch note in
+            # shared/rss_feeds.py).
             continue
         articles.append(
             ArticleRef(
@@ -85,6 +125,7 @@ async def fetch_feed_entries(feed: FeedConfig, client: httpx.AsyncClient) -> lis
                 published=entry.get("published"),
                 feed_name=feed.name,
                 feed_tier=feed.tier,
+                content=content,
             )
         )
 
