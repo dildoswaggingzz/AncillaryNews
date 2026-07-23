@@ -29,8 +29,18 @@ building this module; the results:
 - **EIA** — catalogue itself marks this "lower priority for Nordic focus".
   Not evaluated for this pass; left out of the active list.
 
-Bottom line: exactly one catalogue-documented feed is confirmed live today.
-The list below is intentionally short rather than padded with guessed URLs.
+- **ENTSO-E Transparency Platform news**
+  (`https://external-api.tp.entsoe.eu/news/feed`) — **works**, added after the
+  M3 pass. Public, unauthenticated RSS 2.0 (`application/rss+xml`); no ENTSOE
+  API token required (that token gates the data API, not this news channel).
+  ENTSO-E is a Tier 1 source per README §6, so its claims are fact-eligible.
+  Unlike every feed above, its items carry the full announcement inline in
+  `<description>` and publish NO per-item `<link>`/`<guid>` — so it is flagged
+  `self_contained=True` (see `FeedConfig`) and handled specially by
+  shared/rss_reader.py rather than fetched article-by-article.
+
+Bottom line: two catalogue/verified feeds are confirmed live today. The list
+below is intentionally short rather than padded with guessed URLs.
 """
 
 from dataclasses import dataclass
@@ -49,6 +59,15 @@ class FeedConfig:
     # Tier 1 (Energinet/ENTSO-E/NBM) sources are fact-eligible per README §6;
     # Tier 2 (media/analyst) sources are never asserted as bare fact, even if
     # Claude's extraction says so — see shared/claim_extractor.py.
+    self_contained: bool = False
+    # Most feeds link out to a per-article web page the crawler fetches and
+    # extracts (shared/article_extractor.py). A `self_contained` feed instead
+    # carries each item's full body inline in the RSS `<description>` and
+    # publishes NO per-item link/guid (the ENTSO-E Transparency Platform news
+    # feed is the motivating case). For these, shared/rss_reader.py keeps the
+    # linkless items — synthesising a stable identity URL from the item's
+    # title+date — and stashes the description as `ArticleRef.content`, which
+    # the crawler uses directly instead of making an HTTP fetch.
 
 
 RSS_FEEDS: list[FeedConfig] = [
@@ -56,5 +75,11 @@ RSS_FEEDS: list[FeedConfig] = [
         name="Nordic Balancing Model",
         url="https://nordicbalancingmodel.net/feed/",
         tier="tier1",
+    ),
+    FeedConfig(
+        name="ENTSO-E Transparency Platform",
+        url="https://external-api.tp.entsoe.eu/news/feed",
+        tier="tier1",
+        self_contained=True,
     ),
 ]
