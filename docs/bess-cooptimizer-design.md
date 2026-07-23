@@ -167,22 +167,36 @@ second. No performance concern at backtest scale.
 
 ---
 
-## 4. Currency discipline — unchanged posture, enforced in the objective
+## 4. Currency discipline — one joint LP at the fixed peg (P4 final)
 
-The existing per-currency separation (`bess_simulator.py` module docstring §2) is **not** relaxed.
-DKK and EUR legs are never summed. Concretely: the LP is solved **once per currency bucket** for
-the capacity terms — or equivalently, capacity revenue is accumulated into
-`capacity_revenue_by_currency` exactly as today and the objective's capacity term is grouped by
-currency — so the optimizer never trades a EUR MW against a DKK MW on raw magnitude. A leg with no
-declared currency in the registry still raises `ValueError` (fail loud). `BacktestResult`'s
-`total_capacity_revenue_dkk` / `_eur`, `total_afrr_activation_revenue_eur`, and `currencies_present`
-keep their current meanings.
+**Reporting stays per-currency and native; the objective converts at the fixed peg.** Two distinct
+concerns that the earlier phases conflated:
 
-> **Modeling note.** Because up/down capacity in different currencies genuinely cannot share one
-> scalar objective, the clean formulation optimizes the **DKK-denominated stack and the
-> EUR-denominated stack as separate LPs that share the same SoC/power budget only through the
-> energy leg** (which is single-currency per zone). P1 will settle the exact decomposition; the
-> constraint set above is currency-agnostic and holds either way.
+- **Reporting** — `capacity_revenue_dkk` / `_eur`, `total_afrr_activation_revenue_eur`,
+  `currencies_present` keep their current meanings: each leg's revenue is bucketed by its *own*
+  registry-declared currency and **never converted** in the buckets. A leg with no declared currency
+  still raises `ValueError` (fail loud).
+- **Objective** — the dispatch is decided by **one joint LP** whose objective expresses every term in
+  a single common currency (DKK), converting EUR terms at the fixed `DKK_PER_EUR` peg
+  (`energy_EUR·7.46 + cap_DKK + cap_EUR·7.46 + activation_EUR·7.46`). All markets — energy, DKK
+  capacity, EUR capacity — compete for the one shared SoC/power/headroom budget on equal footing.
+
+**Why the peg in the objective is correct, not the bug §2 guards against.** The `bess_simulator.py`
+§2 bug was summing EUR and DKK **as if 1 EUR = 1 DKK** (no conversion). Converting at the official
+**fixed ERM II peg** is the opposite: DKK/EUR is a policy-held rate (±0.5 % in practice), not a
+floating market variable, so a fixed-rate objective is the *mathematically correct* way to
+co-optimize one physical battery earning in two pegged currencies — it is an accounting identity,
+not a market bet. This is the same justification as §4.1's combined totals, now applied to the
+objective as well.
+
+> **Design evolution (recorded, not hidden).** P1–P3 used a **two-solve decomposition** (a DKK LP
+> and a EUR LP sharing the physical trajectory) specifically to keep the peg *out* of the objective.
+> P4a's move of the energy leg to EUR exposed the flaw: whichever currency doesn't own the energy
+> leg has its capacity **crowded to ~0** (an artifact of solving greedily in sequence, not a true
+> optimum — DK1, all-DKK-capacity, lost ~53 % of its co-optimized total). The single joint pegged LP
+> replaces the two-solve design entirely: it is the **true global optimum** (no artifact crowd-out in
+> either currency) and **simpler** (one LP, no leftover-bounds bookkeeping, no primary/secondary,
+> no `energy_market_currency` switch). Confirmed with the user, P4.
 
 ### 4.1 Combined headline total at a fixed peg (7.46)
 
@@ -208,28 +222,26 @@ not a silent market assumption. The constant lives in one place (`shared/units.p
 DKK/EUR"), and the raw per-currency buckets are always shown beside it so nothing is hidden. This
 is a **presentation layer on top of** the currency separation, not a removal of it.
 
-### 4.2 Energy leg in EUR (P4) — and the decomposition swap
+### 4.2 The single joint LP (supersedes the P4a energy-in-EUR swap)
 
-For Denmark, day-ahead and intraday both *clear* in EUR (Nord Pool / SIDC); the `DayAheadPriceDKK`
-the registry ingests is itself a downstream conversion. To add intraday (ENTSO-E, EUR-only) as a
-second dispatchable energy price **without ever comparing a EUR price to a DKK price inside the LP
-objective** (the §4 principle), the co-optimizer runs its **entire energy leg in EUR**:
+One LP, one shared budget, objective in DKK-equivalent at the peg (§4). Each market is read in its
+**native** currency and converted only inside the objective:
 
-- A day-ahead **EUR** product (`DayAheadPriceEUR`, already published by the `DayAheadPrices` dataset,
-  currently only its DKK field is ingested) is registered; `ENERGY_MARKET_PRODUCT` points the
-  cooptimized engine's `day_ahead` and `intraday` markets at their EUR series. The **threshold
-  engine keeps reading DKK day-ahead — unchanged.**
-- **Decomposition swap.** The solve that owns the energy leg is now the EUR solve, so it becomes the
-  primary, trajectory-driving solve: **Solve EUR** = energy (day-ahead + intraday, EUR) + EUR
-  capacity legs; **Solve DKK** = DKK capacity legs on the leftover power/headroom. (P1 had it the
-  other way — energy was DKK and drove Solve 1. Same "shared physical trajectory, one currency per
-  objective" structure, EUR now owning the energy leg.)
-- **Reporting boundary, not objective.** The energy objective is pure EUR — no cross-currency
-  comparison, principle intact. The resulting energy revenue is expressed in the existing
-  `arbitrage_revenue_dkk` field via the fixed peg — a *reporting-boundary* conversion, exactly like
-  §4.1's combined totals, **never inside the objective** — so the DB schema, the threshold engine,
-  and every threshold-vs-cooptimized A/B stay currency-consistent. The native EUR is recoverable via
-  `total_revenue_all_eur` (which divides the DKK figures back out at the peg).
+- **Energy** — each configured `energy_markets` entry is read in its registry-native currency
+  (`day_ahead` → DKK, `imbalance` → DKK, `intraday` → EUR from P4b), so a mixed DKK/EUR energy set is
+  fine: the objective converts EUR energy at the peg. No `DayAheadPriceEUR` product, no
+  `energy_market_currency` switch, no same-currency guard needed — all removed. The **threshold
+  engine is untouched** (still reads DKK `day_ahead`/`price`).
+- **Capacity & activation** — DKK and EUR legs both enter the one objective (EUR·peg), competing
+  with energy and each other for the shared power/SoC/headroom budget. No crowd-out artifact.
+- **Reporting** — energy revenue lands in `arbitrage_revenue_dkk` (DKK energy native + any EUR energy
+  peg-converted at the reporting boundary, §4.1); capacity revenue stays in native per-currency
+  buckets (`capacity_revenue_dkk` / `_eur`, unconverted); activation in EUR. `total_revenue_all_dkk`
+  / `_eur` unchanged. DB schema unchanged.
+
+The no-double-selling both-endpoint headroom, symmetric-leg handling, cycle cap, and the
+schedule-vs-settlement (post/pre) split are all retained exactly — they are currency-agnostic
+physical constraints and sit inside the single LP unchanged.
 
 ---
 
