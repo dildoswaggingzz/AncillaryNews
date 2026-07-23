@@ -412,7 +412,7 @@ def test_dk2_mixed_currency_stack_reports_separate_buckets():
         capacity_markets=(("FCR", "down"), ("aFRR_capacity", "up")),
         capacity_mwh=50.0,
         power_mw=100.0,
-        starting_soc_fraction=0.15,  # tight up-headroom -> DKK leg doesn't claim all the power
+        starting_soc_fraction=0.85,
     )
     result = run_backtest(db, "DK2", BASE_TIME, BASE_TIME + timedelta(hours=6), config)
 
@@ -436,7 +436,7 @@ def test_combined_total_math_matches_hand_computed_conversion():
         capacity_markets=(("FCR", "down"), ("aFRR_capacity", "up")),
         capacity_mwh=50.0,
         power_mw=100.0,
-        starting_soc_fraction=0.15,
+        starting_soc_fraction=0.85,
     )
     result = run_backtest(db, "DK2", BASE_TIME, BASE_TIME + timedelta(hours=6), config)
 
@@ -684,6 +684,7 @@ def test_day_ahead_only_energy_markets_reproduces_prior_p1_p2_behaviour():
         {},
         [],
         energy_series_by_market={"day_ahead": price_series},
+        energy_currency={"day_ahead": "DKK"},
     )
 
     assert result_old_style.total_arbitrage_revenue_dkk == pytest.approx(148.0, abs=1e-6)
@@ -762,6 +763,7 @@ def test_perfect_foresight_explicit_schedule_matches_omitted_schedule():
         {},
         [],
         energy_series_by_market={"day_ahead": price_series},
+        energy_currency={"day_ahead": "DKK"},
         schedule_energy_series_by_market={"day_ahead": price_series},
         schedule_capacity_series_by_leg={},
     )
@@ -781,7 +783,7 @@ def test_foresight_rejects_invalid_value():
 
 
 def test_energy_markets_rejects_unknown_market():
-    with pytest.raises(ValueError, match="energy_markets"):
+    with pytest.raises(ValueError, match="energy market"):
         BessConfig(energy_markets=("day_ahead", "FCR"))
 
 
@@ -798,6 +800,77 @@ def test_energy_markets_rejects_empty():
 def test_energy_markets_rejects_duplicates():
     with pytest.raises(ValueError, match="duplicates"):
         BessConfig(energy_markets=("day_ahead", "day_ahead"))
+
+
+# --- P4: single joint pegged LP -- no currency crowd-out ------------------------
+
+
+def test_joint_lp_does_not_crowd_out_eur_capacity_when_energy_is_dkk():
+    """The key P4 regression: a single period where day-ahead (DKK) arbitrage
+    and a EUR capacity leg (FCR:down) both want the SAME scarce MW of power.
+    Per-MW-per-hour, the EUR leg is worth far more once peg-converted (50
+    EUR/MW/h * 7.46 = 373 DKK-equiv) than the arbitrage sale (100 DKK/MWh),
+    so the TRUE joint optimum commits the whole 1 MW to capacity and does
+    NOT discharge at all.
+
+    This is designed to FAIL on a greedy energy-first decomposition (the
+    superseded two-solve design, docs/bess-cooptimizer-design.md §4's
+    "design evolution" note): that design decides the DKK energy leg first,
+    with no visibility into the EUR leg's value at all, so it would happily
+    discharge the full 1 MW for the 100 DKK sale (selling already-stored,
+    'free' energy at any positive price is always attractive in isolation)
+    and leave ZERO leftover power for the EUR capacity leg -- exactly the
+    crowd-out artifact the joint LP replaces. Asserts both that EUR capacity
+    revenue is nonzero (not crowded to ~0) AND that the joint total beats
+    the greedy energy-first baseline (100 DKK) outright.
+    """
+    day_ahead = _price_rows([100.0])
+    fcr_down = _price_rows([50.0])  # EUR
+    db = _db_with_series(day_ahead, fcr_down=fcr_down)
+    config = BessConfig(
+        strategy="cooptimized",
+        capacity_markets=(("FCR", "down"),),
+        capacity_commit_mw=0.0,
+        power_mw=1.0,
+        capacity_mwh=10.0,
+        starting_soc_fraction=0.5,
+        max_cycles_per_day=None,
+    )
+    result = run_backtest(db, "DK2", BASE_TIME, BASE_TIME + timedelta(hours=1), config)
+
+    tick = result.ticks[0]
+    greedy_energy_first_dkk = 100.0 * 1.0 * 1.0  # full discharge, 0 capacity
+
+    assert result.total_capacity_revenue_eur > 0, "EUR capacity crowded to ~0 -- the P4 bug"
+    assert tick.capacity_revenue_by_market["FCR:down"] == pytest.approx(50.0, rel=1e-6)
+    assert result.total_revenue_all_dkk == pytest.approx(50.0 * DKK_PER_EUR, rel=1e-6)
+    assert result.total_revenue_all_dkk > greedy_energy_first_dkk
+
+
+def test_total_revenue_all_eur_equals_total_revenue_all_dkk_over_peg():
+    """`total_revenue_all_eur == total_revenue_all_dkk / DKK_PER_EUR` is a
+    pure algebraic identity of the two properties' formulas (both are the
+    SAME underlying figure, just which side of the peg conversion is
+    applied) -- holds regardless of which currencies the energy/capacity
+    legs are denominated in, since both properties are computed from the
+    same four `BacktestResult` totals either way."""
+    day_ahead = _price_rows([100.0] * 6)
+    afrr = _price_rows([5.0] * 6)
+    db = _db_with_series(day_ahead, afrr=afrr)
+    config = BessConfig(
+        strategy="cooptimized",
+        capacity_markets=(("aFRR_capacity", "up"),),
+        capacity_mwh=5.0,
+        power_mw=2.0,
+        starting_soc_fraction=0.5,
+        max_cycles_per_day=None,
+    )
+    result = run_backtest(db, "DK1", BASE_TIME, BASE_TIME + timedelta(hours=6), config)
+
+    assert result.total_revenue_all_dkk != 0.0
+    assert result.total_revenue_all_eur == pytest.approx(
+        result.total_revenue_all_dkk / DKK_PER_EUR, rel=1e-9
+    )
 
 
 # --- no data / empty window -------------------------------------------------------

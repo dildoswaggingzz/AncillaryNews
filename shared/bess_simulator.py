@@ -167,16 +167,20 @@ PRICE_RANKED_BASELINE_MULTIPLIER = 4
 # doesn't change what a BESS can bid into.
 EXCLUDED_MARKETS = frozenset({"mFRR_capacity", "mFRR_EAM", "mFRR_capacity_extra"})
 
-# Product string for every energy market `BessConfig.energy_markets` can name
-# OTHER than the day-ahead-driving series itself (day-ahead's own product is
-# `price_market`/`price_product` above, never this table -- one source of
-# truth for the series that drives the tick timeline). P3
-# (docs/bess-cooptimizer-design.md §6): `imbalance`'s product is
-# `imbalance_price` per `shared/datasets.py`'s `imbalance_price` dataset
-# (`ImbalancePriceDKK`, DKK/MWh -- the same currency as day_ahead, so no new
-# currency handling is needed for it anywhere in this module or
-# `shared/bess_dispatch_milp.py`).
+# Product string for every energy market `BessConfig.energy_markets` can
+# name, for the CO-OPTIMIZED engine only, read in its registry-NATIVE
+# currency (P4, docs/bess-cooptimizer-design.md §4.2's single joint LP --
+# the earlier P4a "energy-in-EUR" swap and its `energy_market_currency`
+# switch are superseded and removed; see that section's "design evolution"
+# note). The threshold engine never reads this table at all; it always
+# reads `price_market`/`price_product` (unchanged, DKK `day_ahead`/`price`).
+# `day_ahead` and `imbalance` are both DKK today; a EUR entry (ENTSO-E
+# intraday, P4b) is fine too -- the single joint LP's objective converts any
+# EUR term to DKK at the fixed peg itself (`shared/bess_dispatch_milp.py`),
+# so this table only ever needs to say which product to fetch, never which
+# currency family a run is restricted to.
 ENERGY_MARKET_PRODUCT: dict[str, str] = {
+    "day_ahead": "price",
     "imbalance": "imbalance_price",
 }
 
@@ -293,23 +297,25 @@ class BessConfig:
     # --- co-optimizer-only: dispatchable energy markets (docs/bess-cooptimizer-design.md §6) ---
     # Every energy market the co-optimizer's LP is allowed to dispatch
     # against, sharing the ONE SoC/power budget with each other --
-    # `("day_ahead",)` (the default) reproduces P1/P2's single-energy-market
-    # behaviour exactly (regression-tested,
-    # tests/test_bess_dispatch_milp.py). Adding `"imbalance"` (P3) lets the
-    # LP route discharge to whichever of {day_ahead, imbalance} pays more
-    # and charge to whichever costs less, each period, since a BESS is a
-    # *controllable* asset that CHOOSES its imbalance exposure rather than
-    # merely settling a forecast-error deviation the way a non-dispatchable
-    # generator would (the design doc's earlier "passive settlement" lean,
-    # its §9, was correct for that case but wrong for a battery, and is
-    # superseded -- see its §6). `imbalance`'s product is `imbalance_price`,
-    # DKK/MWh -- the SAME currency as day_ahead (`ENERGY_MARKET_PRODUCT`
-    # above), so both energy markets live entirely inside
-    # `shared/bess_dispatch_milp.py`'s Solve 1 -- no new currency handling.
+    # `("day_ahead",)` (the default) is the single-energy-market case.
+    # Adding `"imbalance"` (P3) lets the LP route discharge to whichever of
+    # {day_ahead, imbalance} pays more and charge to whichever costs less,
+    # each period, since a BESS is a *controllable* asset that CHOOSES its
+    # imbalance exposure rather than merely settling a forecast-error
+    # deviation the way a non-dispatchable generator would (the design
+    # doc's earlier "passive settlement" lean, its §9, was correct for that
+    # case but wrong for a battery, and is superseded -- see its §6).
     # **Threshold-strategy runs ignore this field entirely** (same posture
     # as `activation_endurance_hours` above) -- that engine stays
     # day_ahead-only, reading `price_market`/`price_product` exactly as it
-    # did before this field existed.
+    # did before this field existed. Each configured market is read in its
+    # OWN registry-native currency (`ENERGY_MARKET_PRODUCT` above) -- a
+    # mixed DKK/EUR energy set is fine (P4, docs/bess-cooptimizer-design.md
+    # §4.2): the co-optimizer's single joint LP objective converts any EUR
+    # term to DKK at the fixed peg itself, so there is no
+    # `energy_market_currency` switch or same-currency restriction to
+    # configure here (an earlier P4a design had one; superseded -- see that
+    # section's "design evolution" note).
     energy_markets: tuple[str, ...] = ("day_ahead",)
 
     # --- co-optimizer-only: post vs. pre foresight (docs/bess-cooptimizer-design.md §5) ---
@@ -387,10 +393,10 @@ class BessConfig:
                     f"energy market {market!r} is not eligible for BESS participation "
                     "(mFRR_capacity/mFRR_EAM are excluded — see module docstring)"
                 )
-            if market not in ("day_ahead", "imbalance"):
+            if market not in ENERGY_MARKET_PRODUCT:
                 raise ValueError(
-                    "energy_markets entries must be one of ('day_ahead', 'imbalance') for P3 "
-                    f"(the tuple is kept general for a future intraday entry, P4), got {market!r}"
+                    f"energy market {market!r} has no product mapping -- add it to "
+                    "ENERGY_MARKET_PRODUCT"
                 )
         if self.foresight not in ("perfect", "forecast"):
             raise ValueError(f"foresight must be 'perfect' or 'forecast', got {self.foresight!r}")
@@ -833,13 +839,18 @@ def run_backtest(
     )
 
     if config.strategy == "cooptimized":
-        # Energy markets (P3, docs/bess-cooptimizer-design.md §6): the
-        # day-ahead-driving series (`price_series`, from `price_market`/
-        # `price_product` above) is reused for whichever `energy_markets`
-        # entry matches `config.price_market` (almost always "day_ahead"),
-        # avoiding a duplicate fetch of the identical rows; every other
-        # configured energy market (e.g. "imbalance") is fetched fresh via
-        # `ENERGY_MARKET_PRODUCT`'s product string.
+        # Energy markets (P3 multi-market, P4 single joint LP -- docs/
+        # bess-cooptimizer-design.md §6/§4.2): the day-ahead-driving series
+        # (`price_series`, from `price_market`/`price_product` above -- DKK)
+        # is reused for whichever `energy_markets` entry matches
+        # `config.price_market` (almost always "day_ahead"), avoiding a
+        # duplicate fetch of the identical rows; every other configured
+        # energy market (e.g. "imbalance") is fetched fresh via
+        # `ENERGY_MARKET_PRODUCT`'s product string. Each market is read in
+        # its own registry-NATIVE currency -- a mixed DKK/EUR energy set is
+        # fine (the single joint LP's objective converts any EUR term to
+        # DKK at the fixed peg itself, `shared/bess_dispatch_milp.py`), so
+        # there is no same-currency restriction to enforce here.
         energy_series_by_market: dict[str, list[tuple[datetime, float]]] = {}
         for market in config.energy_markets:
             if market == config.price_market:
@@ -854,6 +865,26 @@ def run_backtest(
                 energy_series_by_market[market] = _fetch_series(
                     db, market, zone, product, start_time, end_time
                 )
+
+        # Each energy market's currency, resolved once here (same registry
+        # lookup every capacity leg already goes through above) and handed
+        # to the LP so its single joint objective knows which terms need
+        # the fixed peg conversion (module docstring §4/§4.2) -- fail loud
+        # on an unresolved unit, same posture as the capacity-leg check.
+        energy_currency: dict[str, str | None] = {}
+        for market in config.energy_markets:
+            product = (
+                config.price_product
+                if market == config.price_market
+                else ENERGY_MARKET_PRODUCT[market]
+            )
+            energy_currency[market] = currency_for(market, zone, product)
+        unknown_currency_energy_markets = [m for m, c in energy_currency.items() if c is None]
+        if unknown_currency_energy_markets:
+            raise ValueError(
+                f"no unit declared for energy market(s) {unknown_currency_energy_markets} in "
+                f"zone {zone!r}; add `unit=` to the SeriesConfig in shared/datasets.py"
+            )
 
         # Pre mode (P3, docs/bess-cooptimizer-design.md §5): a causal
         # lag-24h persistence forecast of every schedulable series -- energy
@@ -894,6 +925,7 @@ def run_backtest(
             leg_currency=leg_currency,
             activation_price_series=activation_price_series,
             energy_series_by_market=energy_series_by_market,
+            energy_currency=energy_currency,
             schedule_energy_series_by_market=schedule_energy_series_by_market,
             schedule_capacity_series_by_leg=schedule_capacity_series_by_leg,
         )

@@ -1,6 +1,6 @@
 # BESS co-optimizer P2 results: how much does double-selling overstate revenue?
 
-Generated 2026-07-22T13:59:16.023057+00:00 by `scripts/generate_cooptimizer_ab_report.py` against the
+Generated 2026-07-23T10:41:48.157102+00:00 by `scripts/generate_cooptimizer_ab_report.py` against the
 live database (`docs/bess-cooptimizer-design.md` §7 P2 row / §8). Every figure below is
 an **estimate** from a simulated backtest, not a real trading outcome -- same posture as
 every other BESS figure this project publishes (`shared/bess_simulator.py`'s module
@@ -19,7 +19,7 @@ shown below; neither is framed as "the co-optimizer earning less is worse" -- se
 
 Across 8 (config x zone x window) run(s) on real ingested data, the
 threshold engine's booked capacity revenue included
-**142,465.51 DKK / 4,613.21 EUR** of revenue that was
+**142,472.08 DKK / 4,604.52 EUR** of revenue that was
 **infeasible** under the same both-endpoint no-double-selling headroom rule the
 co-optimizer enforces (`shared.bess_dispatch_milp.phantom_capacity_revenue`) -- the
 battery lacked the SoC headroom to actually deliver the committed MW. That is
@@ -49,14 +49,14 @@ Direction confirmed on every pair. Magnitude stayed substantial for both configs
 
 | config | zone | window | threshold capacity (DKK) | phantom (DKK) | phantom % | threshold capacity (EUR) | phantom (EUR) | phantom % |
 |---|---|---|---|---|---|---|---|---|
-| Small commercial (1 MW / 2 MWh) | DK1 | 30d | 36,944.18 | 26,735.81 | 72.4% | 0.00 | 0.00 | 0.0% |
-| Utility-scale (10 MW / 40 MWh) | DK1 | 30d | 36,944.18 | 23,800.85 | 64.4% | 0.00 | 0.00 | 0.0% |
-| Small commercial (1 MW / 2 MWh) | DK1 | 90d | 50,250.86 | 35,218.76 | 70.1% | 0.00 | 0.00 | 0.0% |
-| Utility-scale (10 MW / 40 MWh) | DK1 | 90d | 50,250.86 | 31,100.57 | 61.9% | 0.00 | 0.00 | 0.0% |
-| Small commercial (1 MW / 2 MWh) | DK2 | 30d | 5,844.41 | 3,853.51 | 65.9% | 816.33 | 483.92 | 59.3% |
-| Utility-scale (10 MW / 40 MWh) | DK2 | 30d | 5,844.41 | 3,653.85 | 62.5% | 816.33 | 435.58 | 53.4% |
-| Small commercial (1 MW / 2 MWh) | DK2 | 90d | 16,718.45 | 9,451.22 | 56.5% | 3,370.87 | 1,971.91 | 58.5% |
-| Utility-scale (10 MW / 40 MWh) | DK2 | 90d | 16,718.45 | 8,650.95 | 51.7% | 3,370.87 | 1,721.80 | 51.1% |
+| Small commercial (1 MW / 2 MWh) | DK1 | 30d | 36,944.20 | 26,735.82 | 72.4% | 0.00 | 0.00 | 0.0% |
+| Utility-scale (10 MW / 40 MWh) | DK1 | 30d | 36,944.20 | 23,800.86 | 64.4% | 0.00 | 0.00 | 0.0% |
+| Small commercial (1 MW / 2 MWh) | DK1 | 90d | 50,250.88 | 35,218.77 | 70.1% | 0.00 | 0.00 | 0.0% |
+| Utility-scale (10 MW / 40 MWh) | DK1 | 90d | 50,250.88 | 31,100.58 | 61.9% | 0.00 | 0.00 | 0.0% |
+| Small commercial (1 MW / 2 MWh) | DK2 | 30d | 5,848.90 | 3,855.28 | 65.9% | 811.37 | 481.81 | 59.4% |
+| Utility-scale (10 MW / 40 MWh) | DK2 | 30d | 5,848.90 | 3,655.35 | 62.5% | 811.37 | 433.35 | 53.4% |
+| Small commercial (1 MW / 2 MWh) | DK2 | 90d | 16,722.94 | 9,452.98 | 56.5% | 3,365.91 | 1,969.80 | 58.5% |
+| Utility-scale (10 MW / 40 MWh) | DK2 | 90d | 16,722.94 | 8,652.45 | 51.7% | 3,365.91 | 1,719.57 | 51.1% |
 
 ## 3. Threshold vs. co-optimized, full A/B, per config/zone/window
 
@@ -70,13 +70,13 @@ Currencies present: DKK.
 
 | metric | threshold | co-optimized | delta | delta % |
 |---|---|---|---|---|
-| Arbitrage (DKK) | -3,787.88 | 42,195.58 | 45,983.46 | 1,214.0% |
-| Capacity (DKK) | 36,944.18 | 228,118.58 | 191,174.40 | 517.5% |
+| Arbitrage (DKK) | -3,787.88 | 42,586.41 | 46,374.29 | 1,224.3% |
+| Capacity (DKK) | 36,944.20 | 218,736.33 | 181,792.13 | 492.1% |
 | Capacity (EUR) | 0.00 | 0.00 | 0.00 | n/a |
-| aFRR activation (EUR) | 736.40 | 159.59 | -576.81 | -78.3% |
-| Combined total @ 7.46 DKK/EUR (DKK) | 38,649.87 | 271,504.72 | 232,854.85 | 602.5% |
-| Combined total @ 7.46 DKK/EUR (EUR) | 5,180.95 | 36,394.73 | 31,213.79 | 602.5% |
-| Full cycle equivalents | 34.31 | 15.46 | -18.85 | -54.9% |
+| aFRR activation (EUR) | 598.24 | 3,518.40 | 2,920.16 | 488.1% |
+| Combined total @ 7.46 DKK/EUR (DKK) | 37,619.22 | 287,570.04 | 249,950.82 | 664.4% |
+| Combined total @ 7.46 DKK/EUR (EUR) | 5,042.79 | 38,548.26 | 33,505.47 | 664.4% |
+| Full cycle equivalents | 34.31 | 14.81 | -19.51 | -56.9% |
 
 ### Utility-scale (10 MW / 40 MWh) -- DK1 -- 30d (2026-06-24 to 2026-07-24)
 
@@ -84,13 +84,13 @@ Currencies present: DKK.
 
 | metric | threshold | co-optimized | delta | delta % |
 |---|---|---|---|---|
-| Arbitrage (DKK) | 1,776.21 | 843,831.33 | 842,055.13 | 47,407.5% |
-| Capacity (DKK) | 36,944.18 | 2,058,089.12 | 2,021,144.93 | 5,470.8% |
+| Arbitrage (DKK) | 1,776.21 | 840,848.06 | 839,071.86 | 47,239.5% |
+| Capacity (DKK) | 36,944.20 | 1,983,659.85 | 1,946,715.66 | 5,269.3% |
 | Capacity (EUR) | 0.00 | 0.00 | 0.00 | n/a |
-| aFRR activation (EUR) | 736.40 | 1,131.36 | 394.96 | 53.6% |
-| Combined total @ 7.46 DKK/EUR (DKK) | 44,213.96 | 2,910,360.39 | 2,866,146.43 | 6,482.4% |
-| Combined total @ 7.46 DKK/EUR (EUR) | 5,926.80 | 390,128.74 | 384,201.93 | 6,482.4% |
-| Full cycle equivalents | 31.90 | 15.47 | -16.44 | -51.5% |
+| aFRR activation (EUR) | 598.24 | 32,086.46 | 31,488.22 | 5,263.4% |
+| Combined total @ 7.46 DKK/EUR (DKK) | 43,183.30 | 3,063,872.93 | 3,020,689.63 | 6,995.0% |
+| Combined total @ 7.46 DKK/EUR (EUR) | 5,788.65 | 410,706.83 | 404,918.18 | 6,995.0% |
+| Full cycle equivalents | 31.90 | 14.96 | -16.94 | -53.1% |
 
 ### Small commercial (1 MW / 2 MWh) -- DK1 -- 90d (2026-04-25 to 2026-07-24)
 
@@ -98,13 +98,13 @@ Currencies present: DKK.
 
 | metric | threshold | co-optimized | delta | delta % |
 |---|---|---|---|---|
-| Arbitrage (DKK) | -9,065.99 | 146,205.26 | 155,271.25 | 1,712.7% |
-| Capacity (DKK) | 50,250.86 | 351,750.50 | 301,499.63 | 600.0% |
+| Arbitrage (DKK) | -9,065.99 | 146,596.10 | 155,662.08 | 1,717.0% |
+| Capacity (DKK) | 50,250.88 | 342,368.24 | 292,117.36 | 581.3% |
 | Capacity (EUR) | 0.00 | 0.00 | 0.00 | n/a |
-| aFRR activation (EUR) | 736.40 | 159.59 | -576.81 | -78.3% |
-| Combined total @ 7.46 DKK/EUR (DKK) | 46,678.45 | 499,146.32 | 452,467.87 | 969.3% |
-| Combined total @ 7.46 DKK/EUR (EUR) | 6,257.16 | 66,909.69 | 60,652.53 | 969.3% |
-| Full cycle equivalents | 105.92 | 84.83 | -21.08 | -19.9% |
+| aFRR activation (EUR) | 598.24 | 3,518.40 | 2,920.16 | 488.1% |
+| Combined total @ 7.46 DKK/EUR (DKK) | 45,647.79 | 515,211.63 | 469,563.84 | 1,028.7% |
+| Combined total @ 7.46 DKK/EUR (EUR) | 6,119.01 | 69,063.22 | 62,944.21 | 1,028.7% |
+| Full cycle equivalents | 105.92 | 84.18 | -21.74 | -20.5% |
 
 ### Utility-scale (10 MW / 40 MWh) -- DK1 -- 90d (2026-04-25 to 2026-07-24)
 
@@ -112,13 +112,13 @@ Currencies present: DKK.
 
 | metric | threshold | co-optimized | delta | delta % |
 |---|---|---|---|---|
-| Arbitrage (DKK) | 73,241.71 | 2,714,309.17 | 2,641,067.47 | 3,606.0% |
-| Capacity (DKK) | 50,250.86 | 3,181,099.39 | 3,130,848.53 | 6,230.4% |
+| Arbitrage (DKK) | 73,241.71 | 2,711,325.90 | 2,638,084.20 | 3,601.9% |
+| Capacity (DKK) | 50,250.88 | 3,106,670.13 | 3,056,419.25 | 6,082.3% |
 | Capacity (EUR) | 0.00 | 0.00 | 0.00 | n/a |
-| aFRR activation (EUR) | 736.40 | 1,131.36 | 394.96 | 53.6% |
-| Combined total @ 7.46 DKK/EUR (DKK) | 128,986.14 | 5,903,848.51 | 5,774,862.37 | 4,477.1% |
-| Combined total @ 7.46 DKK/EUR (EUR) | 17,290.37 | 791,400.60 | 774,110.24 | 4,477.1% |
-| Full cycle equivalents | 100.13 | 76.32 | -23.81 | -23.8% |
+| aFRR activation (EUR) | 598.24 | 32,086.46 | 31,488.22 | 5,263.4% |
+| Combined total @ 7.46 DKK/EUR (DKK) | 127,955.48 | 6,057,361.04 | 5,929,405.56 | 4,634.0% |
+| Combined total @ 7.46 DKK/EUR (EUR) | 17,152.21 | 811,978.69 | 794,826.48 | 4,634.0% |
+| Full cycle equivalents | 100.13 | 75.81 | -24.31 | -24.3% |
 
 ### Small commercial (1 MW / 2 MWh) -- DK2 -- 30d (2026-06-24 to 2026-07-24)
 
@@ -126,13 +126,13 @@ Currencies present: DKK, EUR.
 
 | metric | threshold | co-optimized | delta | delta % |
 |---|---|---|---|---|
-| Arbitrage (DKK) | -2,905.20 | 61,164.33 | 64,069.53 | 2,205.3% |
-| Capacity (DKK) | 5,844.41 | 44,459.48 | 38,615.08 | 660.7% |
-| Capacity (EUR) | 816.33 | 0.00 | -816.33 | -100.0% |
-| aFRR activation (EUR) | 494.38 | 1,600.44 | 1,106.07 | 223.7% |
-| Combined total @ 7.46 DKK/EUR (DKK) | 12,717.13 | 117,563.13 | 104,846.00 | 824.4% |
-| Combined total @ 7.46 DKK/EUR (EUR) | 1,704.71 | 15,759.13 | 14,054.42 | 824.4% |
-| Full cycle equivalents | 36.10 | 34.45 | -1.65 | -4.6% |
+| Arbitrage (DKK) | -2,905.20 | 52,519.49 | 55,424.69 | 1,907.8% |
+| Capacity (DKK) | 5,848.90 | 23,126.17 | 17,277.27 | 295.4% |
+| Capacity (EUR) | 811.37 | 9,295.07 | 8,483.70 | 1,045.6% |
+| aFRR activation (EUR) | 449.24 | 3,766.01 | 3,316.78 | 738.3% |
+| Combined total @ 7.46 DKK/EUR (DKK) | 12,347.84 | 173,081.36 | 160,733.52 | 1,301.7% |
+| Combined total @ 7.46 DKK/EUR (EUR) | 1,655.21 | 23,201.25 | 21,546.05 | 1,301.7% |
+| Full cycle equivalents | 36.10 | 20.57 | -15.53 | -43.0% |
 
 ### Utility-scale (10 MW / 40 MWh) -- DK2 -- 30d (2026-06-24 to 2026-07-24)
 
@@ -140,13 +140,13 @@ Currencies present: DKK, EUR.
 
 | metric | threshold | co-optimized | delta | delta % |
 |---|---|---|---|---|
-| Arbitrage (DKK) | 25,977.93 | 1,110,869.95 | 1,084,892.02 | 4,176.2% |
-| Capacity (DKK) | 5,844.41 | 378,837.00 | 372,992.59 | 6,382.0% |
-| Capacity (EUR) | 816.33 | 0.00 | -816.33 | -100.0% |
-| aFRR activation (EUR) | 494.38 | 12,824.23 | 12,329.85 | 2,494.0% |
-| Combined total @ 7.46 DKK/EUR (DKK) | 41,600.26 | 1,585,375.67 | 1,543,775.42 | 3,711.0% |
-| Combined total @ 7.46 DKK/EUR (EUR) | 5,576.44 | 212,516.85 | 206,940.40 | 3,711.0% |
-| Full cycle equivalents | 33.24 | 31.13 | -2.11 | -6.3% |
+| Arbitrage (DKK) | 25,977.93 | 1,009,690.72 | 983,712.80 | 3,786.7% |
+| Capacity (DKK) | 5,848.90 | 206,672.23 | 200,823.33 | 3,433.5% |
+| Capacity (EUR) | 811.37 | 82,083.19 | 81,271.82 | 10,016.6% |
+| aFRR activation (EUR) | 449.24 | 34,664.80 | 34,215.56 | 7,616.4% |
+| Combined total @ 7.46 DKK/EUR (DKK) | 41,230.96 | 2,087,302.97 | 2,046,072.01 | 4,962.5% |
+| Combined total @ 7.46 DKK/EUR (EUR) | 5,526.94 | 279,799.33 | 274,272.39 | 4,962.5% |
+| Full cycle equivalents | 33.24 | 20.60 | -12.64 | -38.0% |
 
 ### Small commercial (1 MW / 2 MWh) -- DK2 -- 90d (2026-04-25 to 2026-07-24)
 
@@ -154,13 +154,13 @@ Currencies present: DKK, EUR.
 
 | metric | threshold | co-optimized | delta | delta % |
 |---|---|---|---|---|
-| Arbitrage (DKK) | -5,108.93 | 167,288.76 | 172,397.69 | 3,374.4% |
-| Capacity (DKK) | 16,718.45 | 144,091.39 | 127,372.94 | 761.9% |
-| Capacity (EUR) | 3,370.87 | 0.00 | -3,370.87 | -100.0% |
-| aFRR activation (EUR) | 494.38 | 1,600.44 | 1,106.07 | 223.7% |
-| Combined total @ 7.46 DKK/EUR (DKK) | 40,444.30 | 323,319.47 | 282,875.17 | 699.4% |
-| Combined total @ 7.46 DKK/EUR (EUR) | 5,421.49 | 43,340.41 | 37,918.92 | 699.4% |
-| Full cycle equivalents | 107.88 | 100.61 | -7.26 | -6.7% |
+| Arbitrage (DKK) | -5,108.93 | 139,206.23 | 144,315.16 | 2,824.8% |
+| Capacity (DKK) | 16,722.94 | 53,404.72 | 36,681.78 | 219.4% |
+| Capacity (EUR) | 3,365.91 | 40,490.46 | 37,124.55 | 1,103.0% |
+| aFRR activation (EUR) | 449.24 | 3,766.01 | 3,316.78 | 738.3% |
+| Combined total @ 7.46 DKK/EUR (DKK) | 40,075.00 | 522,764.26 | 482,689.26 | 1,204.5% |
+| Combined total @ 7.46 DKK/EUR (EUR) | 5,371.98 | 70,075.64 | 64,703.65 | 1,204.5% |
+| Full cycle equivalents | 107.88 | 61.56 | -46.32 | -42.9% |
 
 ### Utility-scale (10 MW / 40 MWh) -- DK2 -- 90d (2026-04-25 to 2026-07-24)
 
@@ -168,13 +168,13 @@ Currencies present: DKK, EUR.
 
 | metric | threshold | co-optimized | delta | delta % |
 |---|---|---|---|---|
-| Arbitrage (DKK) | 147,354.34 | 3,013,029.13 | 2,865,674.79 | 1,944.8% |
-| Capacity (DKK) | 16,718.45 | 1,180,866.23 | 1,164,147.78 | 6,963.3% |
-| Capacity (EUR) | 3,370.87 | 0.00 | -3,370.87 | -100.0% |
-| aFRR activation (EUR) | 494.38 | 12,824.23 | 12,329.85 | 2,494.0% |
-| Combined total @ 7.46 DKK/EUR (DKK) | 192,907.57 | 4,289,564.09 | 4,096,656.52 | 2,123.6% |
-| Combined total @ 7.46 DKK/EUR (EUR) | 25,858.92 | 575,008.59 | 549,149.67 | 2,123.6% |
-| Full cycle equivalents | 101.55 | 89.97 | -11.58 | -11.4% |
+| Arbitrage (DKK) | 147,354.34 | 2,679,765.59 | 2,532,411.24 | 1,718.6% |
+| Capacity (DKK) | 16,722.94 | 433,652.81 | 416,929.86 | 2,493.2% |
+| Capacity (EUR) | 3,365.91 | 363,977.92 | 360,612.01 | 10,713.7% |
+| aFRR activation (EUR) | 449.24 | 34,664.80 | 34,215.56 | 7,616.4% |
+| Combined total @ 7.46 DKK/EUR (DKK) | 192,538.27 | 6,087,293.05 | 5,894,754.78 | 3,061.6% |
+| Combined total @ 7.46 DKK/EUR (EUR) | 25,809.42 | 815,991.03 | 790,181.61 | 3,061.6% |
+| Full cycle equivalents | 101.55 | 61.00 | -40.56 | -39.9% |
 
 ## 4. Reading this: two directions, both honest
 
@@ -202,26 +202,6 @@ combined-total delta would instead be a genuine finding worth investigating.
 
 No row in this run has that combination -- every negative revenue delta observed (§3) co-occurs with a material phantom fraction (§2), consistent with phantom removal rather than a co-optimizer shortfall.
 
-**Observed P1 decomposition effect -- EUR capacity crowded out by arbitrage.** In
-4 row(s) below, the threshold engine booked real EUR capacity
-revenue but the co-optimizer's reported EUR capacity revenue is ~0. This is a known
-consequence of the sequential DKK-then-EUR decomposition
-(`shared/bess_dispatch_milp.py`'s module docstring): Solve 1 (arbitrage + DKK legs)
-decides how much power/headroom to leave for Solve 2's EUR legs *without* knowing
-what EUR revenue it is foregoing, and on a window where arbitrage is this lucrative
-(the realized `day_ahead` series in this run's window is highly volatile -- see the
-large arbitrage deltas in §3), Solve 1 has every incentive to claim the entire power
-budget for arbitrage, leaving Solve 2 nothing. **This is not a finding that EUR
-capacity reservation is unprofitable** -- the threshold engine's own booked EUR
-revenue in the same rows proves otherwise -- it is a limitation of P1's currency-
-decomposition choice, flagged here rather than silently absorbed into the headline
-numbers:
-
-- Small commercial (1 MW / 2 MWh) / DK2 / 30d: threshold EUR capacity 816.33, co-optimized EUR capacity 0.00.
-- Utility-scale (10 MW / 40 MWh) / DK2 / 30d: threshold EUR capacity 816.33, co-optimized EUR capacity 0.00.
-- Small commercial (1 MW / 2 MWh) / DK2 / 90d: threshold EUR capacity 3,370.87, co-optimized EUR capacity 0.00.
-- Utility-scale (10 MW / 40 MWh) / DK2 / 90d: threshold EUR capacity 3,370.87, co-optimized EUR capacity 0.00.
-
 **Data-coverage caveat.** `day_ahead` coverage is gap-free over every window above
 (§2's window-discovery gate); `FCR`/`aFRR_capacity`/`FFR`/`aFRR_energy` are not held to
 the same gate and several have materially shorter confirmed-live history than
@@ -238,13 +218,13 @@ Two further co-optimized runs per (config, zone, window) row above, both with
 so it is a second dispatchable energy market sharing the day-ahead leg's power/SoC
 budget, not passive settlement (docs/bess-cooptimizer-design.md §6).
 
-**Imbalance uplift (perfect foresight):** 9,368,939.45 DKK, summed
+**Imbalance uplift (perfect foresight):** 8,880,618.76 DKK, summed
 across every row -- perfect-foresight total WITH imbalance minus the day-ahead-only
 co-optimized total already shown in §3. Can never be negative (adding a second
 dispatchable market to the same shared budget can only weakly improve the optimum) --
 see the sanity check below.
 
-**Post − pre foresight gap:** 12,683,183.92 DKK, summed across every
+**Post − pre foresight gap:** 13,641,490.75 DKK, summed across every
 row -- perfect minus forecast foresight, both with imbalance enabled. This is the
 monetary value of forecast skill; with the lag-24h-persistence forecast
 (`shared/bess_simulator.py:_lag24h_forecast`) this is a conservative *floor* on that
@@ -254,14 +234,14 @@ floor already shows.
 
 | config | zone | window | day-ahead-only (perfect) | +imbalance (perfect) | imbalance uplift | +imbalance (forecast) | post − pre gap | gap % of post |
 |---|---|---|---|---|---|---|---|---|
-| Small commercial (1 MW / 2 MWh) | DK1 | 30d | 271,504.72 | 402,732.39 | 131,227.67 | 230,027.28 | 172,705.12 | 42.9% |
-| Utility-scale (10 MW / 40 MWh) | DK1 | 30d | 2,910,360.39 | 4,702,913.65 | 1,792,553.26 | 2,248,741.10 | 2,454,172.55 | 52.2% |
-| Small commercial (1 MW / 2 MWh) | DK1 | 90d | 499,146.32 | 669,754.27 | 170,607.95 | 412,556.99 | 257,197.28 | 38.4% |
-| Utility-scale (10 MW / 40 MWh) | DK1 | 90d | 5,903,848.51 | 8,252,503.96 | 2,348,655.45 | 4,674,711.56 | 3,577,792.41 | 43.4% |
-| Small commercial (1 MW / 2 MWh) | DK2 | 30d | 117,563.13 | 272,824.88 | 155,261.75 | 83,428.92 | 189,395.96 | 69.4% |
-| Utility-scale (10 MW / 40 MWh) | DK2 | 30d | 1,585,375.67 | 3,674,943.82 | 2,089,568.15 | 1,225,720.16 | 2,449,223.66 | 66.6% |
-| Small commercial (1 MW / 2 MWh) | DK2 | 90d | 323,319.47 | 506,638.15 | 183,318.69 | 245,038.93 | 261,599.22 | 51.6% |
-| Utility-scale (10 MW / 40 MWh) | DK2 | 90d | 4,289,564.09 | 6,787,310.63 | 2,497,746.54 | 3,466,212.90 | 3,321,097.73 | 48.9% |
+| Small commercial (1 MW / 2 MWh) | DK1 | 30d | 287,570.04 | 416,358.38 | 128,788.35 | 239,685.88 | 176,672.51 | 42.4% |
+| Utility-scale (10 MW / 40 MWh) | DK1 | 30d | 3,063,872.93 | 4,794,434.49 | 1,730,561.56 | 2,321,582.93 | 2,472,851.57 | 51.6% |
+| Small commercial (1 MW / 2 MWh) | DK1 | 90d | 515,211.63 | 683,380.26 | 168,168.62 | 423,041.73 | 260,338.53 | 38.1% |
+| Utility-scale (10 MW / 40 MWh) | DK1 | 90d | 6,057,361.04 | 8,344,024.80 | 2,286,663.76 | 4,750,900.12 | 3,593,124.68 | 43.1% |
+| Small commercial (1 MW / 2 MWh) | DK2 | 30d | 173,081.36 | 322,623.24 | 149,541.88 | 110,665.94 | 211,957.30 | 65.7% |
+| Utility-scale (10 MW / 40 MWh) | DK2 | 30d | 2,087,302.97 | 4,023,361.70 | 1,936,058.74 | 1,341,944.39 | 2,681,417.31 | 66.6% |
+| Small commercial (1 MW / 2 MWh) | DK2 | 90d | 522,764.26 | 698,000.53 | 175,236.27 | 376,619.55 | 321,380.98 | 46.0% |
+| Utility-scale (10 MW / 40 MWh) | DK2 | 90d | 6,087,293.05 | 8,392,892.63 | 2,305,599.59 | 4,469,144.76 | 3,923,747.88 | 46.8% |
 
 **Sanity checks (computed, not assumed):**
 

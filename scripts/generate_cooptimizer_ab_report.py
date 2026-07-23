@@ -81,6 +81,18 @@ skill, a *floor* given the lag-24h forecast (docs/bess-cooptimizer-design.md
 live history (~35 days at generation time) is shorter than day-ahead's, so
 these two figures are reported with the same data-coverage caveat as the
 capacity legs -- see §5's own notes.
+
+**P4 note: single joint pegged LP, no per-run currency switch.**
+`shared/bess_dispatch_milp.py`'s co-optimizer solves ONE joint LP per run --
+every energy market and every capacity leg (any currency) share the same
+power/SoC/headroom budget, with the objective converting any EUR term to
+DKK at the fixed `DKK_PER_EUR` peg (docs/bess-cooptimizer-design.md
+§4/§4.2). Every market is read in its registry-native currency (day-ahead
+and imbalance are both DKK today), so there is no `energy_market_currency`
+switch to configure and no risk of one currency's capacity being crowded
+out by another's presence -- an earlier P4a iteration used a two-solve
+decomposition that had exactly that artifact (documented and superseded;
+see the design doc's "design evolution" note).
 """
 
 import logging
@@ -228,7 +240,8 @@ def main() -> None:
                 # P3: imbalance-enabled perfect- and forecast-foresight runs,
                 # same config/zone/window (module docstring's P3 paragraph).
                 imbalance_config = replace(
-                    cooptimized_config, energy_markets=("day_ahead", "imbalance")
+                    cooptimized_config,
+                    energy_markets=("day_ahead", "imbalance"),
                 )
                 perfect_imbalance_result: BacktestResult = run_backtest(
                     db, zone, start, end, imbalance_config
