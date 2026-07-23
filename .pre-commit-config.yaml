@@ -1,6 +1,10 @@
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.8.4
+    # Keep in lockstep with the ruff version CI runs (pyproject dev-deps /
+    # `ruff --version`): a rev skew here formats differently than CI's
+    # `ruff format --check .`, which is exactly how unformatted files slipped
+    # onto main despite this hook existing.
+    rev: v0.8.6
     hooks:
       - id: ruff
         args: [--fix]

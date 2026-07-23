@@ -173,10 +173,9 @@ def test_lag24h_forecast_matches_naive_with_irregular_gaps():
     # Hourly for a day, then a 10-hour gap, then 15-minute MTUs -- deliberately
     # irregular (day-ahead vs. imbalance/FCR cadences genuinely differ), to
     # exercise the two-pointer's cutoff advancing correctly across gaps.
-    times = (
-        [BASE_TIME + timedelta(hours=i) for i in range(30)]
-        + [BASE_TIME + timedelta(hours=40 + i * 0.25) for i in range(20)]
-    )
+    times = [BASE_TIME + timedelta(hours=i) for i in range(30)] + [
+        BASE_TIME + timedelta(hours=40 + i * 0.25) for i in range(20)
+    ]
     series = [(t, float(i) % 7 + 0.5) for i, t in enumerate(times)]
     assert _lag24h_forecast(series) == _lag24h_forecast_naive_on_squared(series)
 

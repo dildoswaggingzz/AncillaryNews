@@ -386,9 +386,7 @@ def test_predict_output_is_non_crossing_with_a_real_fitted_model():
     n = 300
     feature_rows = _make_feature_rows(n)
     noise = rng.normal(scale=5.0, size=n)
-    target_series = [
-        (BASE + timedelta(hours=i), float(10 + (i % 24) + noise[i])) for i in range(n)
-    ]
+    target_series = [(BASE + timedelta(hours=i), float(10 + (i % 24) + noise[i])) for i in range(n)]
     dataset = join_features_and_target(feature_rows, target_series)
 
     config = ForecastModelConfig(n_estimators=20, num_leaves=7, early_stopping_rounds=5)
@@ -438,9 +436,7 @@ def test_run_model_walk_forward_end_to_end_produces_finite_pinball_losses():
     n = 700
     feature_rows = _make_feature_rows(n)
     noise = rng.normal(scale=3.0, size=n)
-    target_series = [
-        (BASE + timedelta(hours=i), float(10 + (i % 24) + noise[i])) for i in range(n)
-    ]
+    target_series = [(BASE + timedelta(hours=i), float(10 + (i % 24) + noise[i])) for i in range(n)]
     dataset = join_features_and_target(feature_rows, target_series)
 
     fold_a = Fold(
