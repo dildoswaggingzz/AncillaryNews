@@ -208,6 +208,29 @@ not a silent market assumption. The constant lives in one place (`shared/units.p
 DKK/EUR"), and the raw per-currency buckets are always shown beside it so nothing is hidden. This
 is a **presentation layer on top of** the currency separation, not a removal of it.
 
+### 4.2 Energy leg in EUR (P4) — and the decomposition swap
+
+For Denmark, day-ahead and intraday both *clear* in EUR (Nord Pool / SIDC); the `DayAheadPriceDKK`
+the registry ingests is itself a downstream conversion. To add intraday (ENTSO-E, EUR-only) as a
+second dispatchable energy price **without ever comparing a EUR price to a DKK price inside the LP
+objective** (the §4 principle), the co-optimizer runs its **entire energy leg in EUR**:
+
+- A day-ahead **EUR** product (`DayAheadPriceEUR`, already published by the `DayAheadPrices` dataset,
+  currently only its DKK field is ingested) is registered; `ENERGY_MARKET_PRODUCT` points the
+  cooptimized engine's `day_ahead` and `intraday` markets at their EUR series. The **threshold
+  engine keeps reading DKK day-ahead — unchanged.**
+- **Decomposition swap.** The solve that owns the energy leg is now the EUR solve, so it becomes the
+  primary, trajectory-driving solve: **Solve EUR** = energy (day-ahead + intraday, EUR) + EUR
+  capacity legs; **Solve DKK** = DKK capacity legs on the leftover power/headroom. (P1 had it the
+  other way — energy was DKK and drove Solve 1. Same "shared physical trajectory, one currency per
+  objective" structure, EUR now owning the energy leg.)
+- **Reporting boundary, not objective.** The energy objective is pure EUR — no cross-currency
+  comparison, principle intact. The resulting energy revenue is expressed in the existing
+  `arbitrage_revenue_dkk` field via the fixed peg — a *reporting-boundary* conversion, exactly like
+  §4.1's combined totals, **never inside the objective** — so the DB schema, the threshold engine,
+  and every threshold-vs-cooptimized A/B stay currency-consistent. The native EUR is recoverable via
+  `total_revenue_all_eur` (which divides the DKK figures back out at the peg).
+
 ---
 
 ## 5. Post vs. pre — both from one engine
