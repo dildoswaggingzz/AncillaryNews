@@ -1,0 +1,403 @@
+# BESS Co-Optimizer Design: one budget, no double-selling, post vs. pre
+
+**Date:** 2026-07-22
+**Status:** Design, ready to build. Branches off `main` (`bess-cooptimizer-design`).
+**Depends on:** `shared/bess_simulator.py` (existing threshold engine — kept, not replaced),
+`shared/db_manager.py` (`save_bess_run`/`fetch_bess_ticks`, `BacktestResult`/`BessTick` contract),
+`shared/datasets.py` (market/zone/product registry), `shared/units.py` (`currency_for`),
+`shared/forecast_model.py` (drives the "pre" mode). All merged.
+
+---
+
+## 0. Why the current engine bids wrongfully
+
+`shared/bess_simulator.py:run_backtest` computes three **independent** revenue streams and sums
+them. Independence is the bug: a real battery has *one* power rating and *one* state-of-charge,
+and every market competes for the same MW and the same MWh. Four concrete defects follow, each
+verified against the code:
+
+1. **Double-selling energy it cannot deliver (the load-bearing defect).** Capacity commitment
+   subtracts only *power* — `arbitrage_power_mw = power_mw − capacity_commit_mw`
+   (`bess_simulator.py:654`) — and reserves **zero energy/SoC**. The arbitrage leg is then free to
+   drain the pack to `soc_min` for a discharge (`:810`) while the same tick collects FCR/aFRR
+   **up**-capacity payments (`:754`) for MW the battery physically could not deliver, and collects
+   **down**-capacity while charging to `soc_max`. The docstring concedes this outright: it "ignores
+   any requirement to actually be able to deliver the reserved MW out of current SoC" (`:53-56`).
+   Both reference implementations (`BessBidder`, the Alqueva DA-IDA-aFRR-mFRR optimizer) treat this
+   as their #1 rule — *"No double-selling: headroom is computed by subtracting committed net
+   position before offering capacity."* Ours has no such constraint. **This structurally
+   overstates revenue.**
+
+2. **Static capacity commitment, never co-optimized.** `capacity_commit_mw` is a fixed constant
+   held back every period regardless of whether that MW is worth more standing as reserve or
+   cycling energy. The `capacity_allocation` logic (`even`/`price_ranked`) only splits an
+   *already-fixed* total *between* capacity markets — it never makes the actual multi-market
+   decision: *this period, reserve or arbitrage?* That trade-off is the essence of multi-market
+   bidding, and it is absent.
+
+3. **Myopic outlier arbitrage, not value-optimal dispatch.** The z-score fires only on statistical
+   outliers (`:795,805`). On a normal-shaped day with a real but sub-1σ peak/trough spread it
+   **never trades**, and it can charge at a "low" that is not the day's actual minimum. As a "what
+   would a battery have earned" benchmark this is simply wrong — a real backtest buys the cheapest
+   feasible hours and sells the dearest, subject to SoC.
+
+4. **No post/pre separation; single-market energy.** There is one causal heuristic — neither a
+   clean perfect-foresight benchmark (post) nor a forecast-swappable pipeline (pre). Energy
+   arbitrage reads `day_ahead` only, despite the multi-market goal.
+
+---
+
+## 1. What "correct" looks like — one shared budget
+
+The fix is to stop summing independent streams and instead solve **one optimization per backtest
+window** in which energy and reserve compete for a shared power rating and a shared SoC
+trajectory. This is a small **linear program (LP)**, mirroring the reference repos' MILP but
+without integer variables (see §3 for why the relaxation is exact here).
+
+New module: `shared/bess_dispatch_milp.py`. Exposed through the *existing* entry point as a new
+strategy, so nothing about the persisted-run contract changes:
+
+```python
+run_backtest(db, zone, start, end, config, strategy="cooptimized")  # new
+run_backtest(db, zone, start, end, config)                          # unchanged: "threshold"
+```
+
+`strategy` defaults to `"threshold"` so every stored morning-brief and `/dashboard/bess` run keeps
+reproducing exactly (the persisted `config` JSONB determinism guarantee in `save_bess_run` is
+preserved). The co-optimizer emits the **same `BacktestResult`/`BessTick`** objects — one tick per
+period, same revenue fields — so the dashboard, morning brief (`shared/bess_estimator.py`), and M6
+economic-eval consume it with no changes.
+
+---
+
+## 2. The LP
+
+**Indexing.** Periods `t = 0..T−1` over `[start, end]`, driven by the finest ingested energy
+cadence in scope (15-min MTU where available, else hourly). Capacity legs `m ∈ capacity_markets`,
+each with a direction (up/down/symmetric) resolved from its product string.
+
+**Decision variables (all ≥ 0):**
+
+| Variable | Meaning |
+|---|---|
+| `ch[t]`, `dis[t]` | grid charge / discharge power (MW) for energy arbitrage |
+| `soc[t]` | state of charge (MWh) at start of period `t` |
+| `cap_up[m,t]`, `cap_dn[m,t]` | reserve capacity committed to leg `m`, up/down (MW) |
+
+**Objective — maximize total revenue** (per-currency; see §4):
+
+```
+Σ_t price_energy[t] · (dis[t] − ch[t]) · dt[t]                         # arbitrage
+  + Σ_t Σ_m cap_price[m,t] · (cap_up[m,t] + cap_dn[m,t]) · dt[t]       # capacity reservation
+  + Σ_t Σ_m act_price[m,t] · cap_up[m,t] · ρ · dt[t]                   # aFRR activation (ρ = participation rate)
+```
+
+**Constraints:**
+
+```
+soc[t+1] = soc[t] + η·ch[t]·dt[t] − dis[t]·dt[t]/η          # SoC balance, split round-trip η
+soc_min ≤ soc[t] ≤ soc_max                                   # usable band (10–90 %)
+ch[t] + dis[t] + Σ_m(cap_up+cap_dn)[m,t] ≤ power_mw          # ONE power budget — energy & reserve share it
+```
+
+**No-double-selling (the constraint the current code lacks):** committed up-reserve must be
+deliverable out of stored energy for the standby period, and down-reserve must have room to absorb —
+and this must hold *after* the period's committed arbitrage flow, not just at its start (the
+references' "subtract committed net position before offering capacity"). SoC moves monotonically
+within a period (constant power), so binding on **both** the start SoC `soc[t]` and the end SoC
+`soc[t+1]` guarantees deliverability throughout the period:
+
+```
+Σ_m cap_up[m,t] · T_act ≤ (soc[t]   − soc_min) · η          # up: deliverable at period start
+Σ_m cap_up[m,t] · T_act ≤ (soc[t+1] − soc_min) · η          #     …and after the committed discharge
+Σ_m cap_dn[m,t] · T_act ≤ (soc_max − soc[t])   / η          # down: absorbable at period start
+Σ_m cap_dn[m,t] · T_act ≤ (soc_max − soc[t+1]) / η          #     …and after the committed charge
+```
+
+Binding on `soc[t]` alone would let the LP discharge to `soc_min` for arbitrage *and* book up-reserve
+off the higher start-of-period SoC in the same period — a residual within-period double-sell. The
+`soc[t+1]` pair closes it.
+
+`T_act` is the **energy-endurance** duration (hours) a reserve MW must be able to *sustain* out of
+SoC — **not** a ramp/response time. A BESS's full-activation time is seconds (it ramps
+near-instantly and easily meets every FAT requirement), so ramp is never the binding constraint;
+the only thing that limits how much reserve it can honestly commit is how much *energy* backs the
+MW. **Default: `T_act = 0.25 h` (one 15-min MTU)** — a fast-delivering battery need only hold a
+quarter-hour of energy per MW of reserve, not a full hour. Configurable per product, since
+endurance requirements differ (some FCR products define a longer minimum sustain window than one
+MTU). This is the exact "subtract committed net position before offering capacity" rule from the
+references, expressed as an SoC-headroom bound; it is what makes the battery unable to sell
+up-reserve while draining itself for arbitrage.
+
+> **Two independent axes — do not conflate them.** The battery is fully described by two user
+> inputs: `power_mw` (the rated-duty ceiling) and `capacity_mwh` (the stored energy). Their ratio
+> is the **C-rate** — a *descriptor only* (1 MW / 2 MWh = 0.5C), never a separate input or
+> constraint. Duty-cycle compliance is enforced entirely by the single power ceiling
+> `ch + dis + Σcap ≤ power_mw`; the model never references a C-rate as such. `T_act` (market
+> endurance) is a completely separate axis and is not derived from, or coupled to, the C-rate.
+>
+> **Sanity check the 0.25 h default gives.** A 1 MW / 2 MWh unit has 1.6 MWh usable (10–90 % band),
+> so energetically it could back up to `1.6 / 0.25 = 6.4 MW` of up-reserve — far above its 1 MW
+> power rating. So the **power ceiling binds, not the energy-headroom bound**: this battery's
+> reserve offer is capped at its rated 1 MW, exactly as physical duty-cycle compliance requires.
+> Only a longer `T_act` or a larger `capacity_mwh`-to-`power_mw` gap would move the binding
+> constraint onto energy — and the LP switches between the two automatically, with no C-rate term
+> anywhere.
+
+**Cycle cap** (carried over from `max_cycles_per_day`): rolling-24 h discharge energy ≤
+`capacity_mwh · max_cycles_per_day`, expressed as a sliding sum of `dis[t]·dt[t]`.
+
+---
+
+## 3. Why it is a pure LP (no integer variables)
+
+The classic reason a battery dispatch needs a binary is to forbid simultaneous charge and
+discharge. Here that binary is unnecessary: round-trip efficiency `η < 1` makes any simultaneous
+`ch[t] > 0 ∧ dis[t] > 0` strictly revenue-losing (you pay to cycle energy through losses for no
+price gain), so the optimum never does it and the LP relaxation is exact. Dropping the binary keeps
+the solve fast and deterministic.
+
+**Solver:** PuLP with the bundled **HiGHS** backend (open-source, no license, `poetry add pulp`;
+HiGHS ships with recent PuLP). Sizing: a 30-day window at hourly resolution is ~720 periods →
+low-thousands of variables → sub-second solve. At 15-min it is ~2,880 periods → still well under a
+second. No performance concern at backtest scale.
+
+**Determinism:** HiGHS on a fixed model is deterministic; we pin the solver options so a persisted
+`config` reproduces the same dispatch, preserving the `save_bess_run` reproducibility contract.
+
+---
+
+## 4. Currency discipline — one joint LP at the fixed peg (P4 final)
+
+**Reporting stays per-currency and native; the objective converts at the fixed peg.** Two distinct
+concerns that the earlier phases conflated:
+
+- **Reporting** — `capacity_revenue_dkk` / `_eur`, `total_afrr_activation_revenue_eur`,
+  `currencies_present` keep their current meanings: each leg's revenue is bucketed by its *own*
+  registry-declared currency and **never converted** in the buckets. A leg with no declared currency
+  still raises `ValueError` (fail loud).
+- **Objective** — the dispatch is decided by **one joint LP** whose objective expresses every term in
+  a single common currency (DKK), converting EUR terms at the fixed `DKK_PER_EUR` peg
+  (`energy_EUR·7.46 + cap_DKK + cap_EUR·7.46 + activation_EUR·7.46`). All markets — energy, DKK
+  capacity, EUR capacity — compete for the one shared SoC/power/headroom budget on equal footing.
+
+**Why the peg in the objective is correct, not the bug §2 guards against.** The `bess_simulator.py`
+§2 bug was summing EUR and DKK **as if 1 EUR = 1 DKK** (no conversion). Converting at the official
+**fixed ERM II peg** is the opposite: DKK/EUR is a policy-held rate (±0.5 % in practice), not a
+floating market variable, so a fixed-rate objective is the *mathematically correct* way to
+co-optimize one physical battery earning in two pegged currencies — it is an accounting identity,
+not a market bet. This is the same justification as §4.1's combined totals, now applied to the
+objective as well.
+
+> **Design evolution (recorded, not hidden).** P1–P3 used a **two-solve decomposition** (a DKK LP
+> and a EUR LP sharing the physical trajectory) specifically to keep the peg *out* of the objective.
+> P4a's move of the energy leg to EUR exposed the flaw: whichever currency doesn't own the energy
+> leg has its capacity **crowded to ~0** (an artifact of solving greedily in sequence, not a true
+> optimum — DK1, all-DKK-capacity, lost ~53 % of its co-optimized total). The single joint pegged LP
+> replaces the two-solve design entirely: it is the **true global optimum** (no artifact crowd-out in
+> either currency) and **simpler** (one LP, no leftover-bounds bookkeeping, no primary/secondary,
+> no `energy_market_currency` switch). Confirmed with the user, P4.
+
+### 4.1 Combined headline total at a fixed peg (7.46)
+
+The per-currency buckets above remain the **unconverted source of truth** — the objective still
+never trades a EUR MW against a DKK MW, and `total_capacity_revenue_dkk` / `_eur` keep their exact
+current meanings. On top of them we add **two derived, explicitly-labelled combined totals** so a
+reader gets one headline number:
+
+```python
+DKK_PER_EUR = 7.46   # fixed ERM II central-rate peg (DKK is pegged to EUR ~7.46038)
+
+total_revenue_all_dkk = (arbitrage_dkk + capacity_dkk)          + (capacity_eur + activation_eur) * DKK_PER_EUR
+total_revenue_all_eur = (arbitrage_dkk + capacity_dkk) / DKK_PER_EUR + (capacity_eur + activation_eur)
+```
+
+Both directions are exposed on `BacktestResult` (`total_revenue_all_dkk`, `total_revenue_all_eur`)
+so a DKK-thinking reader and a EUR-thinking reader each get a single figure. Why a *fixed* rate is
+legitimate here — and why this does **not** reopen the floating-rate mixing bug the module docstring
+§2 exists to prevent: the DKK/EUR rate is not a market variable, it is a **policy peg** held inside
+a ±2.25 % ERM II band (in practice ±0.5 %). A fixed 7.46 is therefore an accounting convenience,
+not a silent market assumption. The constant lives in one place (`shared/units.py`, alongside
+`currency_for`), is surfaced in every report that shows a combined total ("converted at fixed 7.46
+DKK/EUR"), and the raw per-currency buckets are always shown beside it so nothing is hidden. This
+is a **presentation layer on top of** the currency separation, not a removal of it.
+
+### 4.2 The single joint LP (supersedes the P4a energy-in-EUR swap)
+
+One LP, one shared budget, objective in DKK-equivalent at the peg (§4). Each market is read in its
+**native** currency and converted only inside the objective:
+
+- **Energy** — each configured `energy_markets` entry is read in its registry-native currency
+  (`day_ahead` → DKK, `imbalance` → DKK, `intraday` → EUR from P4b), so a mixed DKK/EUR energy set is
+  fine: the objective converts EUR energy at the peg. No `DayAheadPriceEUR` product, no
+  `energy_market_currency` switch, no same-currency guard needed — all removed. The **threshold
+  engine is untouched** (still reads DKK `day_ahead`/`price`).
+- **Capacity & activation** — DKK and EUR legs both enter the one objective (EUR·peg), competing
+  with energy and each other for the shared power/SoC/headroom budget. No crowd-out artifact.
+- **Reporting** — energy revenue lands in `arbitrage_revenue_dkk` (DKK energy native + any EUR energy
+  peg-converted at the reporting boundary, §4.1); capacity revenue stays in native per-currency
+  buckets (`capacity_revenue_dkk` / `_eur`, unconverted); activation in EUR. `total_revenue_all_dkk`
+  / `_eur` unchanged. DB schema unchanged.
+
+The no-double-selling both-endpoint headroom, symmetric-leg handling, cycle cap, and the
+schedule-vs-settlement (post/pre) split are all retained exactly — they are currency-agnostic
+physical constraints and sit inside the single LP unchanged.
+
+---
+
+## 5. Post vs. pre — both from one engine
+
+Same LP, different price inputs:
+
+- **Post (perfect-foresight benchmark).** Feed *actual* realised prices. The solution is the
+  honest ceiling on what any battery could have earned in the real market over the window — an
+  oracle, not a deployable policy. This is the "what it would have made" number.
+
+- **Pre (forecast-driven).** Solve the LP on *forecast* prices, fix the resulting schedule
+  (`ch`, `dis`, `cap_*`), then **settle that schedule at actual prices.** This is the realistic
+  forecasting evaluation: you bid on what you expected, you get paid what happened. Revenue is
+  `Σ actual_price · scheduled_flow`.
+
+**Mechanism (the P3 contribution).** The engine takes two price sets: **schedule prices** (what the
+LP optimises against) and **settlement prices** (what the fixed schedule is valued at). Post mode
+passes actuals for both; pre mode passes a forecast for schedule and actuals for settlement — one
+code path, a `foresight` switch on `BessConfig`. This is forecast-source-agnostic: any series can
+be the schedule price.
+
+**Forecast source for P3: lag-24h persistence.** The concrete pre-mode forecast is a causal
+lag-24h persistence of each price (yesterday's same-MTU value) — a standard, no-lookahead
+day-ahead baseline that matches `shared/baselines.py`'s persistence discipline. It needs no model
+training and is honest as a *floor* on forecast value. Wiring the M6 LightGBM day-ahead / FCR-D
+models (`shared/forecast_model.py`) as a richer schedule-price source is a documented later hook,
+not P3 scope.
+
+The **post − pre gap is the monetary value of forecast skill** — the same headroom logic as the M6
+economic-eval design (`docs/forecast-economic-eval-design.md` §1), now with a *feasible* dispatch
+underneath it instead of an allocation-only lever. With the lag-24h forecast the gap is a
+*conservative* (floor) estimate of that value; a better forecast can only narrow it.
+
+> **Interaction with M6 P4.** The economic-eval doc explicitly built on the current simulator's
+> "capacity always clears, allocation is the only lever" framing (its §0). The co-optimizer widens
+> that: a forecast can now add value through **bidding feasibility** (committing reserve only where
+> SoC headroom actually supports it), not just allocation. P4's headroom diagnostic still applies —
+> it just runs on top of the co-optimized engine once P5 migrates the defaults. No rework of P4 is
+> forced; it gains a second, more realistic lever to measure.
+
+---
+
+## 6. Multi-market scope & the data reality
+
+Decision (confirmed with user): **full DA + intraday + imbalance** energy stack. Availability
+audit against `shared/datasets.py` and a Nord Pool investigation:
+
+| Stream | Ingested today? | Plan |
+|---|---|---|
+| Day-ahead energy | ✅ `day_ahead` | Core energy leg, P1. |
+| Imbalance settlement | ✅ `imbalance` | Second energy stream, P3. |
+| FCR / aFRR capacity | ✅ `FCR`, `aFRR_capacity`, `FFR` | Capacity legs, P1 (both directions). |
+| aFRR activation | ✅ `aFRR_energy` | Activation term, P1. |
+| **Intraday (IDA) prices** | ❌ **not ingested** | **New ingestion required — P4.** |
+
+**The intraday finding (P4 — BLOCKED, no free source, live-tested).** There is no intraday price
+market in the registry (the only "intraday" string is `ForecastIntraday`, a wind/solar *generation*
+forecast — not a price). After obtaining a real ENTSO-E API token and testing the live API
+exhaustively, the conclusion is definitive: **there is no free source of DK1/DK2 intraday-auction
+(IDA) energy prices.** The evidence, all from live queries against `web-api.tp.entsoe.eu`:
+
+- **ENTSO-E does NOT serve IDA auction prices — proven live, not inferred.** `documentType=A44` +
+  `contract_MarketAgreement.Type=A01` (day-ahead) returns real DK1/DK2 data, confirming token/
+  endpoint/domains are correct. But `contract_MarketAgreement.Type=A07` (intraday) — with or without
+  `classificationSequence…position=1|2|3`, and across every tested `businessType`/`processType`/
+  `auction.Type` variant — returns `Acknowledgement_MarketDocument` "No matching data found for Data
+  item ENERGY_PRICES [12.1.D]" for DK1, DK2, **and DE-LU** (a core SIDC/IDA participant — the
+  clinching control). The Postman collection *documents* the `A07` parameter on that endpoint, but it
+  returns no data for anyone. (This overturns the earlier doc-based claim that ENTSO-E served DK IDA
+  prices; the live API settled it.) A likely reason: **ACER only issued Decision 03/2026 on
+  harmonised intraday clearing prices** — a standardised IDA price publication is still a 2026
+  regulatory work-in-progress.
+- **JAO Nordic** serves flow-based *capacity* data only (`netPosition`, `priceSpread`, `shadowPrices`,
+  `scheduledExchange`, `maxBex`, `congestionIncome`) — no zonal energy price.
+- **Nord Pool** (the actual NEMO that clears the Nordic IDAs) has the prices but they are
+  subscription-gated (~€400/yr).
+
+**ENTSO-E data that DID return live for DK1 with the token** (catalogued for future use, none a
+substitute for an IDA price): day-ahead prices (A44/A01), intraday wind/solar *forecasts* (A69/A40),
+imbalance prices (A85, gzip). Day-ahead and imbalance we already ingest from Energi Data Service.
+
+**P4 consequence: intraday ingestion is parked, not built.** The co-optimizer is left fully
+**intraday-ready** — energy markets are a pluggable list (`BessConfig.energy_markets`) and the
+single joint LP (§4.2) already dispatches mixed-currency energy — so if a free IDA price source ever
+materialises (e.g. once the ACER-harmonised publication goes live), adding it is a pure *data*
+change (new ingestor + registry entry), not an engine change. Until then, P3's **imbalance** already
+provides a free, working second energy market.
+
+**Imbalance is a dispatchable second energy price, not passive settlement** (decision confirmed with
+user, P3). A BESS is a *controllable* asset: unlike a wind farm it has no forecast-error deviation
+to settle — its imbalance exposure comes from *choosing* to position against the imbalance price.
+So P3 models imbalance as a second energy market the LP dispatches against, sharing the one SoC/
+power budget with day-ahead: each period the LP routes discharge to whichever of {DA, imbalance}
+pays more and charge to whichever costs less (subject to the shared budget). The earlier
+"passive-settlement" lean (§9) was correct for non-dispatchable assets but wrong for a battery, and
+is superseded. `imbalance` is DKK/MWh (registry), same currency as `day_ahead`, so both live in the
+single-currency energy leg — no new currency handling.
+
+---
+
+## 7. Phasing
+
+| Phase | Deliverable | Gate |
+|---|---|---|
+| **P0** | This doc, on `bess-cooptimizer-design`. Nord Pool / ENTSO-E IDA audit (done — §6). | ✅ |
+| **P1** | `shared/bess_dispatch_milp.py`: DA energy + FCR/aFRR capacity (both directions) + aFRR activation, no-double-selling headroom, **post** mode. Wired as `strategy="cooptimized"`. Unit tests incl. a **double-selling regression test**. | LP matches hand-checked tiny window. |
+| **P2** | A/B report: co-optimized vs. threshold revenue on identical windows, quantifying the double-sell overstatement. `scripts/generate_cooptimizer_ab_report.py` → `docs/bess-cooptimizer-results.md`. | Co-optimized ≥ threshold on *feasible* windows; on double-sell windows threshold overstates and the report quantifies the phantom revenue (see below). |
+| **P3** | Imbalance as second energy stream + **pre**/forecast mode (schedule on forecast, settle on actuals). Post−pre gap reported. | Pre ≤ Post always. |
+| **P4** | Two parts. **P4-engine (done):** joint pegged LP + intraday-ready energy leg (§4.2). **P4b intraday ingestion — PARKED:** no free source of DK IDA auction prices exists (ENTSO-E returns nothing live even with a token; JAO capacity-only; Nord Pool paid — §6). | Engine done & merged-ready; intraday deferred until a free IDA price source exists. |
+| **P5** | Migrate morning-brief + `/dashboard/bess` defaults to `strategy="cooptimized"`. | A/B report reviewed. |
+
+---
+
+## 8. Validation gates
+
+- **Double-selling regression test** — a window where the threshold engine books up-capacity while
+  discharging to `soc_min`; assert the co-optimizer cannot (headroom constraint binds, revenue is
+  lower and *feasible*).
+- **Perfect-foresight ≥ any *feasible* dispatch** on every test window (an optimum can never
+  underperform a feasible policy). Note the threshold engine is **not** always feasible — when it
+  double-sells it books capacity revenue for MW it cannot deliver, so on those windows its reported
+  total can *exceed* the co-optimized optimum. That excess is **phantom revenue**, not a co-optimizer
+  regression; P2's report isolates and quantifies it (see §7 P2). The gate holds strictly only on
+  windows where the threshold engine never double-sells.
+- **SoC feasibility** — assert `soc_min ≤ soc[t] ≤ soc_max` and headroom bounds hold at every tick
+  of the returned trace.
+- **LP vs. brute force** — on a 3–4 period hand-computable window, the LP optimum equals an
+  exhaustive search.
+- **Currency non-mixing** — a DK2 mixed-currency stack reports `currencies_present == {"DKK","EUR"}`
+  with separate totals; no EUR MW is ever traded against a DKK MW in allocation.
+- **Reproducibility** — a persisted `config` re-solves to identical dispatch (PuLP's bundled CBC on
+  a fixed pure-LP model is deterministic; HiGHS was dropped in P1 in favour of the zero-config CBC
+  backend).
+
+---
+
+## 9. Risks & open questions
+
+- **`T_act` calibration.** The energy-endurance parameter driving the headroom bound (§2) —
+  **not** a ramp time; BESS ramp in seconds. Default `0.25 h` (one 15-min MTU), at which the reserve
+  offer is limited by the `power_mw` ceiling rather than by SoC energy. Exposed per product on
+  `BessConfig`, and kept strictly separate from the battery's C-rate (just `power_mw / capacity_mwh`,
+  a descriptor, not a knob); a longer minimum-sustain window on a specific FCR product raises `T_act`
+  and makes energy the binding constraint again.
+- **DA↔imbalance coupling — RESOLVED (P3).** Imbalance is a **dispatchable second energy price**,
+  not passive settlement — a BESS is controllable and takes imbalance positions by choice (§6). The
+  earlier passive-settlement lean applied to non-dispatchable assets and is superseded.
+- **P1 currency decomposition understates DK2 EUR capacity.** P2's real-data run showed the
+  sequential DKK-then-EUR solve lets lucrative DKK arbitrage claim the whole power budget, crowding
+  EUR (FCR) capacity to ~0 (`docs/bess-cooptimizer-results.md` §4). Not a claim that EUR capacity is
+  unprofitable — a limitation of the decomposition. A joint or iterated DKK/EUR solve is future work.
+- **Symmetric FCR products.** FCR-N / DK1 FCR are symmetric bands — one commitment obligates *both*
+  up and down headroom simultaneously. The headroom constraints must bind on both sides for a
+  symmetric leg (tighter than an up-only or down-only aFRR leg). P1 handles product symmetry
+  explicitly from the product string.
+- **Solver as a new dependency.** PuLP+HiGHS is pure-Python-installable and CI-friendly, but it is
+  a new runtime dep in the Poetry lock and the ingestor/orchestrator images. P1 confirms it builds
+  in the Docker images before committing to it.

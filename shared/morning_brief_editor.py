@@ -12,6 +12,14 @@ subsection) since Slack readers want a scannable summary, not the full
 narrative. `render_for_email` is the fuller version: every forecast horizon
 in full, the complete causal-factor explanation, and the full glossary
 inline (an email reader has more room/patience than a Slack skim).
+
+P5: the threshold engine is retired from the brief. `bess_estimates` now
+carries the co-optimizer's honest achievable (causal lag-24h forecast)
+headline alongside a labelled perfect-foresight theoretical ceiling (see
+`shared/bess_estimator.py`'s module docstring) -- `_bess_line` renders both.
+Old persisted briefs carry the pre-P5 single-number shape; `_bess_line`
+falls back to that rendering when the new achievable/ceiling keys are
+absent, so historical briefs keep rendering correctly.
 """
 
 from __future__ import annotations
@@ -35,6 +43,15 @@ BESS_JARGON_GLOSSARY = {
     "it's expensive.",
     "capacity reservation revenue": "Money earned just for being available/on standby to help "
     "the grid, whether or not it's ever actually called on.",
+    # P5: the co-optimizer publishes two numbers per config/zone (shared/
+    # bess_estimator.py's module docstring) -- these two entries are what
+    # make that distinction understandable to a non-technical reader.
+    "achievable": "The realistic estimate: what the battery would have earned using a simple, "
+    "honest day-ahead price forecast (it does not know the future) -- this is the number to "
+    "trust as 'what a battery like this would actually have made'.",
+    "theoretical ceiling": "An upper-bound estimate assuming the battery knew every future price "
+    "in advance (a perfect-foresight oracle). Never achievable by any real strategy -- shown only "
+    "for context, as the most any battery of this size could conceivably have earned.",
 }
 
 # Confidence badges used by both render functions and by the dashboard
@@ -94,10 +111,49 @@ def compose_brief(
 
 
 def _bess_line(estimate: dict) -> str:
+    """
+    Renders one BESS estimate line. P5 retired the threshold engine from the
+    brief in favor of the co-optimizer's honest achievable-vs-ceiling pair
+    (`shared/bess_estimator.py`'s module docstring): `foresight="forecast"`
+    (causal lag-24h persistence forecast -- what a battery could actually
+    have earned) is the achievable headline, `foresight="perfect"` (an
+    oracle) is a labelled theoretical ceiling, never presented as a number a
+    real battery could hit.
+
+    Backward compat: briefs persisted before P5 carry the OLD summary shape
+    (a single `total_revenue_dkk`, no `_achievable`/`_ceiling` suffixed keys
+    at all -- see `tests/test_morning_brief_editor.py`'s old-shape fixture).
+    Detected via the absence of `total_revenue_all_dkk_achievable`; falls
+    back to the old single-number rendering so historical briefs still
+    render correctly rather than showing blank/zero achievable-ceiling
+    fields.
+    """
+    if "total_revenue_all_dkk_achievable" not in estimate:
+        cap_note = (
+            " (cycle cap limited earnings some days)"
+            if estimate.get("cycle_cap_was_binding")
+            else ""
+        )
+        afrr_eur = estimate.get("total_afrr_activation_revenue_eur", 0)
+        afrr_note = f"; +{afrr_eur:,.0f} EUR aFRR activation" if afrr_eur else ""
+        return (
+            f"{estimate.get('config_label')} in {estimate.get('zone')}: "
+            f"{estimate.get('total_revenue_dkk', 0):,.0f} DKK over the window "
+            f"({estimate.get('full_cycle_equivalents', 0):.2f} full cycle equivalents)"
+            f"{cap_note}{afrr_note}"
+        )
+
+    # New (P5) shape: honest achievable headline + labelled theoretical
+    # ceiling. Cycle-cap/aFRR detail notes are sourced from the achievable
+    # run only (the ceiling run is an oracle, not a deployable strategy, so
+    # its own cycle/activation detail isn't surfaced here -- see
+    # `run_illustrative_backtests`'s docstring).
     cap_note = (
-        " (cycle cap limited earnings some days)" if estimate.get("cycle_cap_was_binding") else ""
+        " (cycle cap limited earnings some days)"
+        if estimate.get("cycle_cap_was_binding_achievable")
+        else ""
     )
-    afrr_eur = estimate.get("total_afrr_activation_revenue_eur", 0)
+    afrr_eur = estimate.get("total_afrr_activation_revenue_eur_achievable", 0)
     # Deliberately kept as a separate clause, not summed into the DKK figure
     # above -- consistent with the "never summed" product decision (mixing
     # EUR into a DKK total would misstate it). Omitted entirely when zero
@@ -106,8 +162,10 @@ def _bess_line(estimate: dict) -> str:
     afrr_note = f"; +{afrr_eur:,.0f} EUR aFRR activation" if afrr_eur else ""
     return (
         f"{estimate.get('config_label')} in {estimate.get('zone')}: "
-        f"{estimate.get('total_revenue_dkk', 0):,.0f} DKK over the window "
-        f"({estimate.get('full_cycle_equivalents', 0):.2f} full cycle equivalents)"
+        f"~{estimate.get('total_revenue_all_dkk_achievable', 0):,.0f} DKK achievable "
+        "(simple day-ahead persistence forecast); up to "
+        f"~{estimate.get('total_revenue_all_dkk_ceiling', 0):,.0f} DKK with perfect foresight "
+        "(theoretical ceiling, not achievable)"
         f"{cap_note}{afrr_note}"
     )
 
@@ -148,7 +206,10 @@ def render_for_slack(brief: MorningBrief) -> str:
 
     if brief.bess_estimates:
         lines.append("")
-        lines.append("*Illustrative BESS estimates (past month, ~1.5 cycles/day cap):*")
+        lines.append(
+            "*Illustrative BESS estimates (past month, ~1.5 cycles/day cap, "
+            "achievable vs. theoretical ceiling):*"
+        )
         for estimate in brief.bess_estimates:
             lines.append(f"• {_bess_line(estimate)}")
 
@@ -224,7 +285,8 @@ def render_for_email(brief: MorningBrief) -> tuple[str, str, str]:
 {causal_html}
 <h2>Outlook</h2>
 {"".join(forecast_htmls)}
-<h2>Illustrative BESS estimates (past month, ~1.5 cycles/day cap)</h2>
+<h2>Illustrative BESS estimates (past month, ~1.5 cycles/day cap,
+achievable vs. theoretical ceiling)</h2>
 <ul>{bess_html}</ul>
 <h2>Glossary</h2>
 <dl>{glossary_html}</dl>
@@ -244,7 +306,7 @@ Yesterday:
 Outlook:
 {"".join(forecast_texts)}
 
-Illustrative BESS estimates (past month, ~1.5 cycles/day cap):
+Illustrative BESS estimates (past month, ~1.5 cycles/day cap, achievable vs. theoretical ceiling):
 {bess_text}
 
 Glossary:

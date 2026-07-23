@@ -33,6 +33,7 @@ import os
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -349,6 +350,14 @@ class BessBacktestRequest(BaseModel):
     # to opt a DK2 run into FCR-D on top of the defaults -- unset falls back
     # to BessConfig.capacity_markets' own default (FCR/aFRR_capacity only).
     capacity_markets: list[tuple[str, str]] | None = None
+    # P5: unset falls back to BessConfig's own defaults ("threshold" /
+    # "perfect") -- callers wanting the co-optimizer (and its achievable vs.
+    # theoretical-ceiling foresight modes; see shared/bess_estimator.py's
+    # module docstring) must pass these explicitly. BessConfig's own class
+    # defaults are deliberately left untouched (old persisted run configs
+    # must keep reproducing under the threshold engine).
+    strategy: str | None = None
+    foresight: str | None = None
 
 
 def _build_bess_config(overrides: dict) -> BessConfig:
@@ -976,12 +985,23 @@ def dashboard_bess_list(request: Request, db: DatabaseManager = Depends(get_db))
     return templates.TemplateResponse(request, "bess_list.html", {"runs": runs})
 
 
+# P5: the dashboard form's own pre-filled defaults default to the
+# co-optimizer's honest achievable mode (strategy="cooptimized",
+# foresight="forecast") -- NOT BessConfig's own class defaults
+# (strategy="threshold", foresight="perfect"), which stay untouched so old
+# persisted run configs keep reproducing (see shared/bess_estimator.py's
+# module docstring). This is done purely at the form-defaults layer via
+# `dataclasses.replace`, never by editing BessConfig itself.
+_BESS_DASHBOARD_DEFAULTS = replace(BessConfig(), strategy="cooptimized", foresight="forecast")
+
+
 @app.get("/dashboard/bess/new", response_class=HTMLResponse)
 def dashboard_bess_new_form(request: Request):
     """Form to trigger a new backtest run over a given zone/time window, with the battery's
-    defaults pre-filled (shared.bess_simulator.BessConfig)."""
+    defaults pre-filled (shared.bess_simulator.BessConfig). Defaults the strategy/foresight
+    selectors to the co-optimizer's achievable mode (see `_BESS_DASHBOARD_DEFAULTS`)."""
     return templates.TemplateResponse(
-        request, "bess_new.html", {"error": None, "defaults": BessConfig()}
+        request, "bess_new.html", {"error": None, "defaults": _BESS_DASHBOARD_DEFAULTS}
     )
 
 
@@ -1013,6 +1033,12 @@ def dashboard_bess_trigger(
     include_fcr_d: bool = Form(False),
     include_ffr: bool = Form(False),
     include_afrr_down: bool = Form(False),
+    # P5: form defaults to the co-optimizer's achievable mode (see
+    # `_BESS_DASHBOARD_DEFAULTS`); a viewer can still pick "threshold" or
+    # "perfect" explicitly. Neither BessConfig's own defaults are touched by
+    # this -- they're passed straight through to BessConfig(...) below.
+    strategy: str = Form("cooptimized"),
+    foresight: str = Form("forecast"),
     db: DatabaseManager = Depends(get_db),
 ):
     """Runs the submitted form through the same trigger logic the JSON API uses, then redirects to
@@ -1074,11 +1100,13 @@ def dashboard_bess_trigger(
             # actually in the stack, so every other run's numbers stay
             # exactly as reproducible as before.
             capacity_allocation="price_ranked" if include_ffr else "even",
+            strategy=strategy,
+            foresight=foresight,
         )
         summary = _run_and_save_bess_backtest(db, zone, start_time, end_time, config)
     except ValueError as e:
         return templates.TemplateResponse(
-            request, "bess_new.html", {"error": str(e), "defaults": BessConfig()}
+            request, "bess_new.html", {"error": str(e), "defaults": _BESS_DASHBOARD_DEFAULTS}
         )
     return RedirectResponse(f"/dashboard/bess/{summary['run_id']}", status_code=303)
 

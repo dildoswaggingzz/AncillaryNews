@@ -12,6 +12,25 @@
   (e.g. capacity reservation assumes the commitment always clears at the published price).
 </p>
 
+{% set run_strategy = run.config.get('strategy', 'threshold') %}
+{% set run_foresight = run.config.get('foresight', 'perfect') %}
+<p class="card">
+  <strong>Strategy:</strong> {{ run_strategy }}
+  {% if run_strategy == 'cooptimized' %}
+    &middot; <strong>Foresight:</strong> {{ run_foresight }}
+    {% if run_foresight == 'perfect' %}
+      -- <strong>theoretical ceiling, not achievable</strong> (an oracle: scheduled against
+      realised prices it could not have known in advance).
+    {% else %}
+      -- <strong>achievable</strong> (scheduled against a simple, honest day-ahead persistence
+      forecast, settled at actuals).
+    {% endif %}
+  {% else %}
+    -- legacy threshold-rule heuristic, retired from the Morning Brief (see
+    <code>docs/bess-cooptimizer-results.md</code>).
+  {% endif %}
+</p>
+
 <div class="card">
   <h3>Summary</h3>
   <table>

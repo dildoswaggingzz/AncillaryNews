@@ -16,7 +16,8 @@
 {% if runs %}
 <table>
   <tr>
-    <th>Run</th><th>Zone</th><th>Period</th><th>Arbitrage revenue (DKK)</th>
+    <th>Run</th><th>Zone</th><th>Strategy</th><th>Foresight</th><th>Period</th>
+    <th>Arbitrage revenue (DKK)</th>
     <th>Capacity revenue (DKK)</th><th>Total revenue (DKK)</th><th>Full cycle equivalents</th>
     <th>Capacity revenue (EUR)</th>
     <th>aFRR activation revenue (EUR)</th>
@@ -26,6 +27,8 @@
   <tr>
     <td><a href="/dashboard/bess/{{ run.id }}">#{{ run.id }}</a></td>
     <td>{{ run.zone }}</td>
+    <td>{{ run.config.get('strategy', 'threshold') }}</td>
+    <td>{{ run.config.get('foresight', 'perfect') }}</td>
     <td>{{ run.start_time }} &rarr; {{ run.end_time }}</td>
     <td>{{ "%.2f"|format(run.total_arbitrage_revenue_dkk) }}</td>
     <td>{{ "%.2f"|format(run.total_capacity_revenue_dkk) }}</td>

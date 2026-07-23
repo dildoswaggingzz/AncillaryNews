@@ -489,6 +489,22 @@ def test_dashboard_bess_new_form_renders(client):
     assert resp.status_code == 200
 
 
+def test_dashboard_bess_new_form_defaults_to_cooptimized_forecast(client):
+    """P5: the FORM's own pre-filled defaults are the co-optimizer's
+    achievable mode -- BessConfig's own class defaults (threshold/perfect)
+    stay untouched (see api_main._BESS_DASHBOARD_DEFAULTS)."""
+    from shared.bess_simulator import BessConfig
+
+    resp = client.get("/dashboard/bess/new")
+
+    assert resp.status_code == 200
+    assert 'value="cooptimized" selected' in resp.text
+    assert 'value="forecast" selected' in resp.text
+    # And BessConfig's own defaults are unaffected by the dashboard's choice.
+    assert BessConfig().strategy == "threshold"
+    assert BessConfig().foresight == "perfect"
+
+
 def test_dashboard_bess_detail_renders(client, db):
     db.fetch_bess_run.return_value = BESS_RUN_ROW
     db.fetch_bess_ticks.return_value = [BESS_TICK_ROW]
@@ -496,6 +512,72 @@ def test_dashboard_bess_detail_renders(client, db):
     resp = client.get("/dashboard/bess/1")
 
     assert resp.status_code == 200
+
+
+def test_dashboard_bess_list_shows_strategy_and_foresight_columns(client, db):
+    row = {**BESS_RUN_ROW, "config": {**BESS_RUN_ROW["config"], "strategy": "cooptimized",
+                                       "foresight": "forecast"}}
+    db.fetch_bess_runs.return_value = [row]
+
+    resp = client.get("/dashboard/bess")
+
+    assert resp.status_code == 200
+    assert "cooptimized" in resp.text
+    assert "forecast" in resp.text
+
+
+def test_dashboard_bess_list_falls_back_to_threshold_perfect_for_old_runs(client, db):
+    # BESS_RUN_ROW's config predates strategy/foresight fields entirely.
+    db.fetch_bess_runs.return_value = [BESS_RUN_ROW]
+
+    resp = client.get("/dashboard/bess")
+
+    assert resp.status_code == 200
+    assert "threshold" in resp.text
+    assert "perfect" in resp.text
+
+
+def test_dashboard_bess_detail_shows_ceiling_label_for_perfect_foresight_cooptimized_run(
+    client, db
+):
+    row = {
+        **BESS_RUN_ROW,
+        "config": {**BESS_RUN_ROW["config"], "strategy": "cooptimized", "foresight": "perfect"},
+    }
+    db.fetch_bess_run.return_value = row
+    db.fetch_bess_ticks.return_value = [BESS_TICK_ROW]
+
+    resp = client.get("/dashboard/bess/1")
+
+    assert resp.status_code == 200
+    assert "theoretical ceiling, not achievable" in resp.text
+
+
+def test_dashboard_bess_detail_shows_achievable_label_for_forecast_foresight_cooptimized_run(
+    client, db
+):
+    row = {
+        **BESS_RUN_ROW,
+        "config": {**BESS_RUN_ROW["config"], "strategy": "cooptimized", "foresight": "forecast"},
+    }
+    db.fetch_bess_run.return_value = row
+    db.fetch_bess_ticks.return_value = [BESS_TICK_ROW]
+
+    resp = client.get("/dashboard/bess/1")
+
+    assert resp.status_code == 200
+    assert "achievable" in resp.text
+
+
+def test_dashboard_bess_detail_falls_back_to_threshold_for_old_runs(client, db):
+    # BESS_RUN_ROW's config predates strategy/foresight fields entirely.
+    db.fetch_bess_run.return_value = BESS_RUN_ROW
+    db.fetch_bess_ticks.return_value = [BESS_TICK_ROW]
+
+    resp = client.get("/dashboard/bess/1")
+
+    assert resp.status_code == 200
+    assert "legacy threshold-rule heuristic" in resp.text
 
 
 def test_dashboard_bess_detail_not_found(client, db):
@@ -611,6 +693,82 @@ def test_dashboard_bess_trigger_without_ffr_keeps_even_allocation(client, db, mo
 
     assert resp.status_code == 303
     assert captured_configs[0].capacity_allocation == "even"
+
+
+def test_dashboard_bess_trigger_defaults_to_cooptimized_forecast_when_unspecified(
+    client, db, monkeypatch
+):
+    """The form's HTML <select> defaults submit strategy=cooptimized/foresight=forecast even
+    without JS -- this asserts the server-side Form(...) defaults match that."""
+    captured_configs = []
+
+    def fake_run_backtest(db_arg, zone, start, end, config):
+        captured_configs.append(config)
+        return BacktestResult(zone=zone, start_time=start, end_time=end, config=config, ticks=[])
+
+    monkeypatch.setattr(api_main, "run_backtest", fake_run_backtest)
+    db.save_bess_run.return_value = 9
+
+    resp = client.post(
+        "/dashboard/bess/new",
+        data={
+            "zone": "DK1",
+            "start_time": "2026-07-16T20:00",
+            "end_time": "2026-07-17T08:00",
+            "power_mw": "1.0",
+            "capacity_mwh": "2.0",
+            "round_trip_efficiency": "0.9",
+            "soc_min_fraction": "0.1",
+            "soc_max_fraction": "0.9",
+            "starting_soc_fraction": "0.5",
+            "arbitrage_lookback_periods": "30",
+            "arbitrage_z_threshold": "0.5",
+            "capacity_commit_mw": "0.3",
+            "afrr_activation_participation_rate": "0.3",
+        },
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 303
+    assert captured_configs[0].strategy == "cooptimized"
+    assert captured_configs[0].foresight == "forecast"
+
+
+def test_dashboard_bess_trigger_passes_strategy_and_foresight_overrides(client, db, monkeypatch):
+    captured_configs = []
+
+    def fake_run_backtest(db_arg, zone, start, end, config):
+        captured_configs.append(config)
+        return BacktestResult(zone=zone, start_time=start, end_time=end, config=config, ticks=[])
+
+    monkeypatch.setattr(api_main, "run_backtest", fake_run_backtest)
+    db.save_bess_run.return_value = 9
+
+    resp = client.post(
+        "/dashboard/bess/new",
+        data={
+            "zone": "DK1",
+            "start_time": "2026-07-16T20:00",
+            "end_time": "2026-07-17T08:00",
+            "power_mw": "1.0",
+            "capacity_mwh": "2.0",
+            "round_trip_efficiency": "0.9",
+            "soc_min_fraction": "0.1",
+            "soc_max_fraction": "0.9",
+            "starting_soc_fraction": "0.5",
+            "arbitrage_lookback_periods": "30",
+            "arbitrage_z_threshold": "0.5",
+            "capacity_commit_mw": "0.3",
+            "afrr_activation_participation_rate": "0.3",
+            "strategy": "threshold",
+            "foresight": "perfect",
+        },
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 303
+    assert captured_configs[0].strategy == "threshold"
+    assert captured_configs[0].foresight == "perfect"
 
 
 def test_dashboard_bess_trigger_rejects_ffr_for_dk1(client, db, monkeypatch):
@@ -1623,6 +1781,63 @@ def test_trigger_bess_backtest_passes_capacity_markets_override(client, db, monk
     ]
 
 
+def test_trigger_bess_backtest_passes_strategy_and_foresight_override(client, db, monkeypatch):
+    """P5: JSON API callers can opt into the co-optimizer + foresight mode
+    explicitly. BessConfig's own defaults (strategy="threshold",
+    foresight="perfect") are untouched -- unset stays unset."""
+    captured_configs = []
+
+    def fake_run_backtest(db_arg, zone, start, end, config):
+        captured_configs.append(config)
+        return BacktestResult(zone=zone, start_time=start, end_time=end, config=config, ticks=[])
+
+    monkeypatch.setattr(api_main, "run_backtest", fake_run_backtest)
+    db.save_bess_run.return_value = 7
+
+    resp = client.post(
+        "/bess/backtest",
+        json={
+            "zone": "DK1",
+            "start_time": "2026-07-16T20:00:00Z",
+            "end_time": "2026-07-17T08:00:00Z",
+            "strategy": "cooptimized",
+            "foresight": "forecast",
+        },
+    )
+
+    assert resp.status_code == 200
+    assert captured_configs[0].strategy == "cooptimized"
+    assert captured_configs[0].foresight == "forecast"
+
+
+def test_trigger_bess_backtest_defaults_to_bessconfig_strategy_and_foresight_when_unset(
+    client, db, monkeypatch
+):
+    from shared.bess_simulator import BessConfig
+
+    captured_configs = []
+
+    def fake_run_backtest(db_arg, zone, start, end, config):
+        captured_configs.append(config)
+        return BacktestResult(zone=zone, start_time=start, end_time=end, config=config, ticks=[])
+
+    monkeypatch.setattr(api_main, "run_backtest", fake_run_backtest)
+    db.save_bess_run.return_value = 7
+
+    resp = client.post(
+        "/bess/backtest",
+        json={
+            "zone": "DK1",
+            "start_time": "2026-07-16T20:00:00Z",
+            "end_time": "2026-07-17T08:00:00Z",
+        },
+    )
+
+    assert resp.status_code == 200
+    assert captured_configs[0].strategy == BessConfig().strategy == "threshold"
+    assert captured_configs[0].foresight == BessConfig().foresight == "perfect"
+
+
 def test_trigger_bess_backtest_response_includes_total_afrr_activation_revenue_eur(
     client, db, monkeypatch
 ):
@@ -1806,6 +2021,45 @@ def test_dashboard_morning_brief_detail_shows_zero_price_periods(client, db):
     assert resp.status_code == 200
     assert "FFR:price" in resp.text
     assert "720" in resp.text
+
+
+def test_dashboard_morning_brief_detail_renders_achievable_and_ceiling(client, db):
+    """P5: current-shape bess_estimates carry both an achievable headline and
+    a labelled theoretical ceiling -- the retired threshold-only shape (used
+    by MORNING_BRIEF_ROW above) is a separate backward-compat code path."""
+    row = {
+        **MORNING_BRIEF_ROW,
+        "bess_estimates": [
+            {
+                "config_label": "Small commercial (1 MW / 2 MWh)",
+                "zone": "DK1",
+                "achievable_run_id": 101,
+                "ceiling_run_id": 201,
+                "total_revenue_dkk_achievable": 9000.0,
+                "total_revenue_dkk_ceiling": 15000.0,
+                "total_revenue_all_dkk_achievable": 12345.6,
+                "total_revenue_all_dkk_ceiling": 20000.0,
+                "total_revenue_all_eur_achievable": 1654.0,
+                "total_revenue_all_eur_ceiling": 2681.0,
+                "full_cycle_equivalents_achievable": 20.0,
+                "cycle_cap_was_binding_achievable": True,
+                "total_afrr_activation_revenue_eur_achievable": 0.0,
+                "total_capacity_revenue_eur_achievable": 0.0,
+                "currencies_present": ["DKK"],
+                "zero_price_periods_by_leg": {},
+            }
+        ],
+    }
+    db.fetch_morning_brief.return_value = row
+
+    resp = client.get("/dashboard/morning-briefs/1")
+
+    assert resp.status_code == 200
+    assert "/dashboard/bess/101" in resp.text
+    assert "/dashboard/bess/201" in resp.text
+    assert "12345.60" in resp.text
+    assert "20000.00" in resp.text
+    assert "theoretical ceiling, not achievable" in resp.text
 
 
 def test_dashboard_morning_brief_detail_not_found(client, db):

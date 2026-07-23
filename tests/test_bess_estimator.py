@@ -34,6 +34,17 @@ def _result_with_ticks(zone: str, config, cap_binding: bool) -> BacktestResult:
     return BacktestResult(zone=zone, start_time=START, end_time=END, config=config, ticks=[tick])
 
 
+# `run_illustrative_backtests` now calls `run_backtest` TWICE per (config,
+# zone) -- once with `foresight="forecast"` (achievable), once with
+# `foresight="perfect"` (ceiling), see shared/bess_estimator.py's module
+# docstring (P5). The mocked `run_backtest` below is config-agnostic (same
+# fixture result regardless of which foresight was requested), so these
+# tests exercise the CALL COUNT/summary-shape contract, not the actual
+# achievable-vs-ceiling numeric distinction (covered by
+# tests/test_bess_dispatch_milp.py's own pre<=post gate).
+_RUNS_PER_CONFIG_ZONE = 2  # achievable + ceiling
+
+
 def test_illustrative_configs_has_two_entries():
     assert len(ILLUSTRATIVE_CONFIGS) == 2
     labels = [label for label, _ in ILLUSTRATIVE_CONFIGS]
@@ -51,10 +62,45 @@ def test_run_illustrative_backtests_runs_every_config_x_zone_combo():
         )
         summaries = run_illustrative_backtests(db, DEFAULT_ZONES, start_time=START, end_time=END)
 
+    # One SUMMARY per (config, zone) -- achievable+ceiling are merged into it.
     assert len(summaries) == len(ILLUSTRATIVE_CONFIGS) * len(DEFAULT_ZONES)
     zones_seen = {s["zone"] for s in summaries}
     assert zones_seen == set(DEFAULT_ZONES)
-    assert mock_run_backtest.call_count == len(ILLUSTRATIVE_CONFIGS) * len(DEFAULT_ZONES)
+    # But run_backtest itself is called TWICE per (config, zone).
+    assert mock_run_backtest.call_count == (
+        len(ILLUSTRATIVE_CONFIGS) * len(DEFAULT_ZONES) * _RUNS_PER_CONFIG_ZONE
+    )
+
+
+def test_run_illustrative_backtests_both_runs_are_cooptimized_with_distinct_foresight():
+    """The threshold engine is retired from the brief (P5) -- every run
+    must be `strategy="cooptimized"`, and the two runs per (config, zone)
+    must differ in `foresight` (forecast=achievable, perfect=ceiling).
+    `BessConfig`'s own defaults (`strategy="threshold"`, `foresight="perfect"`)
+    must stay untouched -- these overrides are applied explicitly, per call."""
+    db = MagicMock()
+    db.save_bess_run.return_value = 1
+    captured_configs = []
+
+    with patch("shared.bess_estimator.run_backtest") as mock_run_backtest:
+
+        def fake_run_backtest(db_arg, zone, start, end, config):
+            captured_configs.append(config)
+            return _result_with_ticks(zone, config, cap_binding=False)
+
+        mock_run_backtest.side_effect = fake_run_backtest
+        run_illustrative_backtests(db, ("DK1",), start_time=START, end_time=END)
+
+    assert all(c.strategy == "cooptimized" for c in captured_configs)
+    foresights = [c.foresight for c in captured_configs]
+    assert foresights.count("forecast") == len(ILLUSTRATIVE_CONFIGS)
+    assert foresights.count("perfect") == len(ILLUSTRATIVE_CONFIGS)
+
+    # BessConfig's own class defaults are untouched by this module.
+    from shared.bess_simulator import BessConfig
+
+    assert BessConfig().strategy == "threshold"
+    assert BessConfig().foresight == "perfect"
 
 
 def test_run_illustrative_backtests_persists_with_morning_brief_label():
@@ -67,6 +113,7 @@ def test_run_illustrative_backtests_persists_with_morning_brief_label():
         )
         run_illustrative_backtests(db, ("DK1",), start_time=START, end_time=END)
 
+    assert db.save_bess_run.call_count == len(ILLUSTRATIVE_CONFIGS) * _RUNS_PER_CONFIG_ZONE
     for call in db.save_bess_run.call_args_list:
         assert call.kwargs["label"] == MORNING_BRIEF_RUN_LABEL
 
@@ -100,12 +147,12 @@ def test_run_illustrative_backtests_surfaces_cycle_cap_was_binding():
         )
         summaries = run_illustrative_backtests(db, ("DK1",), start_time=START, end_time=END)
 
-    assert all(s["cycle_cap_was_binding"] is True for s in summaries)
+    assert all(s["cycle_cap_was_binding_achievable"] is True for s in summaries)
 
 
 def test_run_illustrative_backtests_summary_shape():
     db = MagicMock()
-    db.save_bess_run.return_value = 42
+    db.save_bess_run.side_effect = range(1, 100)
 
     with patch("shared.bess_estimator.run_backtest") as mock_run_backtest:
         mock_run_backtest.side_effect = lambda db_arg, zone, start, end, config: _result_with_ticks(
@@ -114,13 +161,21 @@ def test_run_illustrative_backtests_summary_shape():
         summaries = run_illustrative_backtests(db, ("DK1",), start_time=START, end_time=END)
 
     summary = summaries[0]
-    assert summary["run_id"] == 42
     assert "config_label" in summary
-    assert "total_revenue_dkk" in summary
-    assert "total_arbitrage_revenue_dkk" in summary
-    assert "total_capacity_revenue_dkk" in summary
-    assert "full_cycle_equivalents" in summary
-    assert "total_afrr_activation_revenue_eur" in summary
+    assert "achievable_run_id" in summary
+    assert "ceiling_run_id" in summary
+    assert "total_revenue_dkk_achievable" in summary
+    assert "total_revenue_dkk_ceiling" in summary
+    assert "total_revenue_all_dkk_achievable" in summary
+    assert "total_revenue_all_dkk_ceiling" in summary
+    assert "total_revenue_all_eur_achievable" in summary
+    assert "total_revenue_all_eur_ceiling" in summary
+    assert "full_cycle_equivalents_achievable" in summary
+    assert "total_afrr_activation_revenue_eur_achievable" in summary
+    assert "total_capacity_revenue_eur_achievable" in summary
+    # No threshold-only/leftover fields from the retired engine.
+    assert "total_arbitrage_revenue_dkk" not in summary
+    assert "total_capacity_revenue_dkk" not in summary
 
 
 # --- DK2 FCR-D vs. DK1 (no FCR-D market) asymmetry --------------------------
@@ -165,7 +220,7 @@ def test_run_illustrative_backtests_surfaces_total_afrr_activation_revenue_eur()
         )
         summaries = run_illustrative_backtests(db, ("DK2",), start_time=START, end_time=END)
 
-    assert all(s["total_afrr_activation_revenue_eur"] == 42.0 for s in summaries)
+    assert all(s["total_afrr_activation_revenue_eur_achievable"] == 42.0 for s in summaries)
 
 
 # --- Stage 4.2: ZONE_CAPACITY_MARKETS data table -----------------------------
@@ -199,6 +254,10 @@ def test_dk2_configs_use_price_ranked_allocation_dk1_stays_even():
     "price_ranked" so FFR doesn't dilute FCR/aFRR's shares (shared/
     bess_simulator.py's module docstring §2). DK1 has no zero-price-prone
     market in its stack, so it stays at the reproducible "even" default.
+    `capacity_allocation` is a threshold-only concept the co-optimizer
+    ignores, but this data-table assignment is still checked here since a
+    threshold run of this same config (e.g. an ad-hoc dashboard comparison)
+    still depends on it.
     """
     db = MagicMock()
     db.save_bess_run.return_value = 1

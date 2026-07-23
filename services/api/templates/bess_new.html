@@ -3,9 +3,12 @@
 {% block content %}
 <h1>Run a New BESS Backtest</h1>
 <p class="muted">
-  Runs a threshold-rule battery simulation over real historical data already ingested into
+  Runs a battery simulation over real historical data already ingested into
   <code>market_data_history</code> for the given zone/time window (<code>shared/bess_simulator.py</code>).
   Defaults describe a generic 1&nbsp;MW / 2&nbsp;MWh grid-scale unit, not a specific real battery.
+  Defaults to the <strong>co-optimizer</strong> strategy in its <strong>achievable</strong> foresight
+  mode (a causal day-ahead persistence forecast) -- the older threshold-rule strategy is still
+  available below for comparison, but is no longer used in the Morning Brief.
 </p>
 
 {% if error %}
@@ -40,6 +43,20 @@
         <td><input type="number" step="any" id="capacity_commit_mw" name="capacity_commit_mw" value="{{ defaults.capacity_commit_mw }}" required></td></tr>
     <tr><td><label for="afrr_activation_participation_rate">aFRR activation participation rate</label></td>
         <td><input type="number" step="any" min="0" max="1" id="afrr_activation_participation_rate" name="afrr_activation_participation_rate" value="{{ defaults.afrr_activation_participation_rate }}" required></td></tr>
+    <tr><td><label for="strategy">Strategy</label></td>
+        <td>
+          <select id="strategy" name="strategy">
+            <option value="cooptimized" {% if defaults.strategy == "cooptimized" %}selected{% endif %}>cooptimized (LP co-optimizer)</option>
+            <option value="threshold" {% if defaults.strategy == "threshold" %}selected{% endif %}>threshold (legacy heuristic)</option>
+          </select>
+        </td></tr>
+    <tr><td><label for="foresight">Foresight</label></td>
+        <td>
+          <select id="foresight" name="foresight">
+            <option value="forecast" {% if defaults.foresight == "forecast" %}selected{% endif %}>forecast (achievable -- causal day-ahead persistence)</option>
+            <option value="perfect" {% if defaults.foresight == "perfect" %}selected{% endif %}>perfect (theoretical ceiling -- not achievable)</option>
+          </select>
+        </td></tr>
     <tr><td><label for="include_fcr_d">Include FCR-D (DK2 only)</label></td>
         <td><input type="checkbox" id="include_fcr_d" name="include_fcr_d" value="true"></td></tr>
     <tr><td><label for="include_afrr_down">Include aFRR down-regulation</label></td>
@@ -58,6 +75,14 @@
     automatically switches this run to <code>capacity_allocation="price_ranked"</code>
     server-side, so FFR's zero price doesn't dilute the other markets' shares the way an
     even split would (<code>shared/bess_simulator.py</code>'s module docstring §2).
+  </p>
+  <p class="muted">
+    <strong>Foresight</strong> only affects the <code>cooptimized</code> strategy (ignored by
+    <code>threshold</code> runs). <strong>perfect</strong> foresight is an oracle -- it schedules
+    against realised prices it could not actually have known in advance -- and is shown here only
+    as a <strong>theoretical ceiling</strong>, not a number a real battery could earn.
+    <strong>forecast</strong> foresight schedules against a simple, honest day-ahead persistence
+    forecast and settles at actuals -- this is the achievable, deployable estimate.
   </p>
   <p><button type="submit">Run backtest</button></p>
 </form>
