@@ -89,8 +89,11 @@ charge period's flow, or a discharge period's flow, across whichever
 energy markets pay best that period. The single-energy-market case (the
 default, `energy_markets = ("day_ahead",)`) stays a pure LP -- no binary --
 since the round-trip-efficiency argument above is sufficient there; only
-`len(energy_markets) > 1` becomes a MILP. CBC's branch-and-bound is still
-deterministic for a fixed model, so `save_bess_run`'s reproducibility
+`len(energy_markets) > 1` becomes a MILP. That MILP is solved with **HiGHS**
+(one binary per period is far too slow for CBC's branch-and-bound over a
+month/quarter -- tens of seconds to minutes -- whereas HiGHS solves it in
+~1s); the pure-LP single-market path keeps PuLP's bundled CBC unchanged.
+Both are deterministic for a fixed model, so `save_bess_run`'s reproducibility
 contract is unaffected either way.
 
 **Multiple dispatchable energy markets (P3, docs/bess-cooptimizer-design.md
@@ -758,7 +761,19 @@ def solve_cooptimized_dispatch(
         )
     prob += objective
 
-    status = prob.solve(pulp.PULP_CBC_CMD(msg=False))
+    # Solver choice (module docstring's "no binary" section). The single-
+    # market case is a pure LP -- solved with PuLP's bundled, zero-config CBC,
+    # deterministic and unchanged from P1-P4 (so every already-persisted
+    # single-market run reproduces bit-for-bit). The multi-market case adds
+    # one binary per period (the anti-pass-through complementarity above),
+    # making it a MILP that CBC's branch-and-bound is slow on (tens of
+    # seconds for a month, worse for a quarter); HiGHS solves the same MILP
+    # in ~1s. HiGHS is used ONLY for that MILP path -- it is likewise
+    # deterministic for a fixed model, and multi-market runs are never part
+    # of the persisted morning-brief set (day-ahead only), so this split
+    # solver choice changes no existing persisted numbers.
+    solver = pulp.HiGHS(msg=False) if multi_energy_market else pulp.PULP_CBC_CMD(msg=False)
+    status = prob.solve(solver)
     if pulp.LpStatus[status] != "Optimal":
         raise RuntimeError(
             f"BESS co-optimizer did not reach an optimal solution "
