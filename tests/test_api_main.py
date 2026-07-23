@@ -2059,9 +2059,13 @@ def test_dashboard_morning_brief_detail_renders_achievable_and_ceiling(client, d
     assert resp.status_code == 200
     assert "/dashboard/bess/101" in resp.text
     assert "/dashboard/bess/201" in resp.text
-    assert "12345.60" in resp.text
-    assert "20000.00" in resp.text
+    # All-in totals render grouped, with the EUR-equivalent alongside.
+    assert "12,346 DKK" in resp.text
+    assert "20,000 DKK" in resp.text
+    assert "1,654" in resp.text  # total_revenue_all_eur_achievable
     assert "theoretical ceiling, not achievable" in resp.text
+    # DKK-only run: the EUR-settled column says so rather than warning "not summed".
+    assert "settled entirely in DKK" in resp.text
 
 
 def test_dashboard_morning_brief_detail_not_found(client, db):
