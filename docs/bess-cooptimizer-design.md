@@ -263,32 +263,47 @@ audit against `shared/datasets.py` and a Nord Pool investigation:
 | aFRR activation | ✅ `aFRR_energy` | Activation term, P1. |
 | **Intraday (IDA) prices** | ❌ **not ingested** | **New ingestion required — P4.** |
 
-**The intraday finding (revised P4, after direct API verification).** There is no intraday price
-market in the registry (the only "intraday" string is `ForecastIntraday`, a wind/solar *generation*
-forecast — not a price). A prior scout claimed ENTSO-E offered free IDA auction prices; **direct
-verification proved that false.** The real picture for DK1/DK2 intraday *energy* prices:
+**The intraday finding (P4, verified against the live ENTSO-E API collection).** There is no
+intraday price market in the registry (the only "intraday" string is `ForecastIntraday`, a
+wind/solar *generation* forecast — not a price). Verified directly against the ENTSO-E Transparency
+Platform Postman collection (not a third-party summary):
 
-- **ENTSO-E does NOT publish IDA auction clearing prices.** It exposes only *continuous* intraday
-  prices (`documentType=A44`, `contract_MarketAgreement.type=A07`) and intraday *transfer-capacity*
-  prices (not energy). Auction (IDA1/2/3) energy clearing prices are simply not a queryable product.
-- **JAO Nordic publishes NO zonal energy price at all.** Its publication tool
-  (`publicationtool.jao.eu/nordic`) serves flow-based-market-coupling *capacity* data —
-  `netPosition`, `priceSpread`, `shadowPrices`, `scheduledExchange`, `maxBex`, `congestionIncome`
-  (confirmed via the `jao-py` client's own endpoint list). JAO allocates capacity; it is not a NEMO
-  and does not clear energy. The "clearing prices" a scout attributed to it were constraint shadow
-  prices, not zonal MCPs.
-- **Nord Pool has the IDA auction prices but they are subscription-gated** (v2 API 401/403
-  unauthenticated; continuous XBID via EPEX ~€3,360/mo). Not viable for free ingestion.
-- **Net: there is no free source of DK1/DK2 IDA *auction* energy prices.** The only free intraday
-  *price signal* is ENTSO-E **continuous** intraday (A44/A07) — and that still needs an ENTSO-E API
-  token (`ENTSOE_API_TOKEN`, currently unset) plus a brand-new provider integration (ENTSO-E is not
-  yet ingested at all; the whole ingestion layer is Energi Data Service-only).
+- **ENTSO-E DOES publish IDA1/2/3 auction energy prices for DK1/DK2, free (token-gated).** The
+  `12.1.D Energy Prices` endpoint (`documentType=A44`) takes `contract_MarketAgreement.Type` with
+  documented values **`A01 = Day-ahead`, `A07 = Intraday`**, plus
+  `classificationSequence_AttributeInstanceComponent.position = 1|2|3` selecting IDA1/IDA2/IDA3. The
+  sample `Publication_MarketDocument` response carries `<price_Measure_Unit.name>MWH</...>` with the
+  `classificationSequence…position` tag — i.e. per-auction EUR/MWh clearing prices. (My earlier note
+  that ENTSO-E lacked IDA prices was wrong — based on stale `entsoe-py` code predating ENTSO-E's 2024
+  IDA rollout.) Exact query:
 
-**P4 consequence.** Intraday-auction ingestion as originally scoped is not achievable with free
-data. Options are (a) build an ENTSO-E provider integration for *continuous* intraday (free, but
-token-gated — request required), or (b) defer intraday (the engine is already intraday-ready and
-P3's imbalance already gives a free second energy market) and move to P5. Decision pending; §6's
-"intraday-ready" engine property means either can be picked up later as a pure data addition.
+  ```
+  GET https://web-api.tp.entsoe.eu/api
+    ?documentType=A44
+    &contract_MarketAgreement.Type=A07
+    &classificationSequence_AttributeInstanceComponent.position=1|2|3
+    &in_Domain=10YDK-1--------W&out_Domain=10YDK-1--------W   # DK1 (DK2 = 10YDK-2--------M)
+    &periodStart=YYYYMMDDHHMM&periodEnd=YYYYMMDDHHMM          # UTC
+    &securityToken=<ENTSOE_API_TOKEN>
+  ```
+
+- **JAO Nordic is NOT a source** (checked, to rule it out): its publication tool serves flow-based
+  *capacity* data only (`netPosition`, `priceSpread`, `shadowPrices`, `scheduledExchange`, `maxBex`,
+  `congestionIncome` — per the `jao-py` client). JAO allocates capacity; it does not clear energy.
+- **Nord Pool** has the same IDA prices but subscription-gated — no advantage over ENTSO-E's free
+  feed.
+
+**P4 is therefore buildable**, subject to two real costs, neither an LP-engine change:
+1. **An ENTSO-E API token** (`ENTSOE_API_TOKEN`, currently unset) — register at
+   transparency.entsoe.eu and email transparency@entsoe.eu for RESTful API access (~3 working days).
+   Only the account holder can obtain it.
+2. **A new ENTSO-E provider integration** — the ingestion layer is Energi Data Service-only today
+   (JSON REST); ENTSO-E is XML (`Publication_MarketDocument`), a `securityToken`, and EIC domain
+   codes. Buildable and unit-testable now against recorded/synthetic XML (à la the existing `respx`
+   HTTP mocks), gated behind the token; live backfill runs once the token is in hand.
+
+Once ingested as an `intraday` market, wiring it into the co-optimizer is a pure data addition
+(`BessConfig.energy_markets`), no engine change — §1/§6's "intraday-ready" property.
 
 The engine is therefore built **intraday-ready**: energy markets are a pluggable list, so adding
 the ENTSO-E IDA series in P4 is a *data* change (new ingestor + registry entry), not an *engine*
@@ -314,7 +329,7 @@ single-currency energy leg — no new currency handling.
 | **P1** | `shared/bess_dispatch_milp.py`: DA energy + FCR/aFRR capacity (both directions) + aFRR activation, no-double-selling headroom, **post** mode. Wired as `strategy="cooptimized"`. Unit tests incl. a **double-selling regression test**. | LP matches hand-checked tiny window. |
 | **P2** | A/B report: co-optimized vs. threshold revenue on identical windows, quantifying the double-sell overstatement. `scripts/generate_cooptimizer_ab_report.py` → `docs/bess-cooptimizer-results.md`. | Co-optimized ≥ threshold on *feasible* windows; on double-sell windows threshold overstates and the report quantifies the phantom revenue (see below). |
 | **P3** | Imbalance as second energy stream + **pre**/forecast mode (schedule on forecast, settle on actuals). Post−pre gap reported. | Pre ≤ Post always. |
-| **P4** | Intraday — **blocked/rescoped**: no free source of DK IDA *auction* energy prices exists (ENTSO-E lacks them, JAO is capacity-only, Nord Pool is paid). Free fallback = ENTSO-E *continuous* intraday, which needs a token + a new ENTSO-E provider integration. See §6. | Deferred pending token, or superseded by P5. |
+| **P4** | Intraday: ingest ENTSO-E IDA1/2/3 auction prices (`A44` + `A07` + `classificationSequence`) for DK1/DK2 via a new ENTSO-E provider integration; wire in as `energy_markets`' `intraday`. Free but needs an `ENTSOE_API_TOKEN`. See §6. | Provider integration unit-tested vs mocked XML now; live series validated once the token is obtained. |
 | **P5** | Migrate morning-brief + `/dashboard/bess` defaults to `strategy="cooptimized"`. | A/B report reviewed. |
 
 ---
