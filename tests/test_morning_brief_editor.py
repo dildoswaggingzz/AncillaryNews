@@ -3,6 +3,7 @@ from datetime import date
 from shared.morning_brief_editor import (
     BESS_JARGON_GLOSSARY,
     MorningBrief,
+    _bess_line,
     compose_brief,
     render_for_email,
     render_for_slack,
@@ -38,7 +39,56 @@ FORECASTS = {
     },
 }
 
+# P5 (current) shape: every summary from shared.bess_estimator.run_illustrative_backtests
+# now carries BOTH an achievable (causal lag-24h forecast) headline and a
+# labelled perfect-foresight theoretical ceiling -- see that module's
+# docstring. This is the fixture that reflects what the pipeline actually
+# produces today.
 BESS_ESTIMATES = [
+    {
+        "config_label": "Small commercial (1 MW / 2 MWh)",
+        "zone": "DK1",
+        "achievable_run_id": 101,
+        "ceiling_run_id": 201,
+        "total_revenue_dkk_achievable": 9000.0,
+        "total_revenue_dkk_ceiling": 15000.0,
+        "total_revenue_all_dkk_achievable": 12345.6,
+        "total_revenue_all_dkk_ceiling": 20000.0,
+        "total_revenue_all_eur_achievable": 1654.0,
+        "total_revenue_all_eur_ceiling": 2681.0,
+        "full_cycle_equivalents_achievable": 20.0,
+        "cycle_cap_was_binding_achievable": True,
+        "total_afrr_activation_revenue_eur_achievable": 0.0,
+        "total_capacity_revenue_eur_achievable": 0.0,
+        "currencies_present": ["DKK"],
+        "zero_price_periods_by_leg": {},
+    },
+    {
+        "config_label": "Utility-scale (10 MW / 40 MWh)",
+        "zone": "DK2",
+        "achievable_run_id": 102,
+        "ceiling_run_id": 202,
+        "total_revenue_dkk_achievable": 70000.0,
+        "total_revenue_dkk_ceiling": 110000.0,
+        "total_revenue_all_dkk_achievable": 98765.4,
+        "total_revenue_all_dkk_ceiling": 150000.0,
+        "total_revenue_all_eur_achievable": 13240.0,
+        "total_revenue_all_eur_ceiling": 20107.0,
+        "full_cycle_equivalents_achievable": 18.5,
+        "cycle_cap_was_binding_achievable": False,
+        "total_afrr_activation_revenue_eur_achievable": 0.0,
+        "total_capacity_revenue_eur_achievable": 0.0,
+        "currencies_present": ["DKK"],
+        "zero_price_periods_by_leg": {},
+    },
+]
+
+# Pre-P5 shape: what's actually sitting in `bess_simulation_runs`/persisted
+# morning briefs from before this migration -- a single threshold-engine
+# total, no achievable/ceiling keys at all. `_bess_line` must still render
+# this correctly (see the backward-compat tests below) rather than crashing
+# or silently showing zeroes.
+OLD_SHAPE_BESS_ESTIMATES = [
     {
         "config_label": "Small commercial (1 MW / 2 MWh)",
         "zone": "DK1",
@@ -115,6 +165,10 @@ def test_render_for_slack_returns_condensed_mrkdwn():
     # Confidence tags present for available horizons.
     assert "medium" in text
     assert "low" in text
+    # Both the achievable headline and the labelled theoretical ceiling
+    # appear -- the threshold engine's single number is retired.
+    assert "achievable" in text
+    assert "theoretical ceiling, not achievable" in text
     # Glossary is dropped/linked-out in the Slack rendering, not inlined --
     # a term's *definition* never appears, even though the BESS estimate
     # lines themselves legitimately use jargon terms like "full cycle
@@ -134,9 +188,12 @@ def test_render_for_email_returns_subject_html_and_plaintext():
         assert "Wind output was 20% above" in body
         assert "Small commercial (1 MW / 2 MWh)" in body
         assert "Utility-scale (10 MW / 40 MWh)" in body
-        # Full glossary is inlined in the email (unlike Slack).
+        # Full glossary is inlined in the email (unlike Slack) -- including
+        # the new achievable/theoretical-ceiling entries.
         assert "day-ahead price" in body
         assert "cycle cap" in body
+        assert "achievable" in body
+        assert "theoretical ceiling" in body
         # All three forecast horizons are shown, including the unavailable one.
         assert "Next month" in body
         assert "Next quarter" in body
@@ -172,6 +229,67 @@ def test_render_for_email_escapes_untrusted_llm_output_in_html():
 def test_bess_jargon_glossary_covers_core_terms():
     assert "full cycle equivalent" in BESS_JARGON_GLOSSARY
     assert "cycle cap" in BESS_JARGON_GLOSSARY
+    # P5: these are the two terms that make the achievable/ceiling framing
+    # understandable to a non-technical recipient.
+    assert "achievable" in BESS_JARGON_GLOSSARY
+    assert "theoretical ceiling" in BESS_JARGON_GLOSSARY
+
+
+# --- P5: achievable headline + labelled theoretical ceiling -----------------
+
+
+def test_bess_line_renders_achievable_and_ceiling():
+    line = _bess_line(BESS_ESTIMATES[0])
+
+    assert "12,346 DKK achievable" in line
+    assert "20,000 DKK with perfect foresight" in line
+    assert "theoretical ceiling, not achievable" in line
+    assert "simple day-ahead persistence forecast" in line
+    # Cycle-cap detail is sourced from the achievable run only.
+    assert "(cycle cap limited earnings some days)" in line
+
+
+def test_bess_line_no_cycle_cap_note_when_achievable_run_not_binding():
+    line = _bess_line(BESS_ESTIMATES[1])
+
+    assert "cycle cap limited earnings" not in line
+
+
+# --- Backward compat: pre-P5 persisted briefs (old summary shape) ----------
+
+
+def test_bess_line_backward_compat_with_old_shape_estimate():
+    # Old-shape estimates (no achievable/ceiling keys) must still render via
+    # the old single-number format, not crash or show blank/zero fields.
+    line = _bess_line(OLD_SHAPE_BESS_ESTIMATES[0])
+
+    assert "12,346 DKK over the window" in line
+    assert "(20.00 full cycle equivalents)" in line
+    assert "(cycle cap limited earnings some days)" in line
+    assert "achievable" not in line
+    assert "theoretical ceiling" not in line
+
+
+def test_render_for_slack_backward_compat_with_old_shape_brief():
+    brief = compose_brief(BRIEF_DATE, PRICE_RECAP, FORECASTS, OLD_SHAPE_BESS_ESTIMATES)
+
+    text = render_for_slack(brief)
+
+    assert "Small commercial (1 MW / 2 MWh)" in text
+    # The per-estimate line itself (not the section header, which always
+    # frames the section generically) must use the old single-number
+    # rendering, not the achievable/ceiling wording.
+    assert "12,346 DKK over the window (20.00 full cycle equivalents)" in text
+
+
+def test_render_for_email_backward_compat_with_old_shape_brief():
+    brief = compose_brief(BRIEF_DATE, PRICE_RECAP, FORECASTS, OLD_SHAPE_BESS_ESTIMATES)
+
+    _subject, html_body, plaintext_body = render_for_email(brief)
+
+    for body in (html_body, plaintext_body):
+        assert "Small commercial (1 MW / 2 MWh)" in body
+        assert "12,346 DKK over the window" in body
 
 
 # --- aFRR activation EUR clause (never summed into the DKK figure) ---------
@@ -179,7 +297,7 @@ def test_bess_jargon_glossary_covers_core_terms():
 
 def test_bess_line_includes_eur_clause_when_activation_revenue_nonzero():
     estimates_with_activation = [
-        {**BESS_ESTIMATES[0], "total_afrr_activation_revenue_eur": 1234.0},
+        {**BESS_ESTIMATES[0], "total_afrr_activation_revenue_eur_achievable": 1234.0},
         BESS_ESTIMATES[1],
     ]
     brief = compose_brief(BRIEF_DATE, PRICE_RECAP, FORECASTS, estimates_with_activation)
@@ -193,7 +311,7 @@ def test_bess_line_includes_eur_clause_when_activation_revenue_nonzero():
 
 def test_bess_line_omits_eur_clause_when_activation_revenue_zero():
     estimates_without_activation = [
-        {**BESS_ESTIMATES[0], "total_afrr_activation_revenue_eur": 0.0},
+        {**BESS_ESTIMATES[0], "total_afrr_activation_revenue_eur_achievable": 0.0},
         BESS_ESTIMATES[1],
     ]
     brief = compose_brief(BRIEF_DATE, PRICE_RECAP, FORECASTS, estimates_without_activation)

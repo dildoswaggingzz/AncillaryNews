@@ -4,17 +4,49 @@ representative battery would have earned in the past month", realistically
 capped at ~1.5 charge/discharge cycles/day (`shared/bess_simulator.py`'s
 `BessConfig.max_cycles_per_day`).
 
-Two illustrative configs (`ILLUSTRATIVE_CONFIGS`) x two zones (confirmed
-product decision: both DK1 and DK2, not one -- 4 backtests/day) are run and
-persisted via the *existing* `shared.bess_simulator.run_backtest` /
-`DatabaseManager.save_bess_run`, tagged `label="morning_brief"`
-(init-db/05-morning-briefs.sql) so they're distinguishable from ad-hoc
-`/dashboard/bess/new` runs in the run list, but otherwise identical,
-independently queryable backtest runs -- no parallel persistence mechanism.
+**P5: migrated to the co-optimizer, in BOTH foresight modes (achievable +
+ceiling), replacing the threshold engine.** The threshold engine is RETIRED
+from the brief -- P2's diagnostic (`shared/bess_dispatch_milp.py:
+phantom_capacity_revenue`) found it published ~65% phantom (infeasible)
+capacity revenue on real windows, which is not a number this project wants
+in front of a non-technical reader. Every illustrative config now runs
+TWICE, both with `strategy="cooptimized"` (docs/bess-cooptimizer-design.md):
+
+- **Achievable** (`foresight="forecast"`) -- the LP schedules against a
+  causal lag-24h-persistence forecast and settles at actual prices (§5's
+  pre mode). This is the headline: an honest "what a battery would have
+  earned last month" figure a real, causal strategy could actually have
+  followed, with no double-selling and no lookahead.
+- **Ceiling** (`foresight="perfect"`) -- the LP schedules AND settles at
+  actual prices (§5's post mode), a perfect-foresight oracle. Reported
+  purely as labelled context ("theoretical ceiling, not achievable"),
+  never as if it were a deployable number.
+
+Both illustrative configs (`ILLUSTRATIVE_CONFIGS`) x both zones x both
+foresight modes = 8 backtests/day, run and persisted via the *existing*
+`shared.bess_simulator.run_backtest` / `DatabaseManager.save_bess_run`,
+tagged `label="morning_brief"` (init-db/05-morning-briefs.sql) so they're
+distinguishable from ad-hoc `/dashboard/bess/new` runs in the run list, but
+otherwise identical, independently queryable backtest runs -- no parallel
+persistence mechanism. The persisted `config` JSONB itself carries
+`strategy`/`foresight`, so all 8 runs stay distinguishable from each other
+purely by re-reading that column -- no new DB column needed.
+
+**`BessConfig`'s own defaults are UNCHANGED** (`strategy="threshold"`,
+`foresight="perfect"`) -- this module passes both overrides EXPLICITLY via
+`dataclasses.replace` on every call, exactly the same "opt in per call,
+never change the shared default" discipline `_with_cycle_cap`/
+`_with_zone_capacity_markets` below already use. This is what keeps old
+persisted run configs (from before this field existed, or from an ad-hoc
+threshold run) reproducing identically when re-run -- P1's guarantee.
+`capacity_commit_mw`/`capacity_allocation` are threshold-only concepts
+(`shared/bess_simulator.py`'s `BessConfig` docstring) and are silently
+ignored by the co-optimizer -- harmless to leave configured, not acted on.
 """
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 
 from shared.bess_simulator import BessConfig, run_backtest
@@ -39,8 +71,6 @@ ILLUSTRATIVE_CONFIGS: list[tuple[str, BessConfig]] = [
 def _with_cycle_cap(config: BessConfig, max_cycles_per_day: float | None) -> BessConfig:
     """`BessConfig` is frozen -- build a copy with `max_cycles_per_day`
     overridden rather than mutating the shared `ILLUSTRATIVE_CONFIGS` entries."""
-    from dataclasses import replace
-
     return replace(config, max_cycles_per_day=max_cycles_per_day)
 
 
@@ -62,7 +92,9 @@ def _with_cycle_cap(config: BessConfig, max_cycles_per_day: float | None) -> Bes
 # buckets (module docstring §2) report `currencies_present == {"DKK", "EUR"}`
 # for this stack, and callers (this module's summary dict below, the
 # dashboard templates) must keep showing both totals separately, never
-# combined into one number.
+# combined into one number. The co-optimizer's single joint LP
+# (`shared/bess_dispatch_milp.py`, P4) dispatches this mixed-currency stack
+# natively -- no crowd-out, no per-run currency switch needed.
 #
 # `("aFRR_capacity", "down")` is added to *both* zones here -- previously
 # omitted from this module (and `services/api/main.py`) for no stated
@@ -87,12 +119,13 @@ ZONE_CAPACITY_MARKETS: dict[str, tuple[tuple[str, str], ...]] = {
 # Zones whose ZONE_CAPACITY_MARKETS stack includes a market prone to
 # clearing at/near 0 (FFR, currently DK2-only -- see shared/datasets.py's
 # ffr_dk2 entry: prices are 0.0 today). "price_ranked" allocation
-# (BessConfig.capacity_allocation) is required for these zones' illustrative
-# runs -- with the default "even" split, FFR earning nothing would dilute
-# FCR/aFRR's shares purely from the split, understating this zone's
-# capacity revenue for a reason that has nothing to do with those markets
-# themselves (see shared/bess_simulator.py's module docstring §2,
-# "Allocation mode").
+# (BessConfig.capacity_allocation) was required for the retired threshold
+# engine's illustrative runs (it never mattered to the co-optimizer, which
+# ignores `capacity_allocation` entirely -- the LP decides each leg's
+# commitment level directly) -- kept only so a threshold run of this same
+# config (e.g. an ad-hoc `/dashboard/bess/new` comparison) still avoids the
+# even-split dilution artifact (see shared/bess_simulator.py's module
+# docstring §2, "Allocation mode").
 _PRICE_RANKED_ZONES = frozenset({"DK2"})
 
 
@@ -104,8 +137,6 @@ def _with_zone_capacity_markets(config: BessConfig, zone: str) -> BessConfig:
     `ZONE_CAPACITY_MARKETS` keeps the base config's own `capacity_markets`
     default unchanged.
     """
-    from dataclasses import replace
-
     capacity_markets = ZONE_CAPACITY_MARKETS.get(zone, config.capacity_markets)
     capacity_allocation = (
         "price_ranked" if zone in _PRICE_RANKED_ZONES else config.capacity_allocation
@@ -124,26 +155,37 @@ def run_illustrative_backtests(
     max_cycles_per_day: float | None = 1.5,
 ) -> list[dict]:
     """
-    Runs `run_backtest` for every (label, config) in `ILLUSTRATIVE_CONFIGS`
-    x every zone in `zones` (4 runs for the default 2 configs x 2 zones),
-    persists each via `db.save_bess_run(result, label="morning_brief")`, and
-    returns one summary dict per run:
+    Runs `run_backtest` TWICE (achievable + ceiling, see module docstring)
+    for every (label, config) in `ILLUSTRATIVE_CONFIGS` x every zone in
+    `zones` -- 8 runs for the default 2 configs x 2 zones x 2 foresight
+    modes -- persists EACH via `db.save_bess_run(result,
+    label="morning_brief")` (8 persisted rows/day), and returns ONE summary
+    dict per (config, zone) carrying BOTH totals:
 
-    `{config_label, zone, run_id, total_revenue_dkk,
-    total_arbitrage_revenue_dkk, total_capacity_revenue_dkk,
-    full_cycle_equivalents, cycle_cap_was_binding,
-    total_afrr_activation_revenue_eur, total_capacity_revenue_eur,
-    zero_price_periods_by_leg, currencies_present}`
+    `{config_label, zone, achievable_run_id, ceiling_run_id,
+    total_revenue_dkk_achievable, total_revenue_dkk_ceiling,
+    total_revenue_all_dkk_achievable, total_revenue_all_dkk_ceiling,
+    total_revenue_all_eur_achievable, total_revenue_all_eur_ceiling,
+    full_cycle_equivalents_achievable, cycle_cap_was_binding_achievable,
+    total_afrr_activation_revenue_eur_achievable,
+    total_capacity_revenue_eur_achievable, currencies_present,
+    zero_price_periods_by_leg}`
 
-    `total_capacity_revenue_eur` is DK2's EUR-denominated FCR capacity legs
-    (`shared/bess_simulator.py`'s per-currency capacity buckets, module
-    docstring §2) -- always 0.0 for DK1 (all-DKK), and for a DK2 run it's a
-    genuinely separate figure from `total_capacity_revenue_dkk`, never
-    summed into it or into `total_revenue_dkk`. `currencies_present`
+    Every per-run detail field (cycle cap, aFRR activation, capacity-EUR,
+    currencies present, zero-price periods) is taken from the ACHIEVABLE
+    run only -- the ceiling run is an oracle, never a deployable policy, so
+    only its headline totals are surfaced (`total_revenue_dkk_ceiling`/
+    `total_revenue_all_dkk_ceiling`/`total_revenue_all_eur_ceiling`); a
+    ceiling-side cycle-cap/activation breakdown would invite a reader to
+    treat the oracle as if it were something a real strategy could follow.
+
+    `total_revenue_all_dkk`/`_eur` (`BacktestResult`'s §4.1 peg-converted
+    combined totals) are what `shared/morning_brief_editor.py` actually
+    renders -- a single headline figure per currency-thinking reader,
+    rather than the unconverted per-currency buckets alone. `currencies_present`
     (`BacktestResult.currencies_present`, a `frozenset`) tells a caller
-    whether that separation actually matters for this run --
-    `{"DKK", "EUR"}` for DK2 (mixed FCR/EUR + aFRR+FFR/DKK), `{"DKK"}` for
-    DK1 -- so a template can show the "not summable" note only when needed.
+    whether that separation actually matters for this run -- `{"DKK", "EUR"}`
+    for DK2 (mixed FCR/EUR + aFRR+FFR/DKK), `{"DKK"}` for DK1.
 
     `zero_price_periods_by_leg` (`BacktestResult.zero_price_periods_by_leg`)
     supports honest framing for a market that's currently earning nothing
@@ -151,21 +193,13 @@ def run_illustrative_backtests(
     rather than silently showing a flat zero total with no context.
 
     DK2 runs widen `capacity_markets` to the full stack in
-    `ZONE_CAPACITY_MARKETS` (FCR-N/FCR-D/aFRR up+down/FFR) and switch
-    `capacity_allocation` to `"price_ranked"` (`_PRICE_RANKED_ZONES`) so
-    FFR's currently-zero price doesn't dilute the other, genuinely-earning
-    groups' shares -- see `shared/bess_simulator.py`'s module docstring §2
-    and `_with_zone_capacity_markets` below. DK1 gains
-    `("aFRR_capacity", "down")` on top of its existing FCR/aFRR-up pair but
-    keeps `capacity_allocation="even"` (no zero-price-prone market in its
-    stack).
+    `ZONE_CAPACITY_MARKETS` (FCR-N/FCR-D/aFRR up+down/FFR) -- see
+    `shared/bess_simulator.py`'s module docstring §2 and
+    `_with_zone_capacity_markets` below.
 
-    `cycle_cap_was_binding` is `True` if the rolling-24h cycle cap
-    (`BessTick.cycle_cap_binding`) was ever the limiting factor across the
-    run -- feeds the brief's "capped your earnings on N of the past 30
-    days"-style framing (the per-day count itself is derivable from
-    `db.fetch_bess_ticks(run_id)` by the caller if needed; this summary only
-    carries the boolean "did it ever bind" signal).
+    `cycle_cap_was_binding_achievable` is `True` if the rolling-24h cycle
+    cap (`BessTick.cycle_cap_binding`) was ever the limiting factor across
+    the achievable run.
 
     A single backtest window's data-fetch or persistence failure is not
     caught here -- it propagates to the caller (`run_morning_brief` wraps
@@ -177,26 +211,46 @@ def run_illustrative_backtests(
     for label, base_config in ILLUSTRATIVE_CONFIGS:
         config_with_cap = _with_cycle_cap(base_config, max_cycles_per_day)
         for zone in zones:
-            config = _with_zone_capacity_markets(config_with_cap, zone)
-            result = run_backtest(db, zone, start_time, end_time, config)
-            run_id = db.save_bess_run(result, label=MORNING_BRIEF_RUN_LABEL)
+            zone_config = _with_zone_capacity_markets(config_with_cap, zone)
+
+            # BessConfig's own defaults stay threshold/perfect (module
+            # docstring) -- both overrides applied explicitly, per call.
+            achievable_config = replace(zone_config, strategy="cooptimized", foresight="forecast")
+            ceiling_config = replace(zone_config, strategy="cooptimized", foresight="perfect")
+
+            achievable_result = run_backtest(db, zone, start_time, end_time, achievable_config)
+            achievable_run_id = db.save_bess_run(achievable_result, label=MORNING_BRIEF_RUN_LABEL)
+
+            ceiling_result = run_backtest(db, zone, start_time, end_time, ceiling_config)
+            ceiling_run_id = db.save_bess_run(ceiling_result, label=MORNING_BRIEF_RUN_LABEL)
+
             summaries.append(
                 {
                     "config_label": label,
                     "zone": zone,
-                    "run_id": run_id,
-                    "total_revenue_dkk": result.total_revenue_dkk,
-                    "total_arbitrage_revenue_dkk": result.total_arbitrage_revenue_dkk,
-                    "total_capacity_revenue_dkk": result.total_capacity_revenue_dkk,
-                    "full_cycle_equivalents": result.full_cycle_equivalents,
-                    "cycle_cap_was_binding": any(t.cycle_cap_binding for t in result.ticks),
-                    "total_afrr_activation_revenue_eur": result.total_afrr_activation_revenue_eur,
-                    "total_capacity_revenue_eur": result.total_capacity_revenue_eur,
-                    "zero_price_periods_by_leg": result.zero_price_periods_by_leg,
+                    "achievable_run_id": achievable_run_id,
+                    "ceiling_run_id": ceiling_run_id,
+                    "total_revenue_dkk_achievable": achievable_result.total_revenue_dkk,
+                    "total_revenue_dkk_ceiling": ceiling_result.total_revenue_dkk,
+                    "total_revenue_all_dkk_achievable": achievable_result.total_revenue_all_dkk,
+                    "total_revenue_all_dkk_ceiling": ceiling_result.total_revenue_all_dkk,
+                    "total_revenue_all_eur_achievable": achievable_result.total_revenue_all_eur,
+                    "total_revenue_all_eur_ceiling": ceiling_result.total_revenue_all_eur,
+                    "full_cycle_equivalents_achievable": achievable_result.full_cycle_equivalents,
+                    "cycle_cap_was_binding_achievable": any(
+                        t.cycle_cap_binding for t in achievable_result.ticks
+                    ),
+                    "total_afrr_activation_revenue_eur_achievable": (
+                        achievable_result.total_afrr_activation_revenue_eur
+                    ),
+                    "total_capacity_revenue_eur_achievable": (
+                        achievable_result.total_capacity_revenue_eur
+                    ),
                     # sorted list, not the raw frozenset -- this summary is
                     # persisted as JSONB (db.save_morning_brief), and a
                     # frozenset isn't JSON-serializable.
-                    "currencies_present": sorted(result.currencies_present),
+                    "currencies_present": sorted(achievable_result.currencies_present),
+                    "zero_price_periods_by_leg": achievable_result.zero_price_periods_by_leg,
                 }
             )
     return summaries

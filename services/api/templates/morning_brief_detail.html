@@ -61,25 +61,65 @@
 </div>
 
 <div class="card">
-  <h2>Illustrative BESS estimates (past month, ~1.5 cycles/day cap)</h2>
+  <h2>Illustrative BESS estimates (past month, ~1.5 cycles/day cap, achievable vs. theoretical ceiling)</h2>
   <p class="muted">
     Two illustrative battery sizes, not a specific real asset — see
     <code>shared/bess_estimator.py</code>. Both revenue streams are estimates, not a real
-    co-optimized dispatch.
+    co-optimized dispatch. <strong>Achievable</strong> uses a simple, honest day-ahead
+    persistence forecast (no oracle, no double-sell) -- this is the number to trust.
+    <strong>Theoretical ceiling</strong> assumes perfect foresight of future prices and is
+    <strong>never achievable</strong> by a real strategy; it's shown only as an upper-bound
+    for context. The threshold engine is retired from this brief (see
+    <code>docs/bess-cooptimizer-results.md</code>).
   </p>
   {% if row.bess_estimates %}
   <table>
     <tr>
-      <th>Config</th><th>Zone</th><th>Run</th><th>Total revenue (DKK)</th>
+      <th>Config</th><th>Zone</th><th>Achievable run</th><th>Ceiling run</th>
+      <th>Achievable total (DKK)</th><th>Theoretical ceiling (DKK)</th>
       <th>Capacity revenue (EUR)</th>
       <th>Full cycle equivalents</th><th>Cycle cap binding?</th>
     </tr>
     {% for estimate in row.bess_estimates %}
+    {% if 'total_revenue_all_dkk_achievable' in estimate %}
     <tr>
       <td>{{ estimate.config_label }}</td>
       <td>{{ estimate.zone }}</td>
-      <td><a href="/dashboard/bess/{{ estimate.run_id }}">#{{ estimate.run_id }}</a></td>
-      <td>{{ "%.2f"|format(estimate.total_revenue_dkk) }}</td>
+      <td><a href="/dashboard/bess/{{ estimate.achievable_run_id }}">#{{ estimate.achievable_run_id }}</a></td>
+      <td><a href="/dashboard/bess/{{ estimate.ceiling_run_id }}">#{{ estimate.ceiling_run_id }}</a></td>
+      <td>{{ "%.2f"|format(estimate.total_revenue_all_dkk_achievable) }}</td>
+      <td>{{ "%.2f"|format(estimate.total_revenue_all_dkk_ceiling) }}
+        <span class="muted">-- theoretical ceiling, not achievable</span>
+      </td>
+      <td>{{ "%.2f"|format(estimate.get('total_capacity_revenue_eur_achievable', 0.0)) }}
+        {% if estimate.get('total_capacity_revenue_eur_achievable', 0.0) %}
+        <span class="muted">-- separate currency, not summed into the DKK total</span>
+        {% endif %}
+      </td>
+      <td>{{ "%.3f"|format(estimate.get('full_cycle_equivalents_achievable', 0.0)) }}</td>
+      <td>{{ "yes" if estimate.get('cycle_cap_was_binding_achievable') else "no" }}</td>
+    </tr>
+    {% if estimate.get('zero_price_periods_by_leg') %}
+    <tr>
+      <td colspan="9" class="muted">
+        Cleared at 0:
+        {% for leg, count in estimate.zero_price_periods_by_leg.items() %}
+          {{ leg }} ({{ count }} period{{ "s" if count != 1 else "" }}){{ ", " if not loop.last else "" }}
+        {% endfor %}
+        -- an honest count, not silently folded into the total above.
+      </td>
+    </tr>
+    {% endif %}
+    {% else %}
+    <!-- Backward compat: briefs persisted before P5 only ever carried the
+         single threshold-engine total, no achievable/ceiling split. -->
+    <tr>
+      <td>{{ estimate.config_label }}</td>
+      <td>{{ estimate.zone }}</td>
+      <td colspan="2"><a href="/dashboard/bess/{{ estimate.run_id }}">#{{ estimate.run_id }}</a></td>
+      <td colspan="2">{{ "%.2f"|format(estimate.total_revenue_dkk) }}
+        <span class="muted">-- pre-migration threshold-engine estimate (retired)</span>
+      </td>
       <td>{{ "%.2f"|format(estimate.get('total_capacity_revenue_eur', 0.0)) }}
         {% if estimate.get('total_capacity_revenue_eur', 0.0) %}
         <span class="muted">-- separate currency, not summed into the DKK total</span>
@@ -90,7 +130,7 @@
     </tr>
     {% if estimate.get('zero_price_periods_by_leg') %}
     <tr>
-      <td colspan="7" class="muted">
+      <td colspan="9" class="muted">
         Cleared at 0:
         {% for leg, count in estimate.zero_price_periods_by_leg.items() %}
           {{ leg }} ({{ count }} period{{ "s" if count != 1 else "" }}){{ ", " if not loop.last else "" }}
@@ -98,6 +138,7 @@
         -- an honest count, not silently folded into the total above.
       </td>
     </tr>
+    {% endif %}
     {% endif %}
     {% endfor %}
   </table>
