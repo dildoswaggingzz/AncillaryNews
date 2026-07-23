@@ -736,10 +736,7 @@ def solve_cooptimized_dispatch(
     # (any currency), and (P4) activation all compete for the one shared
     # budget on equal footing.
     objective = pulp.lpSum(
-        energy_peg[m]
-        * (energy_schedule_price_at_t[m][i] or 0.0)
-        * (dis[m][i] - ch[m][i])
-        * dt[i]
+        energy_peg[m] * (energy_schedule_price_at_t[m][i] or 0.0) * (dis[m][i] - ch[m][i]) * dt[i]
         for m in energy_markets
         for i in range(T)
     )
@@ -784,9 +781,7 @@ def solve_cooptimized_dispatch(
     ch_star = {m: [pulp.value(v) or 0.0 for v in ch[m]] for m in energy_markets}
     dis_star = {m: [pulp.value(v) or 0.0 for v in dis[m]] for m in energy_markets}
     soc_star = [starting_soc] + [pulp.value(v) or 0.0 for v in soc[1:]]
-    cap_star: dict[str, list[float]] = {
-        k: [pulp.value(v) or 0.0 for v in cap[k]] for k in leg_keys
-    }
+    cap_star: dict[str, list[float]] = {k: [pulp.value(v) or 0.0 for v in cap[k]] for k in leg_keys}
 
     # ---------------------------------------------------------------
     # Walk the solution into one BessTick per period. Every reported
@@ -849,10 +844,7 @@ def solve_cooptimized_dispatch(
         # at SETTLEMENT prices, unconverted (EUR-native, exactly as before).
         activation_price = activation_settlement_price_at_t[i] if afrr_committed_mw else None
         afrr_activation_revenue = (
-            activation_price
-            * afrr_committed_mw
-            * config.afrr_activation_participation_rate
-            * dt[i]
+            activation_price * afrr_committed_mw * config.afrr_activation_participation_rate * dt[i]
             if activation_price is not None
             else 0.0
         )

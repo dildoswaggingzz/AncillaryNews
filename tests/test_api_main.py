@@ -515,8 +515,10 @@ def test_dashboard_bess_detail_renders(client, db):
 
 
 def test_dashboard_bess_list_shows_strategy_and_foresight_columns(client, db):
-    row = {**BESS_RUN_ROW, "config": {**BESS_RUN_ROW["config"], "strategy": "cooptimized",
-                                       "foresight": "forecast"}}
+    row = {
+        **BESS_RUN_ROW,
+        "config": {**BESS_RUN_ROW["config"], "strategy": "cooptimized", "foresight": "forecast"},
+    }
     db.fetch_bess_runs.return_value = [row]
 
     resp = client.get("/dashboard/bess")

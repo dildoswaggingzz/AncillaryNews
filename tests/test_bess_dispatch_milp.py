@@ -442,9 +442,9 @@ def test_combined_total_math_matches_hand_computed_conversion():
     result = run_backtest(db, "DK2", BASE_TIME, BASE_TIME + timedelta(hours=6), config)
 
     assert result.currencies_present == {"DKK", "EUR"}
-    expected_all_dkk = (
-        result.total_arbitrage_revenue_dkk + result.total_capacity_revenue_dkk
-    ) + (result.total_capacity_revenue_eur + result.total_afrr_activation_revenue_eur) * DKK_PER_EUR
+    expected_all_dkk = (result.total_arbitrage_revenue_dkk + result.total_capacity_revenue_dkk) + (
+        result.total_capacity_revenue_eur + result.total_afrr_activation_revenue_eur
+    ) * DKK_PER_EUR
     expected_all_eur = (
         result.total_arbitrage_revenue_dkk + result.total_capacity_revenue_dkk
     ) / DKK_PER_EUR + (result.total_capacity_revenue_eur + result.total_afrr_activation_revenue_eur)
@@ -515,9 +515,13 @@ def test_phantom_capacity_revenue_exact_amount_when_committed_beyond_headroom():
     discharge that period. `feasible_up_mw` against the tighter of
     start/end SoC is `min(1.0, 0.2) = 0.2 = soc_min`, so feasible up-reserve
     is exactly 0 -- the committed 5.0 MW is *entirely* phantom."""
-    result = _single_tick_result("DK1", soc_mwh=0.2, capacity_revenue_by_market={
-        "aFRR_capacity:up": 500.0  # 5.0 MW committed @ 100 DKK/MW/h, dt=1h
-    })
+    result = _single_tick_result(
+        "DK1",
+        soc_mwh=0.2,
+        capacity_revenue_by_market={
+            "aFRR_capacity:up": 500.0  # 5.0 MW committed @ 100 DKK/MW/h, dt=1h
+        },
+    )
     diagnostic = phantom_capacity_revenue(
         result, _PHANTOM_CONFIG, {"aFRR_capacity:up": [(BASE_TIME, 100.0)]}
     )
@@ -612,8 +616,7 @@ def test_imbalance_discharge_beats_day_ahead_only_when_imbalance_price_is_higher
     )
 
     assert (
-        result_two_markets.total_arbitrage_revenue_dkk
-        > result_da_only.total_arbitrage_revenue_dkk
+        result_two_markets.total_arbitrage_revenue_dkk > result_da_only.total_arbitrage_revenue_dkk
     )
     # Hour 1 (index 1) must have been settled at the higher imbalance price,
     # not day-ahead's -- the discharge revenue there can only be explained
@@ -650,8 +653,12 @@ def test_soc_feasible_with_two_energy_markets():
 
 
 def _naive_no_binary_passthrough_optimum(
-    power_mw: float, starting_soc: float, soc_min: float, eta: float, day_ahead_price: float,
-    imbalance_price: float
+    power_mw: float,
+    starting_soc: float,
+    soc_min: float,
+    eta: float,
+    day_ahead_price: float,
+    imbalance_price: float,
 ) -> float:
     """Rebuilds, standalone (NOT calling any production code), the exact
     single-period toy LP the pre-fix (no cross-market binary) formulation

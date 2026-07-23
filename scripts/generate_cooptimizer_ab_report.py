@@ -423,7 +423,7 @@ def _render_report(*, records: list[dict], skipped_zones: list[str]) -> list[str
         "-- that excess is **phantom** (infeasible) revenue, not a co-optimizer regression. On",
         "windows where the threshold engine never double-sells, the co-optimizer's perfect-",
         "foresight total is `>=` the threshold's, as a true optimum must be. Both directions are",
-        "shown below; neither is framed as \"the co-optimizer earning less is worse\" -- see",
+        'shown below; neither is framed as "the co-optimizer earning less is worse" -- see',
         "§4 for the full reading note.",
         "",
     ]
@@ -524,9 +524,7 @@ def _render_report(*, records: list[dict], skipped_zones: list[str]) -> list[str
         header = f"### {r['config_label']} -- {r['zone']} -- {r['window_label']} ({window_str})"
         lines.append(header)
         lines.append("")
-        currencies = sorted(
-            r["threshold"].currencies_present | r["cooptimized"].currencies_present
-        )
+        currencies = sorted(r["threshold"].currencies_present | r["cooptimized"].currencies_present)
         if currencies:
             lines.append(f"Currencies present: {', '.join(currencies)}.")
             lines.append("")
@@ -552,7 +550,7 @@ def _render_report(*, records: list[dict], skipped_zones: list[str]) -> list[str
         "docstring §0). On a window where its arbitrage leg discharges the battery toward",
         "`soc_min` while it is *also* booking up-reserve payments, part of that reserve payment is",
         "for MW the battery could not have delivered -- phantom revenue. This is the honest",
-        "answer to \"how wrong is the number the Morning Brief currently publishes\", and it is",
+        'answer to "how wrong is the number the Morning Brief currently publishes", and it is',
         "computed independently of anything the co-optimizer does.",
         "",
         "**Direction B -- co-optimizer upside on feasible windows.** Where the threshold engine's",
@@ -638,8 +636,7 @@ def _render_report(*, records: list[dict], skipped_zones: list[str]) -> list[str
         for r in records
     )
     total_post_pre_gap = sum(
-        r["perfect_imbalance"].total_revenue_all_dkk
-        - r["forecast_imbalance"].total_revenue_all_dkk
+        r["perfect_imbalance"].total_revenue_all_dkk - r["forecast_imbalance"].total_revenue_all_dkk
         for r in records
     )
     lines += [
@@ -691,7 +688,7 @@ def _render_report(*, records: list[dict], skipped_zones: list[str]) -> list[str
     if pre_leq_post_violations:
         lines.append(
             f"- **`pre <= post` VIOLATED on {len(pre_leq_post_violations)} row(s)** -- this "
-            "should be impossible per `foresight=\"forecast\"`'s own guarantee and would "
+            'should be impossible per `foresight="forecast"`\'s own guarantee and would '
             "indicate a real bug, not an expected finding:"
         )
         for r in pre_leq_post_violations:

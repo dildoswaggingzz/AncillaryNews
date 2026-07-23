@@ -154,9 +154,7 @@ async def test_self_contained_feed_skips_items_with_no_body(client):
       <item><title>Headline only, no description</title></item>
     </channel></rss>
     """
-    respx.get(SELF_CONTAINED_FEED.url).mock(
-        return_value=httpx.Response(200, content=rss_no_body)
-    )
+    respx.get(SELF_CONTAINED_FEED.url).mock(return_value=httpx.Response(200, content=rss_no_body))
 
     articles = await fetch_feed_entries(SELF_CONTAINED_FEED, client)
 
