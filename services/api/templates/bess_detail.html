@@ -1,13 +1,88 @@
 {% extends "base.html" %}
 {% block title %}BESS Backtest #{{ run.id }} — AncillaryNews{% endblock %}
 {% block content %}
+
+{#
+  Fixed ERM II policy peg, mirrors shared/units.py's DKK_PER_EUR (= 7.46). Used ONLY
+  as a presentation-layer convenience to show ONE combined headline and to stack the
+  revenue streams on a single axis — exactly how BacktestResult.total_revenue_all_dkk
+  is defined. The raw per-currency figures are always shown alongside, never replaced;
+  nothing here is ever fed back into an optimization objective.
+#}
+{% set peg = 7.46 %}
+{% set arb = run.total_arbitrage_revenue_dkk %}
+{% set cap_dkk = run.total_capacity_revenue_dkk %}
+{% set cap_eur = run.get('total_capacity_revenue_eur', 0.0) %}
+{% set afrr_eur = run.total_afrr_activation_revenue_eur %}
+{% set arb_c = arb %}
+{% set capdkk_c = cap_dkk %}
+{% set capeur_c = cap_eur * peg %}
+{% set afrr_c = afrr_eur * peg %}
+{% set combined_dkk = arb_c + capdkk_c + capeur_c + afrr_c %}
+{% set pos_sum = [arb_c, 0]|max + [capdkk_c, 0]|max + [capeur_c, 0]|max + [afrr_c, 0]|max %}
+{% set streams = [
+    {'label': 'Day-ahead arbitrage', 'cur': 'DKK', 'raw': arb, 'dkk': arb_c, 'color': '#2563eb'},
+    {'label': 'Capacity — DKK legs', 'cur': 'DKK', 'raw': cap_dkk, 'dkk': capdkk_c, 'color': '#7c3aed'},
+    {'label': 'Capacity — EUR legs', 'cur': 'EUR', 'raw': cap_eur, 'dkk': capeur_c, 'color': '#0891b2'},
+    {'label': 'aFRR activation', 'cur': 'EUR', 'raw': afrr_eur, 'dkk': afrr_c, 'color': '#ea580c'},
+] %}
+
+<style>
+  .bess-detail { --arb: #2563eb; --capdkk: #7c3aed; --capeur: #0891b2; --afrr: #ea580c; --ink: #12181f; }
+  .bess-detail .num { font-variant-numeric: tabular-nums; font-feature-settings: "tnum" 1; }
+  .bess-detail .eyebrow {
+    text-transform: uppercase; letter-spacing: 0.14em; font-size: 0.7rem; font-weight: 700;
+    color: #6b7280; margin: 0 0 0.35rem;
+  }
+  /* Hero: the one number to plan around */
+  .bess-detail .hero { border-left: 4px solid var(--ink); }
+  .bess-detail .hero-figure {
+    font-size: clamp(2.2rem, 6vw, 3.4rem); font-weight: 700; line-height: 1.05; color: var(--ink);
+    letter-spacing: -0.02em;
+  }
+  .bess-detail .hero-figure .unit { font-size: 0.4em; font-weight: 600; color: #6b7280; margin-left: 0.4rem; letter-spacing: 0; }
+  .bess-detail .hero-sub { font-size: 1rem; color: #4b5563; margin-top: 0.2rem; }
+  .bess-detail .hero-note { font-size: 0.85rem; color: #6b7280; margin: 0.75rem 0 0; max-width: 60ch; }
+  /* Composition bar */
+  .bess-detail .comp-bar {
+    display: flex; height: 2.25rem; border-radius: 0.35rem; overflow: hidden; margin: 0.25rem 0 1rem;
+    background: #eef0f3;
+  }
+  .bess-detail .comp-seg { min-width: 2px; }
+  .bess-detail .comp-legend { list-style: none; padding: 0; margin: 0; display: grid; gap: 0.55rem; }
+  .bess-detail .comp-row { display: flex; align-items: baseline; gap: 0.6rem; }
+  .bess-detail .swatch { width: 0.8rem; height: 0.8rem; border-radius: 0.2rem; flex: 0 0 auto; position: relative; top: 0.05rem; }
+  .bess-detail .comp-name { font-weight: 600; }
+  .bess-detail .comp-name .cur-tag {
+    font-size: 0.68rem; font-weight: 700; letter-spacing: 0.03em; padding: 0.05rem 0.35rem; border-radius: 0.25rem;
+    margin-left: 0.4rem; vertical-align: 0.08em;
+  }
+  .bess-detail .cur-DKK { background: #eef2ff; color: #3730a3; }
+  .bess-detail .cur-EUR { background: #ecfeff; color: #155e75; }
+  .bess-detail .comp-vals { margin-left: auto; text-align: right; white-space: nowrap; }
+  .bess-detail .comp-native { font-weight: 600; color: var(--ink); }
+  .bess-detail .comp-conv { font-size: 0.82rem; color: #6b7280; }
+  .bess-detail .zero { opacity: 0.5; }
+  .bess-detail .comp-total {
+    display: flex; justify-content: space-between; align-items: baseline; gap: 1rem;
+    margin-top: 0.9rem; padding-top: 0.7rem; border-top: 1px solid #e5e7eb; font-weight: 700;
+  }
+  /* Chart */
+  .bess-detail .chart-wrap { position: relative; height: 380px; width: 100%; overflow-x: auto; }
+  .bess-detail .chart-wrap canvas { min-width: 320px; }
+  @media (max-width: 640px) { .bess-detail .chart-wrap { height: 300px; } }
+</style>
+
+<div class="bess-detail">
+
 <h1>BESS Backtest #{{ run.id }} — {{ run.zone }}</h1>
 <p class="muted">
   Period: {{ run.start_time }} &rarr; {{ run.end_time }} &middot; {{ run.tick_count }} tick(s) &middot;
   created {{ run.created_at }}
 </p>
+
 <p class="card">
-  <strong>Both revenue streams below are estimates, not a real co-optimized dispatch</strong> —
+  <strong>These revenue streams are estimates, not a real co-optimized dispatch</strong> —
   see <code>shared/bess_simulator.py</code>'s module docstring for exactly what's simplified
   (e.g. capacity reservation assumes the commitment always clears at the published price).
 </p>
@@ -31,35 +106,67 @@
   {% endif %}
 </p>
 
-<div class="card">
-  <h3>Summary</h3>
-  <table>
-    <tr><th>Arbitrage revenue (DKK)</th><td>{{ "%.2f"|format(run.total_arbitrage_revenue_dkk) }}</td></tr>
-    <tr><th>Capacity reservation revenue (DKK)</th><td>{{ "%.2f"|format(run.total_capacity_revenue_dkk) }}</td></tr>
-    <tr><th>Total revenue (DKK)</th><td>{{ "%.2f"|format(run.total_revenue_dkk) }}</td></tr>
-    <tr><th>Full cycle equivalents</th><td>{{ "%.3f"|format(run.full_cycle_equivalents) }}</td></tr>
-    <tr>
-      <th>Capacity reservation revenue (EUR)</th>
-      <td>{{ "%.2f"|format(run.get('total_capacity_revenue_eur', 0.0)) }}
-        <span class="muted">-- separate currency, not summed into the DKK total above (e.g. DK2's
-        FCR legs settle in EUR while its aFRR_capacity legs settle in DKK)</span>
-      </td>
-    </tr>
-    <tr>
-      <th>aFRR activation revenue (EUR)</th>
-      <td>{{ "%.2f"|format(run.total_afrr_activation_revenue_eur) }}
-        <span class="muted">-- separate currency, not summed into the DKK total above</span>
-      </td>
-    </tr>
-  </table>
-  {% if run.total_capacity_revenue_dkk and run.get('total_capacity_revenue_eur', 0.0) %}
-  <p class="muted">
-    This run's capacity reservation revenue is <strong>not summable to one number</strong> --
-    it includes both a DKK-denominated leg and an EUR-denominated leg (see the two rows above).
-    Compare them side by side; never add them together.
+<!-- Hero: the single total to plan around -->
+<div class="card hero">
+  <p class="eyebrow">Total revenue you can plan around</p>
+  <div class="hero-figure num">{{ "{:,.0f}".format(combined_dkk) }}<span class="unit">DKK</span></div>
+  <div class="hero-sub num">≈ €{{ "{:,.0f}".format(combined_dkk / peg) }} at the fixed peg</div>
+  {% if cap_eur or afrr_eur %}
+  <p class="hero-note">
+    This run earns in two currencies. They are <strong>never summed at floating market
+    rates</strong> — that would misstate the total. This one headline combines them only at the
+    fixed ERM II peg of <strong>{{ peg }} DKK/EUR</strong>, the same convention the engine uses
+    for its combined figure. The raw per-currency amounts are broken out below.
+  </p>
+  {% else %}
+  <p class="hero-note">
+    Every stream in this run settles in DKK, so this total is exact — no currency conversion
+    involved. The per-market breakdown is below.
   </p>
   {% endif %}
 </div>
+
+<!-- Composition: where the total comes from -->
+<div class="card">
+  <p class="eyebrow">Revenue by market</p>
+  <div class="comp-bar" role="img"
+       aria-label="Share of total revenue by market, at the fixed 7.46 DKK/EUR peg">
+    {% for s in streams %}
+      {% if s.dkk > 0 %}
+      <div class="comp-seg" style="flex-grow: {{ s.dkk }}; background: {{ s.color }};"
+           title="{{ s.label }}: {{ '{:,.0f}'.format(s.dkk) }} DKK ({{ '{:.0f}'.format(100 * s.dkk / pos_sum if pos_sum else 0) }}%)"></div>
+      {% endif %}
+    {% endfor %}
+  </div>
+  <ul class="comp-legend">
+    {% for s in streams %}
+    <li class="comp-row {{ 'zero' if s.raw == 0 else '' }}">
+      <span class="swatch" style="background: {{ s.color }};"></span>
+      <span class="comp-name">{{ s.label }}<span class="cur-tag cur-{{ s.cur }}">{{ s.cur }}</span></span>
+      <span class="comp-vals">
+        <span class="comp-native num">
+          {% if s.cur == 'EUR' %}€{% endif %}{{ "{:,.2f}".format(s.raw) }}{% if s.cur == 'DKK' %} DKK{% endif %}
+        </span>
+        {% if s.cur == 'EUR' %}
+        <span class="comp-conv num">= {{ "{:,.0f}".format(s.dkk) }} DKK at {{ peg }} peg</span>
+        {% else %}
+        <span class="comp-conv num">{{ "{:.0f}".format(100 * s.dkk / pos_sum if pos_sum else 0) }}% of total</span>
+        {% endif %}
+      </span>
+    </li>
+    {% endfor %}
+  </ul>
+  <div class="comp-total">
+    <span>Combined total</span>
+    <span class="num">{{ "{:,.0f}".format(combined_dkk) }} DKK</span>
+  </div>
+</div>
+
+<!-- Full-cycle equivalents -->
+<p class="muted">
+  Full cycle equivalents: <strong class="num">{{ "%.3f"|format(run.full_cycle_equivalents) }}</strong>
+  (energy discharged to the grid ÷ nameplate capacity — capacity reservations cycle no energy).
+</p>
 
 <div class="card">
   <h3>Battery configuration used for this run</h3>
@@ -71,28 +178,83 @@
 </div>
 
 {% if ticks %}
-<h3>State of charge over time</h3>
-<canvas id="soc-chart" height="80"></canvas>
+<h3>Revenue by market over time</h3>
+<p class="muted">
+  Bars split each tick's revenue by market; the line tracks the cumulative combined total.
+  EUR-settled streams are shown at the fixed {{ peg }} peg so everything stacks on one DKK axis.
+  State of charge is in the tick table below.
+</p>
+<div class="chart-wrap">
+  <canvas id="revenue-chart"></canvas>
+</div>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <script>
+  const PEG = {{ peg }};
   const labels = {{ ticks|map(attribute='time')|map('string')|list|tojson }};
-  const soc = {{ ticks|map(attribute='soc_fraction')|list|tojson }};
-  const cumulative = {{ ticks|map(attribute='cumulative_total_revenue_dkk')|list|tojson }};
-  new Chart(document.getElementById('soc-chart'), {
-    type: 'line',
+  const arb = {{ ticks|map(attribute='arbitrage_revenue_dkk', default=0.0)|map('float')|list|tojson }};
+  const capDkk = {{ ticks|map(attribute='capacity_revenue_dkk', default=0.0)|map('float')|list|tojson }};
+  const capEurRaw = {{ ticks|map(attribute='capacity_revenue_eur', default=0.0)|map('float')|list|tojson }};
+  const afrrRaw = {{ ticks|map(attribute='afrr_activation_revenue_eur', default=0.0)|map('float')|list|tojson }};
+  const cumDkk = {{ ticks|map(attribute='cumulative_total_revenue_dkk', default=0.0)|map('float')|list|tojson }};
+  const cumCapEur = {{ ticks|map(attribute='cumulative_capacity_revenue_eur', default=0.0)|map('float')|list|tojson }};
+  const cumAfrrEur = {{ ticks|map(attribute='cumulative_afrr_activation_revenue_eur', default=0.0)|map('float')|list|tojson }};
+
+  const capEur = capEurRaw.map(v => v * PEG);
+  const afrr = afrrRaw.map(v => v * PEG);
+  // Cumulative combined = DKK-native legs + EUR legs converted at the fixed peg (matches the bars).
+  const cumCombined = cumDkk.map((v, i) => v + (cumCapEur[i] + cumAfrrEur[i]) * PEG);
+
+  const dkk = new Intl.NumberFormat('en', { maximumFractionDigits: 0 });
+  const eur2 = new Intl.NumberFormat('en', { maximumFractionDigits: 2 });
+
+  // Native-currency value behind each converted bar segment, for tooltips.
+  const nativeFor = { 'Capacity — EUR legs': capEurRaw, 'aFRR activation': afrrRaw };
+
+  new Chart(document.getElementById('revenue-chart'), {
+    type: 'bar',
     data: {
       labels: labels,
       datasets: [
-        { label: 'SoC fraction', data: soc, borderColor: '#0b5fff', tension: 0.1, yAxisID: 'y' },
-        { label: 'Cumulative revenue (DKK)', data: cumulative, borderColor: '#1a6b1a', tension: 0.1, yAxisID: 'y1' }
+        { label: 'Day-ahead arbitrage', data: arb, backgroundColor: '#2563eb', stack: 'rev', yAxisID: 'y', order: 2 },
+        { label: 'Capacity — DKK legs', data: capDkk, backgroundColor: '#7c3aed', stack: 'rev', yAxisID: 'y', order: 2 },
+        { label: 'Capacity — EUR legs', data: capEur, backgroundColor: '#0891b2', stack: 'rev', yAxisID: 'y', order: 2 },
+        { label: 'aFRR activation', data: afrr, backgroundColor: '#ea580c', stack: 'rev', yAxisID: 'y', order: 2 },
+        {
+          label: 'Cumulative total (DKK)', data: cumCombined, type: 'line', yAxisID: 'y1',
+          borderColor: '#12181f', borderWidth: 2, pointRadius: 0, tension: 0.1, order: 0
+        }
       ]
     },
     options: {
+      responsive: true,
+      maintainAspectRatio: false,
       animation: false,
+      interaction: { mode: 'index', intersect: false },
       scales: {
-        x: { display: false },
-        y: { position: 'left', title: { display: true, text: 'SoC fraction' } },
-        y1: { position: 'right', title: { display: true, text: 'Cumulative revenue (DKK)' }, grid: { drawOnChartArea: false } }
+        x: { stacked: true, grid: { display: false }, ticks: { maxRotation: 0, autoSkip: true, maxTicksLimit: 12 } },
+        y: {
+          stacked: true, position: 'left', beginAtZero: true,
+          title: { display: true, text: 'Revenue per tick (DKK, ' + PEG + ' peg)' }
+        },
+        y1: {
+          position: 'right', title: { display: true, text: 'Cumulative total (DKK)' },
+          grid: { drawOnChartArea: false }
+        }
+      },
+      plugins: {
+        legend: { position: 'bottom', labels: { usePointStyle: true, boxWidth: 8 } },
+        tooltip: {
+          callbacks: {
+            label: (ctx) => {
+              const v = ctx.parsed.y;
+              if (ctx.dataset.type === 'line') return ' Cumulative total: ' + dkk.format(v) + ' DKK';
+              const native = nativeFor[ctx.dataset.label];
+              let out = ' ' + ctx.dataset.label + ': ' + dkk.format(v) + ' DKK';
+              if (native) out += '  (€' + eur2.format(native[ctx.dataIndex]) + ' at ' + PEG + ' peg)';
+              return out;
+            }
+          }
+        }
       }
     }
   });
@@ -108,16 +270,18 @@
   <tr>
     <td>{{ t.time }}</td>
     <td>{{ t.action }}</td>
-    <td>{{ "%.3f"|format(t.soc_fraction) }}</td>
-    <td>{{ t.day_ahead_price }}</td>
-    <td>{{ "%.2f"|format(t.arbitrage_revenue_dkk) }}</td>
-    <td>{{ "%.2f"|format(t.capacity_reserved_mw) }}</td>
-    <td>{{ "%.2f"|format(t.capacity_revenue_dkk) }}</td>
-    <td>{{ "%.2f"|format(t.cumulative_total_revenue_dkk) }}</td>
+    <td class="num">{{ "%.3f"|format(t.soc_fraction) }}</td>
+    <td class="num">{{ t.day_ahead_price }}</td>
+    <td class="num">{{ "%.2f"|format(t.arbitrage_revenue_dkk) }}</td>
+    <td class="num">{{ "%.2f"|format(t.capacity_reserved_mw) }}</td>
+    <td class="num">{{ "%.2f"|format(t.capacity_revenue_dkk) }}</td>
+    <td class="num">{{ "%.2f"|format(t.cumulative_total_revenue_dkk) }}</td>
   </tr>
   {% endfor %}
 </table>
 {% else %}
 <p>No ticks for this run (no day-ahead price data in the requested window).</p>
 {% endif %}
+
+</div>
 {% endblock %}
