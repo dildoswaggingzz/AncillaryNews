@@ -49,19 +49,27 @@ from shared.datasets import DATASETS, DatasetConfig, SeriesConfig
 _UnitKey = tuple[str, str | None, str]
 
 # Fixed ERM II central-rate peg (DKK is pegged to EUR at ~7.46038, held
-# inside a +/-2.25% band, +/-0.5% in practice) -- an accounting convenience
-# for *labelled, combined* headline totals only (see
-# `shared/bess_dispatch_milp.py`'s module docstring and
-# `shared/bess_simulator.py:BacktestResult.total_revenue_all_dkk`/
-# `total_revenue_all_eur`). Never used to compare or trade a EUR figure
-# against a DKK figure inside any optimization objective or per-currency
-# revenue bucket -- those stay unconverted and separate (this module's
-# whole reason for existing, see module docstring). A *fixed* policy peg is
-# not the same class of bug as the floating-market-price mixing this module
-# guards against elsewhere, since it is not a market variable that could
-# silently drift; it is surfaced explicitly wherever it is used ("converted
-# at fixed 7.46 DKK/EUR"), alongside the raw per-currency buckets, never in
-# place of them.
+# inside a +/-2.25% band, +/-0.5% in practice). Used in two, deliberately
+# different, places:
+#
+# - Inside `shared/bess_dispatch_milp.py`'s single joint LP OBJECTIVE
+#   (`_peg_factor`), to let energy markets and capacity legs denominated in
+#   different currencies compete for the ONE shared power/SoC/headroom
+#   budget on equal footing -- that module's docstring's "currency
+#   discipline" section explains why converting at this *fixed* peg there is
+#   correct (a policy-held rate, not a floating market variable that could
+#   silently drift) and is NOT the same class of bug as the floating-mix
+#   defect this module otherwise guards against (see below).
+# - For *labelled, combined* headline totals only (see
+#   `shared/bess_simulator.py:BacktestResult.total_revenue_all_dkk`/
+#   `total_revenue_all_eur`), surfaced explicitly as "converted at fixed
+#   7.46 DKK/EUR" alongside the raw per-currency buckets, never in place of
+#   them.
+#
+# Every per-currency REPORTING bucket (`capacity_revenue_dkk`/`_eur`,
+# `afrr_activation_revenue_eur`) stays unconverted and separate regardless --
+# this peg is never used to silently fold one currency's reported total into
+# another's.
 DKK_PER_EUR = 7.46
 
 

@@ -2,6 +2,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
+import pulp
 import pytest
 
 from shared.bess_dispatch_milp import (
@@ -648,6 +649,119 @@ def test_soc_feasible_with_two_energy_markets():
         assert soc_min - 1e-6 <= tick.soc_mwh <= soc_max + 1e-6
 
 
+def _naive_no_binary_passthrough_optimum(
+    power_mw: float, starting_soc: float, soc_min: float, eta: float, day_ahead_price: float,
+    imbalance_price: float
+) -> float:
+    """Rebuilds, standalone (NOT calling any production code), the exact
+    single-period toy LP the pre-fix (no cross-market binary) formulation
+    would have solved: maximize `imbalance_price * dis - day_ahead_price *
+    ch` subject only to the shared power budget (`ch + dis <= power_mw`) and
+    the SoC-feasibility bound (`starting_soc + eta*ch - dis/eta >= soc_min`)
+    -- i.e. `solve_cooptimized_dispatch`'s own constraints MINUS the
+    cross-market `is_dis` guard this fix adds. Used to prove, in-test, what
+    number the pre-fix formulation would have produced on
+    `test_no_cross_market_simultaneous_charge_and_discharge_across_energy_markets`'s
+    window (the unphysical "buy cheap, sell dear, same hour" pass-through),
+    so that test's assertion that the FIXED solver lands far below this
+    number is a genuine regression check, not just an assertion against a
+    hand-computed constant."""
+    prob = pulp.LpProblem("naive_passthrough", pulp.LpMaximize)
+    ch = pulp.LpVariable("ch", lowBound=0)
+    dis = pulp.LpVariable("dis", lowBound=0)
+    prob += ch + dis <= power_mw
+    prob += starting_soc + eta * ch - dis / eta >= soc_min
+    prob += imbalance_price * dis - day_ahead_price * ch
+    prob.solve(pulp.PULP_CBC_CMD(msg=False))
+    return pulp.value(imbalance_price * dis - day_ahead_price * ch)
+
+
+def test_no_cross_market_simultaneous_charge_and_discharge_across_energy_markets():
+    """Fix (code review): with >= 2 energy markets, a pure-LP relaxation (no
+    cross-market binary) can set `ch[day_ahead, t] > 0` AND `dis[imbalance,
+    t] > 0` in the SAME period -- buy the cheap market, sell the dear one --
+    netting almost no SoC change while extracting revenue bounded only by
+    `power_mw`, not by any actually stored energy: an unphysical
+    single-inverter "pass-through" (module docstring's cross-market guard
+    paragraph).
+
+    This window triggers exactly that: SoC starts just barely above
+    `soc_min` (only 0.1 MWh of headroom -- little energy actually available
+    to discharge), day-ahead is near-free (10 DKK/MWh) and imbalance is very
+    lucrative (1000 DKK/MWh). `_naive_no_binary_passthrough_optimum` proves
+    a pre-fix (no cross-market binary) formulation on these EXACT numbers
+    would net ~518.85 DKK -- bounded only by `power_mw=1` MW, not by SoC.
+    The FIXED `solve_cooptimized_dispatch` must instead bound discharge by
+    the SoC actually available above `soc_min` (~94.87 DKK)."""
+    day_ahead_price = 10.0
+    imbalance_price = 1000.0
+    day_ahead = _series([day_ahead_price])
+    imbalance = _series([imbalance_price])
+
+    capacity_mwh = 10.0
+    soc_min_fraction = 0.1
+    starting_soc_fraction = 0.11
+    round_trip_efficiency = 0.9
+    eta = round_trip_efficiency**0.5
+    soc_min = soc_min_fraction * capacity_mwh
+    starting_soc = starting_soc_fraction * capacity_mwh
+    power_mw = 1.0
+
+    # Sanity-check the pre-fix formulation WOULD have exploited this window
+    # (the regression this fix closes) before asserting the fixed solver's
+    # behaviour below.
+    naive_optimum = _naive_no_binary_passthrough_optimum(
+        power_mw, starting_soc, soc_min, eta, day_ahead_price, imbalance_price
+    )
+    assert naive_optimum == pytest.approx(518.85, abs=0.5)
+
+    config = BessConfig(
+        strategy="cooptimized",
+        capacity_commit_mw=0.0,
+        capacity_markets=(),
+        power_mw=power_mw,
+        capacity_mwh=capacity_mwh,
+        soc_min_fraction=soc_min_fraction,
+        soc_max_fraction=0.9,
+        starting_soc_fraction=starting_soc_fraction,
+        round_trip_efficiency=round_trip_efficiency,
+        energy_markets=("day_ahead", "imbalance"),
+        max_cycles_per_day=None,
+    )
+    result = solve_cooptimized_dispatch(
+        "DK1",
+        BASE_TIME,
+        BASE_TIME + timedelta(hours=1),
+        config,
+        day_ahead,
+        {},
+        {},
+        [],
+        energy_series_by_market={"day_ahead": day_ahead, "imbalance": imbalance},
+        energy_currency={"day_ahead": "DKK", "imbalance": "DKK"},
+    )
+
+    tick = result.ticks[0]
+    max_feasible_discharge_mwh = (starting_soc - soc_min) * eta  # ~0.0949 MWh
+
+    # Discharge bounded by the SoC actually available -- NOT the
+    # power-only-bounded pass-through the naive (pre-fix) formulation above
+    # would reach.
+    assert tick.energy_discharged_mwh == pytest.approx(max_feasible_discharge_mwh, rel=1e-3)
+    assert tick.arbitrage_revenue_dkk == pytest.approx(
+        max_feasible_discharge_mwh * imbalance_price, rel=1e-3
+    )
+    assert tick.arbitrage_revenue_dkk < naive_optimum / 2
+
+    # No simultaneous charge alongside this discharge: the SoC drop must
+    # account EXACTLY for the reported discharge at the round-trip
+    # efficiency loss alone (soc_drop == energy_discharged / eta) -- had any
+    # charge occurred in the same period, its eta-scaled contribution would
+    # make the SoC drop strictly SMALLER than this.
+    soc_drop = starting_soc - tick.soc_mwh
+    assert soc_drop == pytest.approx(tick.energy_discharged_mwh / eta, rel=1e-3)
+
+
 def test_day_ahead_only_energy_markets_reproduces_prior_p1_p2_behaviour():
     """`energy_markets=("day_ahead",)` (the default) must be behaviourally
     identical to `solve_cooptimized_dispatch` before this field existed --
@@ -727,6 +841,88 @@ def test_pre_leq_post_on_multiple_windows():
         gaps.append(perfect.total_revenue_all_dkk - forecast.total_revenue_all_dkk)
 
     assert any(gap > 1e-6 for gap in gaps)
+
+
+def test_forecast_mode_does_not_chase_activation_price_lookahead():
+    """Fix (code review): forecast mode builds a lag-24h SCHEDULE forecast
+    for every energy market and every capacity leg, but -- before this fix
+    -- NOT for activation price, so `solve_cooptimized_dispatch`'s objective
+    (P4: activation joined the objective) scheduled against the ACTUAL,
+    realised activation price even in "forecast" (achievable) mode: a
+    lookahead that made the "achievable" headline non-causal.
+
+    30 hourly ticks. Day-ahead is flat (10 DKK/MWh) throughout -- committing
+    `aFRR_capacity:up` (its OWN clearing price fixed at 0, so only
+    activation value can justify it) is worth less than discharging at the
+    baseline activation price (1.0 EUR: 7.46 DKK-equiv * 1.0 * 0.3 = 2.238
+    << 10), so the LP discharges every hour -- EXCEPT hour 24, where the
+    ACTUAL activation price spikes to 1000 EUR (7.46 * 1000 * 0.3 = 2238 >>
+    10), lucrative enough that a foresighted (perfect) LP commits full
+    capacity there instead of discharging. Hour 24's `t - 24h` source is
+    hour 0, which stays at the LOW baseline (1.0 EUR) -- a forecast-mode LP
+    scheduling against this lag-24h forecast has NO way to see the coming
+    spike, so it must keep discharging at hour 24 exactly like every other
+    hour, earning ZERO activation revenue there despite the real spike."""
+    T = 30
+    day_ahead_values = [10.0] * T
+    afrr_price_values = [0.0] * T  # aFRR_capacity:up's OWN clearing price -- worthless alone
+    activation_values = [1.0] * T
+    activation_values[24] = 1000.0  # actual spike; its t-24h source (index 0) stays 1.0
+
+    day_ahead = _price_rows(day_ahead_values)
+    afrr = _price_rows(afrr_price_values)
+    activation = _price_rows(activation_values)
+    db = _db_with_series(day_ahead, afrr=afrr, activation=activation)
+
+    config = BessConfig(
+        strategy="cooptimized",
+        capacity_markets=(("aFRR_capacity", "up"),),
+        capacity_commit_mw=0.0,
+        power_mw=1.0,
+        capacity_mwh=100.0,
+        soc_min_fraction=0.1,
+        soc_max_fraction=0.9,
+        starting_soc_fraction=0.5,
+        max_cycles_per_day=None,
+    )
+
+    perfect = run_backtest(db, "DK1", BASE_TIME, BASE_TIME + timedelta(hours=T), config)
+    forecast = run_backtest(
+        db,
+        "DK1",
+        BASE_TIME,
+        BASE_TIME + timedelta(hours=T),
+        replace(config, foresight="forecast"),
+    )
+
+    perfect_spike_tick = perfect.ticks[24]
+    forecast_spike_tick = forecast.ticks[24]
+
+    # Perfect (oracle) foresight commits capacity right at the spike and
+    # earns the full activation payout (1000 EUR * 1 MW * 0.3 participation
+    # rate * 1h).
+    assert perfect_spike_tick.capacity_reserved_mw == pytest.approx(1.0, rel=1e-3)
+    assert perfect_spike_tick.afrr_activation_revenue_eur == pytest.approx(300.0, rel=1e-3)
+
+    # Forecast (achievable) mode cannot see the spike coming (its schedule's
+    # t-24h source is the low baseline) -- it must NOT chase it: no capacity
+    # committed, no activation revenue, discharging instead exactly like
+    # every other (baseline) hour.
+    assert forecast_spike_tick.capacity_reserved_mw == pytest.approx(0.0, abs=1e-6)
+    assert forecast_spike_tick.afrr_activation_revenue_eur == pytest.approx(0.0, abs=1e-6)
+    assert forecast_spike_tick.action == "discharge"
+    assert forecast_spike_tick.arbitrage_revenue_dkk == pytest.approx(10.0, rel=1e-3)
+
+    assert (
+        forecast_spike_tick.afrr_activation_revenue_eur
+        < perfect_spike_tick.afrr_activation_revenue_eur
+    )
+
+    # pre (forecast) <= post (perfect) must still hold overall, with
+    # activation now in play -- and the gap should be real, not trivial
+    # (roughly the DKK-equivalent of the missed 300 EUR activation payout).
+    assert forecast.total_revenue_all_dkk <= perfect.total_revenue_all_dkk + 1e-6
+    assert perfect.total_revenue_all_dkk - forecast.total_revenue_all_dkk > 1000.0
 
 
 def test_perfect_foresight_explicit_schedule_matches_omitted_schedule():

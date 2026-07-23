@@ -72,7 +72,26 @@ No binary variable is needed to forbid simultaneous charge/discharge on any
 one energy market: `round_trip_efficiency < 1` makes any `ch[e, t] > 0 and
 dis[e, t] > 0` for the SAME `e` strictly revenue-losing (paying the
 round-trip loss for no price gain), so the LP relaxation's optimum never
-does it (docs/bess-cooptimizer-design.md §3).
+does it (docs/bess-cooptimizer-design.md §3). **This argument does NOT
+extend across DIFFERENT energy markets**: with >= 2 energy markets, the pure
+LP relaxation can set `ch[e1, t] > 0` AND `dis[e2, t] > 0` in the same
+period (buy the cheap market, sell the dear one) with a net-zero SoC change
+-- an unphysical "pass-through" bounded only by `power_mw` (the shared power
+budget above still holds), not by any stored energy at all, since the two
+flows' SoC effects cancel. A single-inverter BESS cannot charge and
+discharge at once, so when `len(config.energy_markets) > 1` this module adds
+one binary `is_dis[t] in {0, 1}` per period and two big-M constraints
+(`M = power_mw`, since every `ch`/`dis` variable is already bounded by the
+shared power budget): `sum(ch[e,t] for e) <= power_mw * (1 - is_dis[t])` and
+`sum(dis[e,t] for e) <= power_mw * is_dis[t]`. This forbids simultaneous
+cross-market charge+discharge while still letting the LP freely ROUTE a
+charge period's flow, or a discharge period's flow, across whichever
+energy markets pay best that period. The single-energy-market case (the
+default, `energy_markets = ("day_ahead",)`) stays a pure LP -- no binary --
+since the round-trip-efficiency argument above is sufficient there; only
+`len(energy_markets) > 1` becomes a MILP. CBC's branch-and-bound is still
+deterministic for a fixed model, so `save_bess_run`'s reproducibility
+contract is unaffected either way.
 
 **Multiple dispatchable energy markets (P3, docs/bess-cooptimizer-design.md
 §6).** Day-ahead alone (`BessConfig.energy_markets = ("day_ahead",)`, the
@@ -163,9 +182,12 @@ unconverted (EUR-native, exactly as before) -- only the objective's
 internal accounting uses the peg.
 
 Solved with PuLP's bundled CBC backend (`pulp.PULP_CBC_CMD`) -- a pure LP
-(no integer variables), so CBC's simplex solve is deterministic for a fixed
-model, preserving `save_bess_run`'s reproducibility contract (the same
-persisted `config` re-solves to the same dispatch).
+(no integer variables) for the single-energy-market case, or a MILP with one
+binary per period (the cross-market simultaneous-charge/discharge guard
+above) when `len(config.energy_markets) > 1`. Either way CBC's solve is
+deterministic for a fixed model, preserving `save_bess_run`'s
+reproducibility contract (the same persisted `config` re-solves to the same
+dispatch).
 """
 
 from __future__ import annotations
@@ -643,6 +665,15 @@ def solve_cooptimized_dispatch(
         pulp.LpVariable(f"soc_{i}", lowBound=soc_min, upBound=soc_max) for i in range(1, T + 1)
     ]
 
+    # Cross-market simultaneous charge/discharge guard (module docstring's
+    # "no binary needed" paragraph): only needed with >= 2 energy markets --
+    # the single-market case relies on round_trip_efficiency < 1 alone, and
+    # stays a pure LP (no binary variables at all).
+    multi_energy_market = len(energy_markets) > 1
+    is_dis: list[pulp.LpVariable] | None = None
+    if multi_energy_market:
+        is_dis = [pulp.LpVariable(f"is_dis_{i}", cat="Binary") for i in range(T)]
+
     cap: dict[str, list[pulp.LpVariable]] = {}
     for key in leg_keys:
         variables = []
@@ -680,6 +711,15 @@ def solve_cooptimized_dispatch(
         prob += pulp.lpSum(cap[k][i] for k in up_legs) * t_act <= (soc[i + 1] - soc_min) * eta
         prob += pulp.lpSum(cap[k][i] for k in down_legs) * t_act <= (soc_max - soc[i]) / eta
         prob += pulp.lpSum(cap[k][i] for k in down_legs) * t_act <= (soc_max - soc[i + 1]) / eta
+        if multi_energy_market:
+            # Forbid buying into one energy market and selling into another
+            # in the SAME period (module docstring's cross-market
+            # pass-through guard) -- big-M = power_mw, since both totals are
+            # already bounded by the shared power budget above. Still lets
+            # the LP freely route a charge (or discharge) period's flow
+            # across whichever markets pay best that period.
+            prob += total_ch_i <= config.power_mw * (1 - is_dis[i])
+            prob += total_dis_i <= config.power_mw * is_dis[i]
 
     if cap_mwh_per_window is not None:
         for i in range(T):

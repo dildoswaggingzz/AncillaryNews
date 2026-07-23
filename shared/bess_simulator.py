@@ -627,10 +627,27 @@ def _lag24h_forecast(actual_series: list[tuple[datetime, float]]) -> list[tuple[
     a documented future hook, not P3 scope; nothing about
     `shared/bess_dispatch_milp.py`'s schedule/settlement mechanism assumes
     this particular forecast function.
+
+    O(n) two-pointer, not O(n^2): calling `_value_at_or_before` (an O(n)
+    scan) once per point would be O(n^2) over a whole window. Instead, a
+    single lagging index `j` walks forward through `actual_series` once,
+    tracking the last point at or before the current point's `t - 24h`
+    cutoff -- valid because `actual_series` is ascending by time (guaranteed
+    by `_fetch_series`) and `t - timedelta(hours=24)` is a FIXED absolute
+    duration (not wall-clock), so the cutoff strictly increases in lockstep
+    with `t` regardless of any DST wall-clock jump or irregular gap in the
+    series -- `j` therefore never needs to move backward.
     """
     forecast: list[tuple[datetime, float]] = []
+    n = len(actual_series)
+    j = 0
+    lag_idx = -1  # index of the last point at-or-before the running cutoff; -1 == none yet.
     for t, v in actual_series:
-        lag_value = _value_at_or_before(actual_series, t - timedelta(hours=24))
+        cutoff = t - timedelta(hours=24)
+        while j < n and actual_series[j][0] <= cutoff:
+            lag_idx = j
+            j += 1
+        lag_value = actual_series[lag_idx][1] if lag_idx >= 0 else None
         forecast.append((t, lag_value if lag_value is not None else v))
     return forecast
 
@@ -888,12 +905,18 @@ def run_backtest(
 
         # Pre mode (P3, docs/bess-cooptimizer-design.md §5): a causal
         # lag-24h persistence forecast of every schedulable series -- energy
-        # markets and capacity legs (`_lag24h_forecast`). `None` (perfect
-        # mode, the default) tells `solve_cooptimized_dispatch` to schedule
-        # against the same actual series it settles at -- P1/P2's behaviour,
-        # unchanged.
+        # markets, capacity legs, AND (P4/P5 fix) activation price
+        # (`_lag24h_forecast`). `None` (perfect mode, the default) tells
+        # `solve_cooptimized_dispatch` to schedule against the same actual
+        # series it settles at -- P1/P2's behaviour, unchanged. Activation
+        # joined the LP's objective in P4 (module docstring there); omitting
+        # a forecast for it here would leave the "forecast" (achievable)
+        # mode's LP scheduling `aFRR_capacity` commitment against ACTUAL
+        # (realised) activation prices -- a lookahead that makes the
+        # "achievable" headline non-causal, exactly the defect this fixes.
         schedule_energy_series_by_market: dict[str, list[tuple[datetime, float]]] | None = None
         schedule_capacity_series_by_leg: dict[str, list[tuple[datetime, float]]] | None = None
+        schedule_activation_price_series: list[tuple[datetime, float]] | None = None
         if config.foresight == "forecast":
             schedule_energy_series_by_market = {
                 market: _lag24h_forecast(series)
@@ -902,6 +925,7 @@ def run_backtest(
             schedule_capacity_series_by_leg = {
                 key: _lag24h_forecast(series) for key, series in capacity_series_by_leg.items()
             }
+            schedule_activation_price_series = _lag24h_forecast(activation_price_series)
 
         # Deferred import: `shared/bess_dispatch_milp.py` imports several
         # names from *this* module (`BessConfig`, `BessTick`,
@@ -928,6 +952,7 @@ def run_backtest(
             energy_currency=energy_currency,
             schedule_energy_series_by_market=schedule_energy_series_by_market,
             schedule_capacity_series_by_leg=schedule_capacity_series_by_leg,
+            schedule_activation_price_series=schedule_activation_price_series,
         )
 
     soc_min = config.soc_min_fraction * config.capacity_mwh

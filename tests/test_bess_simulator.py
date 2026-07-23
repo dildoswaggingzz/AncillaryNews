@@ -7,6 +7,7 @@ import pytest
 from shared.bess_simulator import (
     BessConfig,
     _causal_zscore,
+    _lag24h_forecast,
     _leg_relative_strength,
     _value_at_or_before,
     run_backtest,
@@ -144,6 +145,66 @@ def test_value_at_or_before_carries_forward_last_known_value():
 def test_value_at_or_before_none_when_no_entry_precedes_time():
     series = [(BASE_TIME + timedelta(hours=1), 1.0)]
     assert _value_at_or_before(series, BASE_TIME) is None
+
+
+# --- _lag24h_forecast (O(n) two-pointer) ----------------------------------------
+
+
+def _lag24h_forecast_naive_on_squared(
+    actual_series: list[tuple[datetime, float]],
+) -> list[tuple[datetime, float]]:
+    """The pre-fix `_lag24h_forecast` reference implementation, verbatim: one
+    `_value_at_or_before` O(n) scan per point, O(n^2) overall -- kept ONLY
+    here, as a slow/obviously-correct oracle the O(n) two-pointer rewrite
+    must match exactly, never in production code."""
+    forecast: list[tuple[datetime, float]] = []
+    for t, v in actual_series:
+        lag_value = _value_at_or_before(actual_series, t - timedelta(hours=24))
+        forecast.append((t, lag_value if lag_value is not None else v))
+    return forecast
+
+
+def test_lag24h_forecast_matches_naive_on_regular_hourly_series():
+    series = [(BASE_TIME + timedelta(hours=i), float(i) * 3.0 + 1.0) for i in range(72)]
+    assert _lag24h_forecast(series) == _lag24h_forecast_naive_on_squared(series)
+
+
+def test_lag24h_forecast_matches_naive_with_irregular_gaps():
+    # Hourly for a day, then a 10-hour gap, then 15-minute MTUs -- deliberately
+    # irregular (day-ahead vs. imbalance/FCR cadences genuinely differ), to
+    # exercise the two-pointer's cutoff advancing correctly across gaps.
+    times = (
+        [BASE_TIME + timedelta(hours=i) for i in range(30)]
+        + [BASE_TIME + timedelta(hours=40 + i * 0.25) for i in range(20)]
+    )
+    series = [(t, float(i) % 7 + 0.5) for i, t in enumerate(times)]
+    assert _lag24h_forecast(series) == _lag24h_forecast_naive_on_squared(series)
+
+
+def test_lag24h_forecast_matches_naive_across_a_dst_ish_wall_clock_jump():
+    # A synthetic "DST-ish" jump: the wall-clock gap between two consecutive
+    # points is 23h (as if an hour vanished), while every duration is still
+    # computed as a plain, absolute (UTC, timezone-aware) timedelta -- exactly
+    # what `t - timedelta(hours=24)` is, so the cutoff must still strictly
+    # increase in lockstep with `t` regardless of the irregular gap.
+    times = [BASE_TIME + timedelta(hours=i) for i in range(10)]
+    times += [times[-1] + timedelta(hours=23)]  # the "jump"
+    times += [times[-1] + timedelta(hours=i) for i in range(1, 20)]
+    series = [(t, float(i) * 2.5) for i, t in enumerate(times)]
+    assert _lag24h_forecast(series) == _lag24h_forecast_naive_on_squared(series)
+
+
+def test_lag24h_forecast_cold_start_falls_back_to_own_value():
+    series = [(BASE_TIME + timedelta(hours=i), 100.0 + i) for i in range(5)]
+    forecast = _lag24h_forecast(series)
+    # No point has a t-24h predecessor yet -- every forecast value falls back
+    # to that same tick's own actual value (module docstring's cold-start
+    # floor limitation, deliberately left as-is).
+    assert forecast == series
+
+
+def test_lag24h_forecast_empty_series():
+    assert _lag24h_forecast([]) == []
 
 
 # --- run_backtest: arbitrage strategy ------------------------------------------
