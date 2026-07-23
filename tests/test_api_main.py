@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from shared.bess_simulator import BacktestResult
 from shared.claim_extractor import ExtractedClaim, ExtractionResult
+from shared.units import DKK_PER_EUR
 
 MAIN_PATH = Path(__file__).parent.parent / "services" / "api" / "main.py"
 
@@ -512,6 +513,180 @@ def test_dashboard_bess_detail_renders(client, db):
     resp = client.get("/dashboard/bess/1")
 
     assert resp.status_code == 200
+
+
+def _streams_by_label(streams):
+    return {s["label"]: s for s in streams}
+
+
+def test_revenue_streams_splits_capacity_by_market_and_resolves_each_currency():
+    """The per-market split is only safe because each leg's currency is resolved from
+    shared/units.py: DK2's FCR legs settle in EUR, its aFRR_capacity legs in DKK."""
+    run = {**BESS_RUN_ROW, "zone": "DK2"}
+    ticks = [
+        {
+            "arbitrage_revenue_dkk": 0.0,
+            "capacity_revenue_by_market": {"FCR:up": 2.0, "aFRR_capacity:up": 5.0},
+        },
+        {
+            "arbitrage_revenue_dkk": 0.0,
+            "capacity_revenue_by_market": {"FCR:up": 3.0, "aFRR_capacity:up": 7.0},
+        },
+    ]
+
+    streams, unpriced = api_main._revenue_streams_for_run(run, ticks)
+
+    assert unpriced == []
+    by_label = _streams_by_label(streams)
+    fcr = by_label["FCR (up)"]
+    afrr_cap = by_label["aFRR capacity (up)"]
+    assert fcr["currency"] == "EUR"
+    assert fcr["native_total"] == 5.0
+    assert fcr["dkk_total"] == pytest.approx(5.0 * DKK_PER_EUR)
+    assert afrr_cap["currency"] == "DKK"
+    # A DKK-native leg is never "converted" -- its DKK total is its native total.
+    assert afrr_cap["dkk_total"] == afrr_cap["native_total"] == 12.0
+
+
+def test_revenue_streams_sum_to_the_all_in_headline_total():
+    """The composition and the chart both decompose the hero number, so the streams
+    must reconcile to it exactly -- otherwise the page contradicts itself."""
+    run = {**BESS_RUN_ROW, "zone": "DK2"}
+    ticks = [
+        {
+            "arbitrage_revenue_dkk": run["total_arbitrage_revenue_dkk"],
+            # DKK legs must total total_capacity_revenue_dkk, EUR legs total_capacity_revenue_eur.
+            "capacity_revenue_by_market": {
+                "aFRR_capacity:up": run["total_capacity_revenue_dkk"],
+                "FCR:up": run["total_capacity_revenue_eur"],
+            },
+        }
+    ]
+
+    streams, _ = api_main._revenue_streams_for_run(run, ticks)
+
+    combined = (
+        run["total_arbitrage_revenue_dkk"]
+        + run["total_capacity_revenue_dkk"]
+        + (run["total_capacity_revenue_eur"] + run["total_afrr_activation_revenue_eur"])
+        * DKK_PER_EUR
+    )
+    assert sum(s["dkk_total"] for s in streams) == pytest.approx(combined)
+
+
+def test_revenue_streams_order_and_colors_are_independent_of_size():
+    """Color follows the entity, not its rank -- so making a leg the biggest earner
+    must not repaint it."""
+    run = {**BESS_RUN_ROW, "zone": "DK1"}
+    small = [
+        {
+            "arbitrage_revenue_dkk": 0.0,
+            "capacity_revenue_by_market": {"aFRR_capacity:up": 1.0, "mFRR_capacity:up": 900.0},
+        }
+    ]
+    flipped = [
+        {
+            "arbitrage_revenue_dkk": 0.0,
+            "capacity_revenue_by_market": {"aFRR_capacity:up": 900.0, "mFRR_capacity:up": 1.0},
+        }
+    ]
+
+    colors_small = {
+        s["label"]: s["color"] for s in api_main._revenue_streams_for_run(run, small)[0]
+    }
+    colors_flipped = {
+        s["label"]: s["color"] for s in api_main._revenue_streams_for_run(run, flipped)[0]
+    }
+
+    assert colors_small == colors_flipped
+
+
+def test_revenue_streams_fold_past_palette_capacity_into_other():
+    """A 9th series is never a generated hue -- it folds into one neutral 'Other'
+    that still carries its keys so the total stays exact."""
+    run = {**BESS_RUN_ROW, "zone": "DK1", "total_afrr_activation_revenue_eur": 1.0}
+    legs = {f"mFRR_capacity:{p}": 2.0 for p in ("up", "down")}
+    legs.update({f"aFRR_capacity:{p}": 2.0 for p in ("up", "down")})
+    legs.update({f"mFRR_capacity_extra:{p}": 2.0 for p in ("up", "down")})
+    legs["FCR:price"] = 2.0
+    ticks = [{"arbitrage_revenue_dkk": 0.0, "capacity_revenue_by_market": legs}]
+
+    streams, _ = api_main._revenue_streams_for_run(run, ticks)
+
+    assert len(streams) == len(api_main._SERIES_COLORS)
+    other = streams[-1]
+    assert other["label"].startswith("Other (")
+    assert other["color"] == api_main._OTHER_COLOR
+    # Every leg still reaches the chart: no key is dropped by the fold.
+    assert sorted(k for s in streams for k in s["keys"]) == sorted(
+        ["__arbitrage__", "__afrr_activation__", *legs]
+    )
+
+
+def test_revenue_streams_fold_keeps_a_per_key_rate_for_mixed_currencies():
+    """The 'Other' fold can merge a DKK leg and a EUR leg into one series, so the rate
+    has to stay per-key -- a single per-stream rate would silently undercount the EUR
+    legs in the chart."""
+    run = {**BESS_RUN_ROW, "zone": "DK2", "total_afrr_activation_revenue_eur": 1.0}
+    # Legs are ordered by key, so these last three fall into the fold:
+    # aFRR_capacity:up_eur (EUR) alongside two DKK mFRR legs.
+    legs = {
+        "FCR:down": 2.0,
+        "FCR:up": 2.0,
+        "aFRR_capacity:down": 2.0,
+        "aFRR_capacity:down_eur": 2.0,
+        "aFRR_capacity:up": 2.0,
+        "aFRR_capacity:up_eur": 2.0,
+        "mFRR_capacity:down": 2.0,
+        "mFRR_capacity:up": 2.0,
+    }
+    ticks = [{"arbitrage_revenue_dkk": 0.0, "capacity_revenue_by_market": legs}]
+
+    streams, _ = api_main._revenue_streams_for_run(run, ticks)
+    other = streams[-1]
+
+    assert other["label"].startswith("Other (")
+    assert other["key_rates"]["aFRR_capacity:up_eur"] == DKK_PER_EUR
+    assert other["key_rates"]["mFRR_capacity:up"] == 1.0
+    # The fold's DKK total is the sum of each leg converted at its OWN rate.
+    assert other["dkk_total"] == pytest.approx(
+        sum(2.0 * other["key_rates"][k] for k in other["keys"])
+    )
+
+
+def test_revenue_streams_exclude_legs_with_no_declared_currency():
+    """A leg with no unit in shared/units.py can't be converted; it is surfaced
+    separately rather than folded in at an assumed rate."""
+    run = {**BESS_RUN_ROW, "zone": "DK1"}
+    ticks = [
+        {
+            "arbitrage_revenue_dkk": 0.0,
+            "capacity_revenue_by_market": {"aFRR_capacity:up": 5.0, "made_up_market:up": 99.0},
+        }
+    ]
+
+    streams, unpriced = api_main._revenue_streams_for_run(run, ticks)
+
+    assert [u["keys"] for u in unpriced] == [["made_up_market:up"]]
+    assert all("made_up_market:up" not in s["keys"] for s in streams)
+    assert 99.0 not in [s["dkk_total"] for s in streams]
+
+
+def test_dashboard_bess_detail_shows_per_market_split_and_flags_unpriced_legs(client, db):
+    db.fetch_bess_run.return_value = {**BESS_RUN_ROW, "zone": "DK2"}
+    db.fetch_bess_ticks.return_value = [
+        {
+            **BESS_TICK_ROW,
+            "capacity_revenue_by_market": {"FCR:up": 4.0, "aFRR_capacity:up": 6.0, "nope:up": 1.0},
+        }
+    ]
+
+    resp = client.get("/dashboard/bess/1")
+
+    assert resp.status_code == 200
+    assert "FCR (up)" in resp.text
+    assert "aFRR capacity (up)" in resp.text
+    assert "Not included above" in resp.text and "nope:up" in resp.text
 
 
 def test_dashboard_bess_list_shows_strategy_and_foresight_columns(client, db):

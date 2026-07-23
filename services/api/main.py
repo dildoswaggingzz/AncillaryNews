@@ -31,6 +31,7 @@ import importlib.util
 import logging
 import os
 import time
+from collections import defaultdict
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -51,7 +52,7 @@ from shared.db_manager import DatabaseManager
 from shared.linkedin_embed import resolve_linkedin_content
 from shared.logging_config import configure_logging
 from shared.rss_reader import ArticleRef
-from shared.units import unit_for
+from shared.units import DKK_PER_EUR, currency_for, unit_for
 from shared.vector_store import QdrantStore
 
 configure_logging()
@@ -1113,13 +1114,156 @@ def dashboard_bess_trigger(
 
 @app.get("/dashboard/bess/{run_id}", response_class=HTMLResponse)
 def dashboard_bess_detail(request: Request, run_id: int, db: DatabaseManager = Depends(get_db)):
-    """Full detail for one BESS backtest run: revenue-by-stream summary, full-cycle-equivalents, a
-    SoC-over-time chart, and the tick-level action table."""
+    """Full detail for one BESS backtest run: an all-in revenue headline, the revenue-by-market
+    split (composition + over-time chart), and the tick-level action table."""
     run = db.fetch_bess_run(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail=f"BESS run {run_id} not found")
     ticks = db.fetch_bess_ticks(run_id)
-    return templates.TemplateResponse(request, "bess_detail.html", {"run": run, "ticks": ticks})
+    streams, unpriced = _revenue_streams_for_run(run, ticks)
+    return templates.TemplateResponse(
+        request,
+        "bess_detail.html",
+        {
+            "run": run,
+            "ticks": ticks,
+            "streams": streams,
+            "unpriced_legs": unpriced,
+            "dkk_per_eur": DKK_PER_EUR,
+        },
+    )
+
+
+# Categorical series colors, assigned in this fixed order and never cycled (a 9th
+# series folds into "Other" below). Validated for stacked/adjacent use on this
+# dashboard's light surface (#fafafa): lightness band, chroma floor, CVD separation
+# and normal-vision separation all pass. Three slots sit under 3:1 contrast against
+# the surface, which the page relieves with the always-present legend values and the
+# tick-level table rather than color alone.
+_SERIES_COLORS = (
+    "#2a78d6",  # blue
+    "#eb6834",  # orange
+    "#1baf7a",  # aqua
+    "#eda100",  # yellow
+    "#e87ba4",  # magenta
+    "#008300",  # green
+    "#4a3aa7",  # violet
+    "#e34948",  # red
+)
+_OTHER_COLOR = "#6b7280"
+
+# Registry product names that carry no information once the market is named -- a leg
+# keyed "FFR:price" is just "FFR" to a reader (contrast "aFRR_capacity:up", where the
+# direction is the whole point).
+_UNINFORMATIVE_PRODUCTS = frozenset({"price", "price_eur"})
+
+
+def _leg_label(market: str, product: str) -> str:
+    """A capacity leg's display name: registry keys read as machine identifiers
+    ("aFRR_capacity:up"), so underscores become spaces and the direction/product is
+    parenthesised ("aFRR capacity (up)"). The market name itself is never reworded --
+    it has to stay greppable against shared/datasets.py."""
+    market_label = market.replace("_", " ")
+    if not product or product in _UNINFORMATIVE_PRODUCTS:
+        return market_label
+    return f"{market_label} ({product.replace('_', ' ')})"
+
+
+def _revenue_streams_for_run(run: dict, ticks: list[dict]) -> tuple[list[dict], list[dict]]:
+    """
+    The run's revenue split by *market*, as an ordered list of display streams, plus
+    any capacity legs whose currency could not be resolved.
+
+    Each stream carries the `keys` it aggregates (so the template can rebuild the
+    same split per tick), its settlement `currency`, its `native_total` in that
+    currency, and `dkk_total` -- the native total converted at the fixed ERM II peg
+    so every stream can stack on one DKK axis. Capacity legs are keyed the same way
+    as `BessTick.capacity_revenue_by_market` ("{market}:{product}") and each is
+    denominated in its own currency (e.g. DK2's FCR legs settle in EUR while its
+    aFRR_capacity legs settle in DKK), which is exactly why the per-leg currency has
+    to be resolved here rather than assumed.
+
+    Order is fixed and independent of size -- arbitrage, then aFRR activation, then
+    capacity legs by key -- so a series keeps its color regardless of how it ranked
+    in a given run. Legs past the palette's capacity fold into one "Other" stream
+    rather than being assigned a generated color.
+
+    A leg with no declared unit in shared/units.py has no resolvable currency; those
+    are returned separately (never folded into a total at an assumed rate) for the
+    template to surface. `shared/bess_simulator.py` refuses to run such a leg, so
+    this only bites on data predating that check.
+    """
+    totals: dict[str, float] = defaultdict(float)
+    for tick in ticks:
+        for key, revenue in (tick.get("capacity_revenue_by_market") or {}).items():
+            totals[key] += revenue
+
+    streams: list[dict] = [
+        {
+            "keys": ["__arbitrage__"],
+            "label": "Day-ahead arbitrage",
+            "currency": "DKK",
+            "native_total": run["total_arbitrage_revenue_dkk"],
+        }
+    ]
+    afrr_activation = run.get("total_afrr_activation_revenue_eur") or 0.0
+    if afrr_activation:
+        streams.append(
+            {
+                "keys": ["__afrr_activation__"],
+                "label": "aFRR activation",
+                "currency": "EUR",
+                "native_total": afrr_activation,
+            }
+        )
+
+    unpriced: list[dict] = []
+    for key in sorted(totals):
+        market, _, product = key.partition(":")
+        currency = currency_for(market, zone := run["zone"], product)
+        entry = {
+            "keys": [key],
+            "label": _leg_label(market, product),
+            "currency": currency,
+            "native_total": totals[key],
+        }
+        if currency is None:
+            entry["zone"] = zone
+            unpriced.append(entry)
+        else:
+            streams.append(entry)
+
+    # Never generate a 9th hue: everything past the palette collapses into one
+    # neutral "Other" stream, which still carries its keys so the chart and the
+    # composition agree with the headline total.
+    for stream in streams:
+        rate = DKK_PER_EUR if stream["currency"] == "EUR" else 1.0
+        # Per-key rate, not a per-stream one: the "Other" fold below may merge legs
+        # of different currencies into a single series, and the chart converts each
+        # tick's per-key values with this map.
+        stream["key_rates"] = {key: rate for key in stream["keys"]}
+        stream["dkk_total"] = stream["native_total"] * rate
+
+    if len(streams) > len(_SERIES_COLORS):
+        kept, folded = streams[: len(_SERIES_COLORS) - 1], streams[len(_SERIES_COLORS) - 1 :]
+        streams = kept + [
+            {
+                "keys": [k for s in folded for k in s["keys"]],
+                "key_rates": {k: r for s in folded for k, r in s["key_rates"].items()},
+                "label": f"Other ({len(folded)} markets)",
+                # Mixed currencies may be folded together, so there is no single
+                # native total to state -- only the peg-converted DKK sum is meaningful.
+                "currency": None,
+                "native_total": None,
+                "folded_labels": [s["label"] for s in folded],
+                "dkk_total": sum(s["dkk_total"] for s in folded),
+                "color": _OTHER_COLOR,
+            }
+        ]
+
+    for index, stream in enumerate(streams):
+        stream.setdefault("color", _SERIES_COLORS[index])
+    return streams, unpriced
 
 
 # --- Morning Brief dashboard -------------------------------------------------
