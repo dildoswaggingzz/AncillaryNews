@@ -72,12 +72,19 @@
     for context. The threshold engine is retired from this brief (see
     <code>docs/bess-cooptimizer-results.md</code>).
   </p>
+  {% set peg = 7.46 %}
+  <p class="muted">
+    Totals are <strong>all-in</strong>: any EUR-settled revenue is already included, converted
+    at the fixed ERM II peg of <strong>{{ peg }} DKK/EUR</strong> (never at floating market
+    rates). The <em>EUR-settled</em> column just breaks out how much of each total came in EUR —
+    it is part of the total, not an add-on to it.
+  </p>
   {% if row.bess_estimates %}
   <table>
     <tr>
       <th>Config</th><th>Zone</th><th>Achievable run</th><th>Ceiling run</th>
-      <th>Achievable total (DKK)</th><th>Theoretical ceiling (DKK)</th>
-      <th>Capacity revenue (EUR)</th>
+      <th>All-in total (DKK, {{ peg }} peg)</th><th>Theoretical ceiling (DKK)</th>
+      <th>Of which EUR-settled</th>
       <th>Full cycle equivalents</th><th>Cycle cap binding?</th>
     </tr>
     {% for estimate in row.bess_estimates %}
@@ -87,13 +94,24 @@
       <td>{{ estimate.zone }}</td>
       <td><a href="/dashboard/bess/{{ estimate.achievable_run_id }}">#{{ estimate.achievable_run_id }}</a></td>
       <td><a href="/dashboard/bess/{{ estimate.ceiling_run_id }}">#{{ estimate.ceiling_run_id }}</a></td>
-      <td>{{ "%.2f"|format(estimate.total_revenue_all_dkk_achievable) }}</td>
-      <td>{{ "%.2f"|format(estimate.total_revenue_all_dkk_ceiling) }}
+      {% set cap_eur = estimate.get('total_capacity_revenue_eur_achievable', 0.0) %}
+      {% set afrr_eur = estimate.get('total_afrr_activation_revenue_eur_achievable', 0.0) %}
+      {% set eur_native = cap_eur + afrr_eur %}
+      <td>
+        <strong>{{ "{:,.0f}".format(estimate.total_revenue_all_dkk_achievable) }} DKK</strong>
+        <span class="muted">&asymp; &euro;{{ "{:,.0f}".format(estimate.total_revenue_all_eur_achievable) }}</span>
+      </td>
+      <td>{{ "{:,.0f}".format(estimate.total_revenue_all_dkk_ceiling) }} DKK
         <span class="muted">-- theoretical ceiling, not achievable</span>
       </td>
-      <td>{{ "%.2f"|format(estimate.get('total_capacity_revenue_eur_achievable', 0.0)) }}
-        {% if estimate.get('total_capacity_revenue_eur_achievable', 0.0) %}
-        <span class="muted">-- separate currency, not summed into the DKK total</span>
+      <td>
+        {% if eur_native %}
+        &euro;{{ "%.2f"|format(eur_native) }}
+        <span class="muted">= {{ "{:,.0f}".format(eur_native * peg) }} DKK of the total at the {{ peg }} peg
+          {%- if cap_eur and afrr_eur %} (&euro;{{ "%.2f"|format(cap_eur) }} capacity + &euro;{{ "%.2f"|format(afrr_eur) }} aFRR activation){% endif -%}
+        </span>
+        {% else %}
+        <span class="muted">-- none; this run settled entirely in DKK</span>
         {% endif %}
       </td>
       <td>{{ "%.3f"|format(estimate.get('full_cycle_equivalents_achievable', 0.0)) }}</td>
@@ -117,12 +135,15 @@
       <td>{{ estimate.config_label }}</td>
       <td>{{ estimate.zone }}</td>
       <td colspan="2"><a href="/dashboard/bess/{{ estimate.run_id }}">#{{ estimate.run_id }}</a></td>
-      <td colspan="2">{{ "%.2f"|format(estimate.total_revenue_dkk) }}
-        <span class="muted">-- pre-migration threshold-engine estimate (retired)</span>
+      <td colspan="2">{{ "%.0f"|format(estimate.total_revenue_dkk) }} DKK
+        <span class="muted">-- pre-migration threshold estimate (retired); DKK-native only, no all-in peg total was stored</span>
       </td>
-      <td>{{ "%.2f"|format(estimate.get('total_capacity_revenue_eur', 0.0)) }}
+      <td>
         {% if estimate.get('total_capacity_revenue_eur', 0.0) %}
-        <span class="muted">-- separate currency, not summed into the DKK total</span>
+        &euro;{{ "%.2f"|format(estimate.total_capacity_revenue_eur) }}
+        <span class="muted">-- not included in the DKK figure at left (this retired estimate stored no peg-combined total)</span>
+        {% else %}
+        <span class="muted">-- none</span>
         {% endif %}
       </td>
       <td>{{ "%.3f"|format(estimate.full_cycle_equivalents) }}</td>
