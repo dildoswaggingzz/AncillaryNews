@@ -211,6 +211,28 @@ def test_forward_publishing_datasets_use_the_shared_start_margin():
     assert mismatched == []
 
 
+# --- records_per_day (shared/backfill.py chunk-sizing input) --------------
+
+
+def test_backfillable_datasets_have_a_positive_records_per_day():
+    """
+    `shared/backfill.py:_auto_chunk_days` needs a measured `records_per_day`
+    to size a dataset's chunk width -- a `None`/non-positive value there
+    silently falls back to `DEFAULT_CHUNK_DAYS` instead of collapsing to a
+    single request, so every dataset `shared/backfill.py` actually backfills
+    (`BACKFILLABLE_DATASET_NAMES`) should have one measured (2026-07-24).
+    """
+    from shared.backfill import BACKFILLABLE_DATASET_NAMES
+
+    missing = [
+        dataset.name
+        for dataset in DATASETS
+        if dataset.name in BACKFILLABLE_DATASET_NAMES
+        and not (dataset.records_per_day and dataset.records_per_day > 0)
+    ]
+    assert missing == []
+
+
 def test_non_forward_publishing_datasets_have_no_start_param():
     """
     The inverse guard: a dataset with no declared `forward_publish_horizon`

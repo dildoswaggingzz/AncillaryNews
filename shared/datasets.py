@@ -154,6 +154,17 @@ class DatasetConfig:
     # before the next one) in a way a single horizon string can't capture
     # precisely enough to safely drive a `limit` computation.
     forward_publish_horizon: str | None = None
+    # Measured average records/day for this dataset, used ONLY by
+    # shared/backfill.py to size per-dataset chunk width so a backfill makes
+    # as few requests per dataset as possible (Energi Data Service throttles
+    # on request COUNT per dataset, not response volume or the `limit`
+    # param -- confirmed live 2026-07-24 against the API guide and a
+    # controlled test: one wide `limit=0` request returning 720 rows in 0.3s
+    # succeeded while the same span as 30 one-day chunks got 96.7% HTTP 429s).
+    # None = not measured / not backfilled. Not machine-critical: a stale
+    # value only means slightly more/fewer chunks, never data loss (backfill
+    # fetches with `limit=0` = all records, so it cannot truncate).
+    records_per_day: int | None = None
 
 
 # Relative-time margin used as `start` for every forward-publishing
@@ -298,6 +309,7 @@ DATASETS: list[DatasetConfig] = [
         ],
         is_provisional=True,
         params={"limit": 100, "sort": "TimeMsUTC DESC"},
+        records_per_day=172519,  # ~172519/day measured 2026-07-24
     ),
     # High priority — mFRR Energy Activation Market (EAM), Nordic, 15-minute
     # MTU. This is the dataset the README's primary focus (mFRR EAM) refers
@@ -393,6 +405,7 @@ DATASETS: list[DatasetConfig] = [
             SeriesConfig(product="afrr_vwa_down", value_field="aFRRVWADownDKK", unit="DKK/MWh"),
         ],
         is_provisional=True,
+        records_per_day=192,  # ~192/day measured 2026-07-24
     ),
     # High priority — day-ahead spot reference prices, used to contextualize
     # activation price spikes (e.g. "mFRR price >> day-ahead price").
@@ -433,6 +446,7 @@ DATASETS: list[DatasetConfig] = [
         is_provisional=False,
         forward_publish_horizon="P1D",
         params=_forward_publish_params("TimeUTC", 2500),
+        records_per_day=576,  # ~576/day measured 2026-07-24
     ),
     # BESS simulator (shared/bess_simulator.py) — FCR capacity/reservation
     # prices. Two different datasets per zone since FCR is structured
@@ -488,6 +502,7 @@ DATASETS: list[DatasetConfig] = [
         is_provisional=True,
         forward_publish_horizon="P1D",
         params=_forward_publish_params("HourUTC", 250),
+        records_per_day=24,  # ~24/day measured 2026-07-24
     ),
     # FcrNdDK2 packs three products (FCR-D ned/upp, FCR-N) and two auction
     # views (D-1 early / Total) into one shared `PriceTotalEUR` column,
@@ -681,6 +696,7 @@ DATASETS: list[DatasetConfig] = [
         is_provisional=True,
         forward_publish_horizon="P1D",
         params=_forward_publish_params("HourUTC", 4500),
+        records_per_day=1080,  # ~1080/day measured 2026-07-24
     ),
     # FFR (Fast Frequency Reserve) capacity/reservation market, DK2-only --
     # confirmed live 2026-07-21, documented but never previously ingested
@@ -740,6 +756,7 @@ DATASETS: list[DatasetConfig] = [
         is_provisional=True,
         forward_publish_horizon="P1D",
         params=_forward_publish_params("HourUTC", 250),
+        records_per_day=24,  # ~24/day measured 2026-07-24
     ),
     # FFR demand curve, DK2-only -- eight step-wise demand levels
     # (`ffrupdemandd0`..`ffrupdemandd7`) from the same auction FFR clears in
@@ -782,6 +799,7 @@ DATASETS: list[DatasetConfig] = [
         is_provisional=True,
         forward_publish_horizon="P1D",
         params=_forward_publish_params("HourUTC", 250),
+        records_per_day=24,  # ~24/day measured 2026-07-24
     ),
     # BESS simulator — Nordic aFRR capacity/reservation market (distinct
     # from `afrr_energy_activation` above, which is the PICASSO
@@ -839,6 +857,7 @@ DATASETS: list[DatasetConfig] = [
         is_provisional=True,
         forward_publish_horizon="P1D",
         params=_forward_publish_params("TimeUTC", 1300),
+        records_per_day=288,  # ~288/day measured 2026-07-24
     ),
     # High priority — near-real-time system state (wind/solar/CO2), used as
     # explanatory soft-signal context ("low wind" style narratives). No
@@ -893,6 +912,7 @@ DATASETS: list[DatasetConfig] = [
         ],
         is_provisional=True,
         params={"limit": 100, "sort": "HourUTC DESC"},
+        records_per_day=22,  # ~22/day measured 2026-07-24
     ),
     # --- M6 P0: fundamentals gap (docs/forecast-datasets-scope.md §2 Tier 1) ---
     #
@@ -997,6 +1017,7 @@ DATASETS: list[DatasetConfig] = [
         is_provisional=True,
         forward_publish_horizon="P1D",
         params=_forward_publish_params("HourUTC", 650),
+        records_per_day=144,  # ~144/day measured 2026-07-24
     ),
     # Realised production and cross-border exchange, 5-minute resolution,
     # per price area. Confirmed live 2026-07-20. Not one of the §1.2
@@ -1039,6 +1060,7 @@ DATASETS: list[DatasetConfig] = [
         ],
         is_provisional=True,
         params={"limit": 100, "sort": "Minutes5UTC DESC"},
+        records_per_day=576,  # ~576/day measured 2026-07-24
     ),
     # PICASSO cross-border available transfer capacity for aFRR -- **one of
     # the three §1.2 90-day-rolling-retention datasets**; live-reconfirmed
@@ -1138,6 +1160,7 @@ DATASETS: list[DatasetConfig] = [
         ],
         is_provisional=True,
         params={"limit": 2000, "sort": "TimeMsUTC DESC"},
+        records_per_day=24643,  # ~24643/day measured 2026-07-24
     ),
     # aFRR LFC activation limits -- Energinet's own hard ceiling on how much
     # energy the Load Frequency Controller is allowed to activate, per price
@@ -1187,5 +1210,6 @@ DATASETS: list[DatasetConfig] = [
         ],
         is_provisional=True,
         params={"limit": 100, "sort": "TimeMsUTC DESC"},
+        records_per_day=186,  # ~186/day measured 2026-07-24
     ),
 ]

@@ -25,33 +25,23 @@ in 197 seconds."}`):
    behavior unchanged -- those don't come with a server-advertised cooldown
    to honor.
 
-**Honest assessment of what actually carries a backfill (2026-07-20, M6
-rate-limit cleanup):** a live 91-day/4-dataset backfill measured over the
-same 60-minute window as the live poller: the poller (small `limit`,
-100-2000) saw a ~5% 429 rate; the backfill (`shared/backfill.py`'s much
-larger `limit`, up to `CHUNK_LIMIT`=300000) saw a ~37% 429 rate, with nearly
-every backfill request getting a 429 on its *first* attempt and succeeding
-after the server-advertised cooldown (~36-60s) -- i.e. concern 2 (reactive
-retry) absorbed essentially all of it, 0 chunks failed outright, at the cost
-of a ~60s penalty per retried chunk. Concern 1 (`TokenBucket`) did not
-prevent that -- it paces *request count*, and a backfill's problem in
-practice is response *volume* (a `limit=300000` request vs. the poller's
-`limit=100-2000`), which the bucket does not currently account for (each
-`fetch_data` call costs exactly 1 token regardless of `limit`). Whether
-Energinet's quota is actually volume-sensitive (and a volume-aware bucket
-would meaningfully help) versus purely request-count (in which case the
-bucket's calibration is what would need retuning) has not been established
-live -- a planned controlled probe to distinguish the two was blocked by a
-backfill already in flight against the same API from the same IP at the
-time (any 429 measurement taken then would be contaminated by concurrent
-load, not usable to isolate volume-sensitivity). So: treat `TokenBucket` as
-a politeness measure only -- it keeps a *fast* burst of many small requests
-from tripping the limit, which is real and worth keeping -- not as the
-thing that makes backfills succeed. The thing that actually makes backfills
-succeed today is concern 2, the reactive server-directed retry; do not
-assume retuning `TokenBucket` alone would reduce the backfill's 429 rate
-without first confirming (via that probe, run when the API is quiet) what
-the quota is actually keyed on.
+**Resolved 2026-07-24 (what actually carries a backfill):** the Energi Data
+Service API guide documents rate limits as per-dataset and keyed to each
+dataset's update frequency ("1 request per Update Frequency"), and states the
+`limit` query param is pagination only, NOT a throttling factor. A
+controlled live test confirmed it: one wide `limit=0` request for a 30-day
+FcrDK1 window returned all 720 rows in 0.3s (200 OK), while the same span
+split into 30 one-day requests ~3s apart got 29/30 = 96.7% HTTP 429 --
+despite each of those returning only ~24 rows. So the backfill's old ~37%
+429 rate was driven by REQUEST COUNT per dataset (many rapid requests to one
+dataset), not by the large `limit`/response volume. This is why
+`shared/backfill.py` now sizes chunk width per-dataset (from measured
+records/day) to make as few requests per dataset as possible -- ideally one
+-- rather than relying on reactive retry to absorb a self-inflicted 429
+storm. `TokenBucket` remains a politeness measure only; reactive
+server-directed retry (concern 2 above) remains the backstop for the two
+high-volume millisecond datasets that genuinely still need multiple
+requests.
 """
 
 import asyncio
