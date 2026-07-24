@@ -45,6 +45,20 @@ which is itself an `httpx.HTTPError` subclass) with exponential backoff (5
 attempts, 2-10s), so an occasional 429 here self-heals rather than aborting
 the whole run -- but `RATE_LIMIT_SECONDS` below still paces every request at
 ~1/sec up front to keep 429s rare rather than relying on the retry alone.
+
+**Resolved 2026-07-24 (see `shared/base_ingestor.py`'s module docstring for
+the full finding):** the API throttles on request COUNT per dataset, not on
+response volume or the `limit` param, and `limit=0` returns every record for
+the window in one request. So the actual fix for a backfill's 429s is not
+pacing or a bigger retry budget -- it's minimizing the number of requests
+made per dataset in the first place. This module now sizes each dataset's
+chunk width from its measured `records_per_day` (see
+`_auto_chunk_days`/`TARGET_ROWS_PER_REQUEST` below) so every low/mid-volume
+dataset backfills in a single request; only the two genuinely
+millisecond-cadence datasets (`afrr_energy_activation`,
+`afrr_border_atc`) still get chunked, to bound response size, with
+`RATE_LIMIT_SECONDS` and the reactive retry above remaining as the backstop
+for those.
 """
 
 import asyncio
@@ -143,36 +157,26 @@ BACKFILLABLE_DATASET_NAMES = BESS_DATASET_NAMES | FORECASTING_DATASET_NAMES
 # (script) / start_time (API) for a wider window.
 DEFAULT_BACKFILL_DAYS = 30
 
-# Energinet's date-range query is chunked into this many days per request
-# rather than one single [start, end] call, both to bound each individual
-# response's size and to give the rate limiter/retry logic more, smaller
-# checkpoints to recover at if one chunk's request fails.
-#
-# **Does not fit every dataset -- verified live 2026-07-20, M6 P0**: at
-# CHUNK_LIMIT's old value (20000), a DEFAULT_CHUNK_DAYS=7-day chunk of
-# `afrr_energy_activation` (confirmed live: ~172,400 records/day, both
-# zones) would silently return only the newest ~20000 of a chunk's ~1.2M
-# records -- Energinet's `sort`/`limit` combination truncates rather than
-# erroring, so this would fail silently, not loudly. `afrr_border_atc`
-# (~21,600 records/day, confirmed live) has the same problem even at
-# `chunk_days=1`. **A full backfill of either millisecond dataset must pass
-# an explicit smaller `--chunk-days` (1 is recommended for both, verified
-# safely under the raised CHUNK_LIMIT below at that grain) -- the default
-# below stays 7 for every other, much lower-volume dataset in this
-# registry.**
+# Fallback chunk width (days) for a dataset with no measured
+# `records_per_day` (`DatasetConfig.records_per_day` is `None`) -- kept at
+# the original flat value this module used before per-dataset auto-sizing
+# existed. The two millisecond datasets (`afrr_energy_activation`,
+# `afrr_border_atc`) no longer need a manually-supplied `--chunk-days 1`:
+# both declare a measured `records_per_day`, so `_auto_chunk_days` sizes
+# them to 1-day chunks automatically. This constant now only matters for a
+# dataset nobody has measured yet.
 DEFAULT_CHUNK_DAYS = 7
 
-# Per-chunk record cap, sized to the highest-volume dataset actually in this
-# registry (`afrr_energy_activation`, confirmed live 2026-07-20: a single
-# UTC day returned exactly 172,421 records when requested with a `limit`
-# comfortably above that count -- i.e. Energinet's API honors a large
-# `limit` rather than silently capping it lower, confirmed by that same
-# live request). 300000 leaves >70% headroom above that single-day figure
-# for `--chunk-days 1` on the two millisecond datasets (see
-# DEFAULT_CHUNK_DAYS's comment above); every other, far lower-volume dataset
-# in this registry stays comfortably under this even at the default
-# `chunk_days=7`.
-CHUNK_LIMIT = 300000
+# Target upper bound on records returned per single backfill request. Chunk
+# width is sized per-dataset from `DatasetConfig.records_per_day` so each
+# chunk stays near/under this, which for every low/mid-volume dataset means
+# the whole backfill window is ONE request. Only the two millisecond datasets
+# (afrr_energy_activation ~172k/day, afrr_border_atc ~25k/day) exceed this in
+# a single day and stay chunked. 250000 sits just under the old flat
+# CHUNK_LIMIT (300000) that Energinet was already observed to honor in one
+# response (a single `limit=0` request returning 172,501 rows succeeded live,
+# 2026-07-24).
+TARGET_ROWS_PER_REQUEST = 250_000
 
 
 def bess_datasets() -> list[DatasetConfig]:
@@ -203,7 +207,19 @@ def _date_chunks(start: datetime, end: datetime, chunk_days: int):
         cur = chunk_end
 
 
-def _historical_params(dataset: DatasetConfig, start: datetime, end: datetime, limit: int) -> dict:
+def _auto_chunk_days(dataset: DatasetConfig) -> int:
+    """Chunk width (days) sized so one request stays near TARGET_ROWS_PER_REQUEST,
+    from `dataset.records_per_day`. Datasets with no measured rate fall back to
+    DEFAULT_CHUNK_DAYS. Always >= 1. A very low-volume dataset yields a very
+    large width, so `_date_chunks` naturally collapses the whole window to a
+    single chunk/request."""
+    rpd = dataset.records_per_day
+    if not rpd:
+        return DEFAULT_CHUNK_DAYS
+    return max(1, TARGET_ROWS_PER_REQUEST // rpd)
+
+
+def _historical_params(dataset: DatasetConfig, start: datetime, end: datetime) -> dict:
     """
     Builds Energi Data Service query params for one historical date-range
     chunk of `dataset`: its own declared `sort` (carried over from
@@ -211,13 +227,17 @@ def _historical_params(dataset: DatasetConfig, start: datetime, end: datetime, l
     record in the chunk gets saved regardless), plus `start`/`end` (the
     date-range params this module adds -- confirmed live against
     `api.energidataservice.dk`, not just `limit`-based like the live
-    ingestor's `dataset.params`) and a much higher `limit` than the live
-    poller's "most recent N" default.
+    ingestor's `dataset.params`) and `limit=0`, which Energi Data Service
+    documents as "no limit" (returns every record for the window) -- see
+    module docstring's "Resolved 2026-07-24" note: the `limit` param is
+    pagination only, not a throttling factor, so requesting everything in one
+    go is both correct and the fastest way to minimize request count per
+    dataset.
     """
     params = dict(dataset.params)
     params["start"] = start.strftime("%Y-%m-%dT%H:%M")
     params["end"] = end.strftime("%Y-%m-%dT%H:%M")
-    params["limit"] = limit
+    params["limit"] = 0
     return params
 
 
@@ -227,23 +247,29 @@ async def backfill_dataset(
     dataset: DatasetConfig,
     start: datetime,
     end: datetime,
-    chunk_days: int = DEFAULT_CHUNK_DAYS,
+    chunk_days: int | None = None,
     rate_limit_seconds: float = RATE_LIMIT_SECONDS,
 ) -> dict:
     """
-    Pages through [start, end) for one dataset in chunk_days-wide date-range
-    windows, saving every chunk's records via `DatabaseManager.save_market_data`
-    (see module docstring's "Idempotency / safe-to-re-run" section). A
-    failed chunk (fetch or save) is logged and skipped, not fatal to the
-    rest of the dataset's backfill -- mirrors
+    Pages through [start, end) for one dataset in date-range windows, saving
+    every chunk's records via `DatabaseManager.save_market_data` (see module
+    docstring's "Idempotency / safe-to-re-run" section). A failed chunk
+    (fetch or save) is logged and skipped, not fatal to the rest of the
+    dataset's backfill -- mirrors
     services/ingestor/main.py:run_ingestion_cycle's "one dataset's failure
     doesn't take down the rest" pattern, applied at chunk granularity here.
 
-    A chunk whose response lands on exactly `CHUNK_LIMIT` records is flagged
-    as (likely) silently truncated by Energinet's sort+limit behavior -- see
-    the inline comment at that check -- logged as a warning and counted in
-    the returned summary's `chunks_truncated`/`truncated_windows`, distinct
-    from `chunks_failed` since the chunk did fetch and save successfully.
+    `chunk_days=None` (the default) auto-sizes the chunk width from
+    `dataset.records_per_day` via `_auto_chunk_days` -- for every low/mid-
+    volume dataset this collapses `[start, end)` to a single chunk/request
+    (see module docstring's "Resolved 2026-07-24" note). An explicit
+    caller-supplied `chunk_days` overrides that sizing unconditionally.
+
+    Each chunk is fetched with `limit=0` (all records for that window -- see
+    `_historical_params`), so a chunk can no longer be silently truncated by
+    Energinet's `sort`+`limit` behavior; `chunks_truncated`/
+    `truncated_windows` remain in the returned summary for downstream
+    consumers but are now always `0`/`[]`.
 
     Returns a summary dict for this one dataset.
     """
@@ -256,12 +282,13 @@ async def backfill_dataset(
     earliest_record_time = None
     latest_record_time = None
 
-    chunk_list = list(_date_chunks(start, end, chunk_days))
+    effective_chunk_days = chunk_days if chunk_days is not None else _auto_chunk_days(dataset)
+    chunk_list = list(_date_chunks(start, end, effective_chunk_days))
     for i, (chunk_start, chunk_end) in enumerate(chunk_list):
         if i > 0:
             await asyncio.sleep(rate_limit_seconds)
 
-        params = _historical_params(dataset, chunk_start, chunk_end, CHUNK_LIMIT)
+        params = _historical_params(dataset, chunk_start, chunk_end)
         try:
             data = await ingestor.fetch_data(f"dataset/{dataset.dataset_id}", params=params)
         except Exception:
@@ -276,34 +303,6 @@ async def backfill_dataset(
         if not records:
             continue
         records_fetched += len(records)
-
-        # Energinet's dataset API applies `sort` then `limit` and *truncates*
-        # rather than erroring when a window has more records than `limit` --
-        # so a response landing on exactly CHUNK_LIMIT is indistinguishable
-        # from "this window happened to have exactly CHUNK_LIMIT records"
-        # except that the former is astronomically more likely for any chunk
-        # whose true record count comfortably exceeds CHUNK_LIMIT (see that
-        # constant's comment). Flag it either way -- a false positive here
-        # just means a re-run with a smaller chunk_days confirms nothing was
-        # actually missing, whereas staying silent means a real truncation
-        # (silently keeping only the newest CHUNK_LIMIT records of the
-        # window, per that same sort+limit behavior) reads as a clean run.
-        # Deliberately count/threshold-free: this needs no per-dataset volume
-        # table to catch a dataset nobody has profiled yet.
-        if len(records) == CHUNK_LIMIT:
-            logger.warning(
-                "Backfill chunk for %s [%s, %s) returned exactly CHUNK_LIMIT (%d) "
-                "records -- Energinet's API truncates rather than erroring when a "
-                "date-range window has more records than `limit`, so this window's "
-                "true record count may exceed what was saved. Re-run this dataset "
-                "with a smaller chunk_days to fill the gap.",
-                dataset.name,
-                chunk_start,
-                chunk_end,
-                CHUNK_LIMIT,
-            )
-            chunks_truncated += 1
-            truncated_windows.append({"start": chunk_start, "end": chunk_end})
 
         try:
             save_result = db.save_market_data(records, dataset)
@@ -344,13 +343,14 @@ async def backfill_dataset(
     }
 
 
-# A CHUNK_LIMIT-sized response (up to 300000 records -- see that constant's
-# comment) from the two millisecond datasets can take Energinet noticeably
-# longer to generate/transmit than a typical few-hundred-record chunk;
-# `BaseIngestor`'s general-purpose default (`timeout=30.0`, sized for the
-# live poller's much smaller "most recent N records" requests) is too tight
-# for that. Backfill-specific, not changed globally, since the live poller
-# never requests anywhere near this many records per call.
+# A `limit=0` ("all records") response from the two millisecond datasets --
+# still chunked to ~1 day each by `_auto_chunk_days`, but that 1-day window
+# can still be ~172k/~25k records -- can take Energinet noticeably longer to
+# generate/transmit than a typical few-hundred-record chunk; `BaseIngestor`'s
+# general-purpose default (`timeout=30.0`, sized for the live poller's much
+# smaller "most recent N records" requests) is too tight for that.
+# Backfill-specific, not changed globally, since the live poller never
+# requests anywhere near this many records per call.
 BACKFILL_TIMEOUT_SECONDS = 120.0
 
 
@@ -358,7 +358,7 @@ async def run_backfill(
     start: datetime,
     end: datetime | None = None,
     dataset_names: list[str] | None = None,
-    chunk_days: int = DEFAULT_CHUNK_DAYS,
+    chunk_days: int | None = None,
     rate_limit_seconds: float = RATE_LIMIT_SECONDS,
     db: DatabaseManager | None = None,
 ) -> dict:
@@ -374,6 +374,12 @@ async def run_backfill(
     `DatabaseManager` (`get_db`) rather than opening a second connection
     pool, while `scripts/backfill_history.py` (a short-lived standalone
     process) lets this open and close its own.
+
+    `chunk_days=None` (the default) is passed straight through to
+    `backfill_dataset`, which auto-sizes each dataset's own chunk width from
+    its measured `records_per_day` -- see that function's docstring. An
+    explicit `chunk_days` here overrides auto-sizing for every dataset in
+    this run.
     """
     if end is None:
         end = datetime.now(UTC)

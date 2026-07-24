@@ -1712,6 +1712,9 @@ def test_dashboard_trigger_backfill_passes_through_chunk_days(
 def test_dashboard_trigger_backfill_defaults_chunk_days_when_omitted(
     client, db, monkeypatch, backfill_mock
 ):
+    """None (not a hardcoded DEFAULT_CHUNK_DAYS) is now the omitted-field default -- it reaches
+    run_backfill/backfill_dataset unchanged, letting shared.backfill._auto_chunk_days size each
+    dataset's chunk width from its measured records/day instead of a flat value."""
     monkeypatch.delenv("API_KEY", raising=False)
     db.fetch_event_reports.return_value = []
     monkeypatch.setattr(api_main, "run_backfill", backfill_mock)
@@ -1719,7 +1722,7 @@ def test_dashboard_trigger_backfill_defaults_chunk_days_when_omitted(
     resp = client.post("/dashboard/ingestor/backfill", data={"days": "30", "datasets": ""})
 
     assert resp.status_code == 200
-    assert backfill_mock.call_args.kwargs["chunk_days"] == api_main.DEFAULT_CHUNK_DAYS
+    assert backfill_mock.call_args.kwargs["chunk_days"] is None
 
 
 def test_dashboard_trigger_backfill_surfaces_truncation_warning(

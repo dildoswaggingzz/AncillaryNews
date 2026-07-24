@@ -92,8 +92,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--chunk-days",
         type=int,
-        default=DEFAULT_CHUNK_DAYS,
-        help=f"Date-range chunk size per Energinet request (default: {DEFAULT_CHUNK_DAYS}).",
+        default=None,
+        help=(
+            "Date-range chunk size per Energinet request. Default: auto-sized per "
+            "dataset from its measured records/day (see shared/backfill.py's "
+            f"_auto_chunk_days), falling back to {DEFAULT_CHUNK_DAYS} for an "
+            "unmeasured dataset. Pass this to override auto-sizing for every "
+            "dataset in the run."
+        ),
     )
     parser.add_argument(
         "--datasets",

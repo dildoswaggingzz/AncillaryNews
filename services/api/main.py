@@ -45,7 +45,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_
 from pydantic import BaseModel
 from qdrant_client import AsyncQdrantClient
 
-from shared.backfill import DEFAULT_BACKFILL_DAYS, DEFAULT_CHUNK_DAYS, run_backfill
+from shared.backfill import DEFAULT_BACKFILL_DAYS, run_backfill
 from shared.bess_simulator import BessConfig, run_backtest
 from shared.claim_extractor import extract_claims
 from shared.db_manager import DatabaseManager
@@ -689,7 +689,12 @@ class BackfillRequest(BaseModel):
     # deliberately excluded from that default, see FORECASTING_DATASET_NAMES'
     # docstring.
     datasets: list[str] | None = None
-    chunk_days: int = DEFAULT_CHUNK_DAYS
+    # None (default): auto-size each dataset's chunk width from its measured
+    # records/day (shared.backfill.backfill_dataset -> _auto_chunk_days),
+    # falling back to shared.backfill.DEFAULT_CHUNK_DAYS for an unmeasured
+    # dataset. An explicit int overrides auto-sizing for every dataset in
+    # the run.
+    chunk_days: int | None = None
 
 
 @app.post("/ingestor/backfill", dependencies=[Depends(require_api_key)])
@@ -805,12 +810,13 @@ async def dashboard_trigger_backfill(
     # Was hard-locked to shared.backfill.DEFAULT_CHUNK_DAYS (7) until this
     # field was added -- the JSON /ingestor/backfill route already exposed
     # BackfillRequest.chunk_days, but the dashboard form didn't, so a
-    # high-volume dataset (afrr_energy_activation at the default 7-day
-    # chunk -- see shared/backfill.py's DEFAULT_CHUNK_DAYS comment) could
-    # only be backfilled correctly via the JSON route or the CLI script, not
-    # this form. Defaults to the same DEFAULT_CHUNK_DAYS so existing
-    # behaviour is unchanged for callers that don't touch this field.
-    chunk_days: int = Form(DEFAULT_CHUNK_DAYS),
+    # high-volume dataset (afrr_energy_activation) could only be backfilled
+    # correctly via the JSON route or the CLI script, not this form. Now
+    # defaults to `None` so shared.backfill.backfill_dataset auto-sizes each
+    # dataset's chunk width from its measured records/day (see
+    # `_auto_chunk_days`), consistent with the JSON route and CLI script
+    # defaults above/in scripts/backfill_history.py.
+    chunk_days: int | None = Form(None),
     db: DatabaseManager = Depends(get_db),
 ):
     """

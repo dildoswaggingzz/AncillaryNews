@@ -6,9 +6,10 @@ import pytest
 import respx
 from tenacity import wait_none
 
-import shared.backfill as backfill_module
 from shared.backfill import (
     BESS_DATASET_NAMES,
+    DEFAULT_CHUNK_DAYS,
+    _auto_chunk_days,
     _date_chunks,
     _historical_params,
     backfill_dataset,
@@ -109,12 +110,38 @@ def test_historical_params_includes_start_end_limit_and_preserves_dataset_sort()
     start = datetime(2026, 1, 1, 6, 30, tzinfo=UTC)
     end = datetime(2026, 1, 8, tzinfo=UTC)
 
-    params = _historical_params(FCR_DK1, start, end, 12345)
+    params = _historical_params(FCR_DK1, start, end)
 
     assert params["start"] == "2026-01-01T06:30"
     assert params["end"] == "2026-01-08T00:00"
-    assert params["limit"] == 12345
+    # limit=0 means "all records for the window" -- see module docstring's
+    # "Resolved 2026-07-24" note: the API's `limit` param is pagination only,
+    # not a throttling factor, so a backfill chunk requests everything.
+    assert params["limit"] == 0
     assert params["sort"] == FCR_DK1.params["sort"]
+
+
+# --- _auto_chunk_days --------------------------------------------------------
+
+
+def test_auto_chunk_days_collapses_low_volume_dataset_to_single_chunk_over_90_days():
+    low_volume = FCR_DK1  # records_per_day=24
+    width = _auto_chunk_days(low_volume)
+
+    chunks = list(
+        _date_chunks(datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 4, 1, tzinfo=UTC), width)
+    )
+    assert len(chunks) == 1
+
+
+def test_auto_chunk_days_gives_high_volume_dataset_one_day_chunks():
+    afrr_energy_activation = next(d for d in DATASETS if d.name == "afrr_energy_activation")
+    assert _auto_chunk_days(afrr_energy_activation) == 1
+
+
+def test_auto_chunk_days_falls_back_to_default_when_unmeasured():
+    unmeasured = next(d for d in DATASETS if d.records_per_day is None)
+    assert _auto_chunk_days(unmeasured) == DEFAULT_CHUNK_DAYS
 
 
 # --- backfill_dataset (chunking + idempotency, mocked HTTP via respx) ------
@@ -272,85 +299,6 @@ async def test_backfill_dataset_is_safe_to_rerun(ingestor, db):
     assert first["rows_saved"] == 1
     assert second["rows_saved"] == 1
     assert db.save_market_data.call_count == 2
-    await ingestor.close()
-
-
-# --- backfill_dataset truncation detection (Energinet sort+limit truncates,
-# does not error -- a chunk landing on exactly CHUNK_LIMIT records is the
-# truncation signature) -----------------------------------------------------
-
-
-@respx.mock
-async def test_backfill_dataset_flags_chunk_at_exactly_chunk_limit_as_truncated(
-    ingestor, db, monkeypatch
-):
-    monkeypatch.setattr(backfill_module, "CHUNK_LIMIT", 3)
-    start = datetime(2026, 1, 1, tzinfo=UTC)
-    end = datetime(2026, 1, 8, tzinfo=UTC)  # a single 7-day chunk
-
-    records = [{"HourUTC": f"2026-01-0{i}T00:00:00", "FCRdk_DKK": 1.0} for i in range(1, 4)]
-    respx.get(FCR_DK1_URL).mock(return_value=httpx.Response(200, json={"records": records}))
-
-    result = await backfill_dataset(ingestor, db, FCR_DK1, start, end, rate_limit_seconds=0)
-
-    assert result["chunks_truncated"] == 1
-    assert result["chunks_failed"] == 0  # a truncated chunk still fetched and saved successfully
-    assert result["chunks_fetched"] == 1
-    assert result["rows_saved"] == 3
-    assert result["truncated_windows"] == [{"start": start, "end": end}]
-    await ingestor.close()
-
-
-@respx.mock
-async def test_backfill_dataset_does_not_flag_chunk_just_below_chunk_limit(
-    ingestor, db, monkeypatch
-):
-    monkeypatch.setattr(backfill_module, "CHUNK_LIMIT", 3)
-    start = datetime(2026, 1, 1, tzinfo=UTC)
-    end = datetime(2026, 1, 8, tzinfo=UTC)
-
-    records = [{"HourUTC": f"2026-01-0{i}T00:00:00", "FCRdk_DKK": 1.0} for i in range(1, 3)]
-    respx.get(FCR_DK1_URL).mock(return_value=httpx.Response(200, json={"records": records}))
-
-    result = await backfill_dataset(ingestor, db, FCR_DK1, start, end, rate_limit_seconds=0)
-
-    assert result["chunks_truncated"] == 0
-    assert result["truncated_windows"] == []
-    assert result["rows_saved"] == 2
-    await ingestor.close()
-
-
-@respx.mock
-async def test_backfill_dataset_flags_only_the_truncated_chunk_among_several(
-    ingestor, db, monkeypatch
-):
-    """Two chunks: the first lands on exactly CHUNK_LIMIT (truncated), the second doesn't --
-    only the first should be counted/listed."""
-    monkeypatch.setattr(backfill_module, "CHUNK_LIMIT", 2)
-    start = datetime(2026, 1, 1, tzinfo=UTC)
-    end = datetime(2026, 1, 15, tzinfo=UTC)  # chunk_days=7 -> 2 chunks
-
-    truncated_chunk_records = [
-        {"HourUTC": "2026-01-02T00:00:00", "FCRdk_DKK": 1.0},
-        {"HourUTC": "2026-01-03T00:00:00", "FCRdk_DKK": 2.0},
-    ]
-    ok_chunk_records = [{"HourUTC": "2026-01-09T00:00:00", "FCRdk_DKK": 3.0}]
-    respx.get(FCR_DK1_URL).mock(
-        side_effect=[
-            httpx.Response(200, json={"records": truncated_chunk_records}),
-            httpx.Response(200, json={"records": ok_chunk_records}),
-        ]
-    )
-
-    result = await backfill_dataset(
-        ingestor, db, FCR_DK1, start, end, chunk_days=7, rate_limit_seconds=0
-    )
-
-    assert result["chunks_truncated"] == 1
-    assert result["chunks_fetched"] == 2
-    assert result["truncated_windows"] == [
-        {"start": start, "end": datetime(2026, 1, 8, tzinfo=UTC)}
-    ]
     await ingestor.close()
 
 
