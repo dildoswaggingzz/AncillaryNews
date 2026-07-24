@@ -794,10 +794,10 @@ async def trigger_backfill(req: BackfillRequest, db: DatabaseManager = Depends(g
 @app.get("/", response_class=HTMLResponse)
 def dashboard_home(request: Request, db: DatabaseManager = Depends(get_db)):
     """Recent Event Reports list -- the dashboard's landing page. Also hosts the
-    "Run orchestrator now" / "Run crawler now" on-demand buttons (see the two POST routes
-    below). `orchestrator_job` reflects the background orchestrator run's live status
-    (the button 303-redirects here after starting it); `crawler_result` is `None` on a
-    plain `GET`."""
+    on-demand "Run orchestrator/crawler/morning brief now" buttons (see the POST routes
+    below). Each `*_job` reflects that background run's live status -- the buttons
+    303-redirect here after starting the job, and the page auto-refreshes while any is
+    running -- or is `None` if that job has not been run this process lifetime."""
     reports = db.fetch_event_reports(limit=25, offset=0)
     return templates.TemplateResponse(
         request,
@@ -805,10 +805,9 @@ def dashboard_home(request: Request, db: DatabaseManager = Depends(get_db)):
         {
             "reports": reports,
             "orchestrator_job": get_background_job("orchestrator"),
-            "orchestrator_result": None,
-            "crawler_result": None,
+            "crawler_job": get_background_job("crawler"),
+            "morning_brief_job": get_background_job("morning_brief"),
             "backfill_result": None,
-            "morning_brief_result": None,
         },
     )
 
@@ -835,27 +834,16 @@ async def dashboard_trigger_orchestrator_run_now(
     return RedirectResponse(url="/", status_code=303)
 
 
-@app.post("/dashboard/crawler/run-now", response_class=HTMLResponse)
+@app.post("/dashboard/crawler/run-now")
 async def dashboard_trigger_crawler_run_now(
-    request: Request,
-    db: DatabaseManager = Depends(get_db),
     crawler_main=Depends(get_crawler_main),
 ):
-    """Dashboard counterpart to `POST /crawler/run-now` above -- see
-    `dashboard_trigger_orchestrator_run_now`'s docstring for the full rationale."""
-    result = await crawler_main.run_crawl_cycle()
-    reports = db.fetch_event_reports(limit=25, offset=0)
-    return templates.TemplateResponse(
-        request,
-        "index.html",
-        {
-            "reports": reports,
-            "orchestrator_result": None,
-            "crawler_result": result,
-            "backfill_result": None,
-            "morning_brief_result": None,
-        },
-    )
+    """Dashboard counterpart to `POST /crawler/run-now` above -- fires the crawl
+    cycle as an in-process background job and 303-redirects home, same as
+    `dashboard_trigger_orchestrator_run_now` (see that route's docstring for the
+    full rationale)."""
+    start_background_job("crawler", crawler_main.run_crawl_cycle)
+    return RedirectResponse(url="/", status_code=303)
 
 
 @app.post("/dashboard/ingestor/backfill", response_class=HTMLResponse)
@@ -902,10 +890,10 @@ async def dashboard_trigger_backfill(
         "index.html",
         {
             "reports": reports,
-            "orchestrator_result": None,
-            "crawler_result": None,
+            "orchestrator_job": get_background_job("orchestrator"),
+            "crawler_job": get_background_job("crawler"),
+            "morning_brief_job": get_background_job("morning_brief"),
             "backfill_result": result,
-            "morning_brief_result": None,
         },
     )
 
@@ -1354,29 +1342,16 @@ def dashboard_morning_brief_detail(
 
 @app.post("/dashboard/morning-briefs/run-now", response_class=HTMLResponse)
 async def dashboard_trigger_morning_brief_run_now(
-    request: Request,
-    db: DatabaseManager = Depends(get_db),
     orchestrator_main=Depends(get_orchestrator_main),
 ):
     """
-    Dashboard counterpart to `POST /morning-briefs/run-now` -- same
-    synchronous trigger-and-show-result flow as
-    `dashboard_trigger_orchestrator_run_now` (see that route's docstring for
-    the full rationale). Redirects straight to the new brief's detail page
-    on success, same UX as `dashboard_bess_trigger`.
+    Dashboard counterpart to `POST /morning-briefs/run-now` -- fires the
+    morning-brief run as an in-process background job and 303-redirects home,
+    same as `dashboard_trigger_orchestrator_run_now` (see that route's
+    docstring for the full rationale). The home page's job panel links through
+    to the new brief's detail page once the run finishes (previously this route
+    redirected straight there, but a background run has no brief to redirect to
+    until it completes).
     """
-    result = await orchestrator_main.run_morning_brief()
-    if result.get("brief_id") is not None:
-        return RedirectResponse(f"/dashboard/morning-briefs/{result['brief_id']}", status_code=303)
-    reports = db.fetch_event_reports(limit=25, offset=0)
-    return templates.TemplateResponse(
-        request,
-        "index.html",
-        {
-            "reports": reports,
-            "orchestrator_result": None,
-            "crawler_result": None,
-            "backfill_result": None,
-            "morning_brief_result": result,
-        },
-    )
+    start_background_job("morning_brief", orchestrator_main.run_morning_brief)
+    return RedirectResponse(url="/", status_code=303)

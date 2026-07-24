@@ -1536,21 +1536,29 @@ def test_dashboard_trigger_orchestrator_run_now_ignores_double_click(
     assert orchestrator_main_mock.run_synthesis_cycle.await_count == 1
 
 
-def test_dashboard_trigger_crawler_run_now_renders_summary(
+def test_dashboard_trigger_crawler_run_now_runs_in_background_and_shows_summary(
     client, db, monkeypatch, crawler_main_mock
 ):
     monkeypatch.delenv("API_KEY", raising=False)
     db.fetch_event_reports.return_value = []
+    api_main._background_jobs.clear()
     api_main.app.dependency_overrides[api_main.get_crawler_main] = lambda: crawler_main_mock
     try:
-        resp = client.post("/dashboard/crawler/run-now")
+        resp = client.post("/dashboard/crawler/run-now", follow_redirects=False)
+        assert resp.status_code == 303
+        assert resp.headers["location"] == "/"
+
+        job = _wait_for_background_job("crawler")
+        assert job["status"] == "done"
+        crawler_main_mock.run_crawl_cycle.assert_awaited_once()
+
+        home = client.get("/")
     finally:
         del api_main.app.dependency_overrides[api_main.get_crawler_main]
 
-    assert resp.status_code == 200
-    assert "5 article(s) processed" in resp.text
-    assert "12 claim(s) extracted" in resp.text
-    crawler_main_mock.run_crawl_cycle.assert_awaited_once()
+    assert home.status_code == 200
+    assert "5 article(s) processed" in home.text
+    assert "12 claim(s) extracted" in home.text
 
 
 def test_dashboard_home_run_now_buttons_present(client, db):
@@ -2312,21 +2320,32 @@ def test_dashboard_morning_brief_detail_not_found(client, db):
     assert resp.status_code == 404
 
 
-def test_dashboard_trigger_morning_brief_run_now_redirects_to_detail(
+def test_dashboard_trigger_morning_brief_run_now_runs_in_background_and_links_to_brief(
     client, db, monkeypatch, morning_brief_orchestrator_mock
 ):
     monkeypatch.delenv("API_KEY", raising=False)
+    db.fetch_event_reports.return_value = []
+    api_main._background_jobs.clear()
     api_main.app.dependency_overrides[api_main.get_orchestrator_main] = lambda: (
         morning_brief_orchestrator_mock
     )
     try:
         resp = client.post("/dashboard/morning-briefs/run-now", follow_redirects=False)
+        assert resp.status_code == 303
+        assert resp.headers["location"] == "/"
+
+        job = _wait_for_background_job("morning_brief")
+        assert job["status"] == "done"
+        morning_brief_orchestrator_mock.run_morning_brief.assert_awaited_once()
+
+        # Once done, the home page's panel links through to the new brief.
+        home = client.get("/")
     finally:
         del api_main.app.dependency_overrides[api_main.get_orchestrator_main]
 
-    assert resp.status_code == 303
-    assert resp.headers["location"] == "/dashboard/morning-briefs/1"
-    morning_brief_orchestrator_mock.run_morning_brief.assert_awaited_once()
+    assert home.status_code == 200
+    assert "/dashboard/morning-briefs/1" in home.text
+    assert "4 BESS estimate(s)" in home.text
 
 
 def test_dashboard_home_shows_morning_brief_run_now_button(client, db):

@@ -15,7 +15,7 @@
     <button type="submit"{% if orchestrator_job and orchestrator_job.status == 'running' %} disabled{% endif %}>Run orchestrator now</button>
   </form>
   <form method="post" action="/dashboard/crawler/run-now" style="display:inline;">
-    <button type="submit">Run crawler now</button>
+    <button type="submit"{% if crawler_job and crawler_job.status == 'running' %} disabled{% endif %}>Run crawler now</button>
   </form>
 
   {% if orchestrator_job %}
@@ -32,14 +32,25 @@
     {{ orchestrator_job.result.reports_published }} Event Report(s) published.
     {% endif %}
   </p>
-  {% if orchestrator_job.status == 'running' %}
+  {% endif %}
+  {% if crawler_job %}
+  <p><strong>Crawler run:</strong>
+    {% if crawler_job.status == 'running' %}
+    <span class="badge">running</span> started {{ crawler_job.started_at }} &middot;
+    runs in the background &mdash; this page auto-refreshes until it finishes.
+    {% elif crawler_job.status == 'failed' %}
+    <span class="badge badge-correction">failed</span> at {{ crawler_job.finished_at }}:
+    {{ crawler_job.error }}
+    {% elif crawler_job.status == 'done' %}
+    <span class="badge">done</span> at {{ crawler_job.finished_at }} &mdash;
+    {{ crawler_job.result.articles_processed }} article(s) processed,
+    {{ crawler_job.result.claims_extracted }} claim(s) extracted.
+    {% endif %}
+  </p>
+  {% endif %}
+  {% if (orchestrator_job and orchestrator_job.status == 'running')
+        or (crawler_job and crawler_job.status == 'running') %}
   <script>setTimeout(function () { location.reload(); }, 4000);</script>
-  {% endif %}
-  {% endif %}
-  {% if crawler_result is not none %}
-  <p><strong>Crawler run result:</strong>
-    {{ crawler_result.articles_processed }} article(s) processed,
-    {{ crawler_result.claims_extracted }} claim(s) extracted.</p>
   {% endif %}
 </div>
 
@@ -53,16 +64,32 @@
     handful of Claude Opus calls (recap + any stale forecast horizons).
   </p>
   <form method="post" action="/dashboard/morning-briefs/run-now" style="display:inline;">
-    <button type="submit">Run morning brief now</button>
+    <button type="submit"{% if morning_brief_job and morning_brief_job.status == 'running' %} disabled{% endif %}>Run morning brief now</button>
   </form>
   <p><a href="/dashboard/morning-briefs">View past Morning Briefs &rarr;</a></p>
 
-  {% if morning_brief_result is not none %}
-  <p><strong>Morning brief run result:</strong>
-    brief_date={{ morning_brief_result.brief_date }},
-    slack_sent={{ morning_brief_result.slack_sent }},
-    email_sent={{ morning_brief_result.email_sent }},
-    {{ morning_brief_result.bess_estimates_count }} BESS estimate(s).</p>
+  {% if morning_brief_job %}
+  <p><strong>Morning brief run:</strong>
+    {% if morning_brief_job.status == 'running' %}
+    <span class="badge">running</span> started {{ morning_brief_job.started_at }} &middot;
+    runs in the background &mdash; this page auto-refreshes until it finishes.
+    {% elif morning_brief_job.status == 'failed' %}
+    <span class="badge badge-correction">failed</span> at {{ morning_brief_job.finished_at }}:
+    {{ morning_brief_job.error }}
+    {% elif morning_brief_job.status == 'done' %}
+    <span class="badge">done</span> at {{ morning_brief_job.finished_at }} &mdash;
+    brief_date={{ morning_brief_job.result.brief_date }},
+    slack_sent={{ morning_brief_job.result.slack_sent }},
+    email_sent={{ morning_brief_job.result.email_sent }},
+    {{ morning_brief_job.result.bess_estimates_count }} BESS estimate(s).
+    {% if morning_brief_job.result.brief_id is not none %}
+    <a href="/dashboard/morning-briefs/{{ morning_brief_job.result.brief_id }}">View brief &rarr;</a>
+    {% endif %}
+    {% endif %}
+  </p>
+  {% if morning_brief_job.status == 'running' %}
+  <script>setTimeout(function () { location.reload(); }, 4000);</script>
+  {% endif %}
   {% endif %}
 </div>
 
