@@ -27,9 +27,11 @@ rationale. `/health` and `/metrics` are always unauthenticated (needed for
 healthchecks/Prometheus scraping).
 """
 
+import asyncio
 import importlib.util
 import logging
 import os
+import threading
 import time
 from collections import defaultdict
 from collections.abc import AsyncIterator
@@ -171,6 +173,68 @@ def get_crawler_main():
     if _crawler_main is None:
         _crawler_main = _load_sibling_service_module("crawler", "crawler_main")
     return _crawler_main
+
+
+# --- in-process background jobs (for slow, human-triggered dashboard runs) --
+#
+# The orchestrator "Run now" button used to `await run_synthesis_cycle()`
+# inline in the POST handler, holding the HTTP response open for the whole
+# cycle. That cycle drives synchronous psycopg2 queries (DatabaseManager,
+# shared/rule_engine.py) directly on the asyncio event loop, so a slow cycle
+# froze the *entire* uvicorn worker -- every other request, /metrics scrape
+# included -- until it finished, and the browser tab just spun with no
+# feedback. Instead we now run the cycle in a dedicated worker thread with its
+# own event loop (`asyncio.run` below), so its blocking DB calls never touch
+# the API's loop, and return the dashboard immediately. This is a deliberately
+# tiny single-process job registry (the dashboard is one uvicorn worker for a
+# human clicking around, see the module docstring) -- not a Celery/RQ queue.
+_background_jobs: dict[str, dict] = {}
+_background_jobs_lock = threading.Lock()
+
+
+def start_background_job(name: str, coro_factory) -> bool:
+    """Runs `coro_factory()` (a zero-arg callable returning a coroutine) in a
+    daemon worker thread with its own event loop, recording status/result in
+    `_background_jobs[name]`. Returns False without starting anything if a job
+    of this name is already running (so a double-click can't launch two
+    concurrent cycles hammering the same tables)."""
+    with _background_jobs_lock:
+        existing = _background_jobs.get(name)
+        if existing and existing["status"] == "running":
+            return False
+        _background_jobs[name] = {
+            "status": "running",
+            "started_at": datetime.now(UTC),
+            "finished_at": None,
+            "result": None,
+            "error": None,
+        }
+
+    def _worker():
+        result, error = None, None
+        try:
+            result = asyncio.run(coro_factory())
+        except Exception as exc:  # noqa: BLE001 -- recorded for the dashboard, not swallowed silently
+            logger.exception("Background job %r failed", name)
+            error = str(exc)
+        with _background_jobs_lock:
+            _background_jobs[name].update(
+                status="failed" if error else "done",
+                finished_at=datetime.now(UTC),
+                result=result,
+                error=error,
+            )
+
+    threading.Thread(target=_worker, name=f"job-{name}", daemon=True).start()
+    return True
+
+
+def get_background_job(name: str) -> dict | None:
+    """Snapshot of the named job's state (copy, so callers never see it mutate
+    mid-render), or None if it has never been started this process lifetime."""
+    with _background_jobs_lock:
+        job = _background_jobs.get(name)
+        return dict(job) if job else None
 
 
 @asynccontextmanager
@@ -731,13 +795,16 @@ async def trigger_backfill(req: BackfillRequest, db: DatabaseManager = Depends(g
 def dashboard_home(request: Request, db: DatabaseManager = Depends(get_db)):
     """Recent Event Reports list -- the dashboard's landing page. Also hosts the
     "Run orchestrator now" / "Run crawler now" on-demand buttons (see the two POST routes
-    below) -- `orchestrator_result`/`crawler_result` are `None` on a plain `GET`."""
+    below). `orchestrator_job` reflects the background orchestrator run's live status
+    (the button 303-redirects here after starting it); `crawler_result` is `None` on a
+    plain `GET`."""
     reports = db.fetch_event_reports(limit=25, offset=0)
     return templates.TemplateResponse(
         request,
         "index.html",
         {
             "reports": reports,
+            "orchestrator_job": get_background_job("orchestrator"),
             "orchestrator_result": None,
             "crawler_result": None,
             "backfill_result": None,
@@ -746,37 +813,26 @@ def dashboard_home(request: Request, db: DatabaseManager = Depends(get_db)):
     )
 
 
-@app.post("/dashboard/orchestrator/run-now", response_class=HTMLResponse)
+@app.post("/dashboard/orchestrator/run-now")
 async def dashboard_trigger_orchestrator_run_now(
-    request: Request,
-    db: DatabaseManager = Depends(get_db),
     orchestrator_main=Depends(get_orchestrator_main),
 ):
     """
-    Dashboard counterpart to `POST /orchestrator/run-now` above -- same
-    synchronous trigger-and-show-result flow as `/dashboard/bess/new`: runs
-    the real cycle, then re-renders the dashboard home with the run's
-    summary shown inline. Stays open regardless of `API_KEY` (same
-    "dashboard HTML is for humans clicking around a browser" exception as
-    every other dashboard route, see module docstring) -- the underlying
-    JSON `/orchestrator/run-now` route this shares logic with is what's
-    gated; see DEPLOYMENT.md if you want this button itself gated too (e.g.
-    a reverse-proxy auth layer), since a click here spends real Anthropic
-    credit.
+    Dashboard counterpart to `POST /orchestrator/run-now` above. Unlike that
+    JSON route (which blocks until the cycle finishes), this fires the cycle
+    as an in-process background job (`start_background_job`, above) and
+    immediately 303-redirects back to the dashboard home, which then shows
+    the job's live status -- so a slow cycle never freezes the API worker or
+    leaves the browser spinning (see `start_background_job`'s docstring for
+    the full rationale). A repeat click while a cycle is already running is a
+    no-op, so double-clicking can't launch two competing cycles. Stays open
+    regardless of `API_KEY` (same "dashboard HTML is for humans clicking
+    around a browser" exception as every other dashboard route); the
+    underlying JSON route this shares logic with is what's gated. A run here
+    still spends real Anthropic credit (Opus, per trigger fired).
     """
-    result = await orchestrator_main.run_synthesis_cycle()
-    reports = db.fetch_event_reports(limit=25, offset=0)
-    return templates.TemplateResponse(
-        request,
-        "index.html",
-        {
-            "reports": reports,
-            "orchestrator_result": result,
-            "crawler_result": None,
-            "backfill_result": None,
-            "morning_brief_result": None,
-        },
-    )
+    start_background_job("orchestrator", orchestrator_main.run_synthesis_cycle)
+    return RedirectResponse(url="/", status_code=303)
 
 
 @app.post("/dashboard/crawler/run-now", response_class=HTMLResponse)

@@ -12,16 +12,29 @@
     orchestrator, per trigger fired; Haiku for the crawler, per new article found).
   </p>
   <form method="post" action="/dashboard/orchestrator/run-now" style="display:inline;">
-    <button type="submit">Run orchestrator now</button>
+    <button type="submit"{% if orchestrator_job and orchestrator_job.status == 'running' %} disabled{% endif %}>Run orchestrator now</button>
   </form>
   <form method="post" action="/dashboard/crawler/run-now" style="display:inline;">
     <button type="submit">Run crawler now</button>
   </form>
 
-  {% if orchestrator_result is not none %}
-  <p><strong>Orchestrator run result:</strong>
-    {{ orchestrator_result.triggers_fired }} trigger(s) fired,
-    {{ orchestrator_result.reports_published }} Event Report(s) published.</p>
+  {% if orchestrator_job %}
+  <p><strong>Orchestrator run:</strong>
+    {% if orchestrator_job.status == 'running' %}
+    <span class="badge">running</span> started {{ orchestrator_job.started_at }} &middot;
+    runs in the background &mdash; this page auto-refreshes until it finishes.
+    {% elif orchestrator_job.status == 'failed' %}
+    <span class="badge badge-correction">failed</span> at {{ orchestrator_job.finished_at }}:
+    {{ orchestrator_job.error }}
+    {% elif orchestrator_job.status == 'done' %}
+    <span class="badge">done</span> at {{ orchestrator_job.finished_at }} &mdash;
+    {{ orchestrator_job.result.triggers_fired }} trigger(s) fired,
+    {{ orchestrator_job.result.reports_published }} Event Report(s) published.
+    {% endif %}
+  </p>
+  {% if orchestrator_job.status == 'running' %}
+  <script>setTimeout(function () { location.reload(); }, 4000);</script>
+  {% endif %}
   {% endif %}
   {% if crawler_result is not none %}
   <p><strong>Crawler run result:</strong>
