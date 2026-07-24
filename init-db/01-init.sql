@@ -34,6 +34,19 @@ ALTER TABLE market_data_history SET (
   timescaledb.compress_segmentby = 'market,zone,product'
 );
 
+-- Per-series lookup index. The rule engine (shared/rule_engine.py) and the
+-- BESS backtest read one series at a time --
+-- `WHERE market=? AND zone=? AND product=? ORDER BY time DESC, fetched_at DESC` --
+-- once per (market, zone, product) tuple. The primary key and the auto-created
+-- time index both lead with `time`, so neither supports that filter: without
+-- this index each such query is a full parallel seq-scan of every hypertable
+-- chunk (~85M rows), and the rule engine fires ~300 of them per synthesis cycle
+-- (13+ minutes, all on the synchronous run-now event loop). This composite makes
+-- each lookup an index range seek. Column order matches the query's equality
+-- predicates then its ORDER BY.
+CREATE INDEX IF NOT EXISTS idx_market_data_history_mzp_time
+  ON market_data_history (market, zone, product, time DESC, fetched_at DESC);
+
 -- Latest-value-per-key view for fast current-state queries. Derived, not
 -- stored: always reflects the most recently fetched row for each
 -- (time, market, zone, product), without ever mutating market_data_history.
