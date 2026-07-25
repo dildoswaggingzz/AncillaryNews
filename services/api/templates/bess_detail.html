@@ -176,6 +176,44 @@
     common currency. Shown as excluded rather than folded in at an assumed rate.
   </p>
   {% endif %}
+
+  {# Coverage qualifies every figure above it: a low total means something
+     different when a third of the window had no prices behind it. #}
+  {% if coverage.recorded %}
+    {% if coverage.uncovered %}
+    <p class="muted" style="margin-top: 0.75rem;">
+      <strong>Periods with no price data:</strong>
+      {% for leg, n in coverage.uncovered %}
+      <code>{{ leg }}</code> {{ n }}/{{ run.tick_count }}
+      ({{ "%.1f"|format(100 * n / run.tick_count) }}%){{ ", " if not loop.last }}
+      {% endfor %}
+      — booked as zero revenue, not as a zero price. Nothing was carried
+      forward past the end of a series to fill these.
+    </p>
+    {% endif %}
+    {% if coverage.zero_priced %}
+    <p class="muted" style="margin-top: 0.5rem;">
+      <strong>Periods that genuinely cleared at 0:</strong>
+      {% for leg, n in coverage.zero_priced %}
+      <code>{{ leg }}</code> {{ n }}/{{ run.tick_count }}{{ ", " if not loop.last }}
+      {% endfor %}
+      — a real price of 0, distinct from the missing data above.
+    </p>
+    {% endif %}
+    {% if not coverage.uncovered and not coverage.zero_priced %}
+    <p class="muted" style="margin-top: 0.75rem;">
+      Every period had a price for every configured leg.
+    </p>
+    {% endif %}
+  {% else %}
+  <p class="muted" style="margin-top: 0.75rem;">
+    <strong>Coverage not recorded for this run.</strong> It predates
+    <code>init-db/09-bess-coverage-counts.sql</code>, so how much of its
+    window had price data behind it is unknown — including whether a series
+    that ended mid-window kept paying at a stale price, which runs from
+    before that fix did. Re-run it to find out.
+  </p>
+  {% endif %}
 </div>
 
 <!-- Full-cycle equivalents -->

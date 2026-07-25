@@ -9,11 +9,16 @@ from shared.bess_simulator import (
     _causal_zscore,
     _lag24h_forecast,
     _leg_relative_strength,
+    _native_period,
     _value_at_or_before,
     run_backtest,
 )
 
 BASE_TIME = datetime(2026, 7, 16, tzinfo=UTC)
+# Bucket alignment origin for the fake `fetch_series_period_means` below --
+# Postgres `time_bucket`'s own default origin, so a fake bucket boundary
+# lands where the real one does.
+_BUCKET_EPOCH = datetime(2000, 1, 3, tzinfo=UTC)
 
 
 def _price_rows(
@@ -58,6 +63,31 @@ def _db_with_series(
         raise AssertionError(f"unexpected market/product {market!r}/{product!r} requested")
 
     db.fetch_series_values.side_effect = fetch_series_values
+
+    def fetch_series_period_means(
+        market, zone, product, bucket_seconds, time_from=None, time_to=None
+    ):
+        """Mirrors DatabaseManager.fetch_series_period_means over the same
+        canned rows: the mean of every sample falling in each
+        `bucket_seconds`-wide bucket, empty buckets omitted. `aFRR_energy`
+        goes through this path rather than fetch_series_values (see
+        shared/bess_simulator.py:_fetch_period_mean_series), so a fake that
+        only answers the latter silently hands the simulator an empty
+        activation series."""
+        rows = fetch_series_values(market, zone, product, time_from=time_from, time_to=time_to)
+        buckets: dict[datetime, list[float]] = {}
+        for row in rows:
+            if row["value"] is None:
+                continue
+            offset = (row["time"] - _BUCKET_EPOCH).total_seconds()
+            start = _BUCKET_EPOCH + timedelta(seconds=(offset // bucket_seconds) * bucket_seconds)
+            buckets.setdefault(start, []).append(row["value"])
+        return [
+            {"time": start, "value": sum(vals) / len(vals), "sample_count": len(vals)}
+            for start, vals in sorted(buckets.items())
+        ]
+
+    db.fetch_series_period_means.side_effect = fetch_series_period_means
     return db
 
 
@@ -145,6 +175,61 @@ def test_value_at_or_before_carries_forward_last_known_value():
 def test_value_at_or_before_none_when_no_entry_precedes_time():
     series = [(BASE_TIME + timedelta(hours=1), 1.0)]
     assert _value_at_or_before(series, BASE_TIME) is None
+
+
+def test_value_at_or_before_max_staleness_covers_own_period_then_stops():
+    """An hourly price covers `[t, t+1h)` -- its own hour, half-open. At
+    exactly +1h it has been superseded (by the next point, or by nothing)."""
+    series = [(BASE_TIME, 1.0)]
+    hour = timedelta(hours=1)
+
+    assert _value_at_or_before(series, BASE_TIME, max_staleness=hour) == 1.0
+    assert _value_at_or_before(series, BASE_TIME + timedelta(minutes=59), max_staleness=hour) == 1.0
+    assert _value_at_or_before(series, BASE_TIME + hour, max_staleness=hour) is None
+
+
+def test_value_at_or_before_staleness_stops_a_series_that_ends_mid_window():
+    """Regression (BESS runs 77/82): one partial day of ingested aFRR
+    activation prices was carried across the following 6.5 days, inventing
+    ~244k DKK of activation revenue and steering the co-optimizer's capacity
+    commitment with it. Unbounded carry-forward is the default only for
+    callers that opt out; bounded, the gap reads as "no data"."""
+    series = [(BASE_TIME + timedelta(hours=i), 100.0) for i in range(6)]
+    last_point = BASE_TIME + timedelta(hours=5)
+    hour = timedelta(hours=1)
+
+    # Unbounded: still "priced" a week later.
+    assert _value_at_or_before(series, last_point + timedelta(days=7)) == 100.0
+    # Bounded by its own cadence: priced through its own hour, then nothing.
+    assert (
+        _value_at_or_before(series, last_point + timedelta(minutes=30), max_staleness=hour) == 100.0
+    )
+    assert _value_at_or_before(series, last_point + timedelta(days=7), max_staleness=hour) is None
+
+
+# --- _native_period -------------------------------------------------------------
+
+
+def test_native_period_is_the_median_gap():
+    hourly = [(BASE_TIME + timedelta(hours=i), 1.0) for i in range(5)]
+    quarter_hourly = [(BASE_TIME + timedelta(minutes=15 * i), 1.0) for i in range(5)]
+
+    assert _native_period(hourly) == timedelta(hours=1)
+    assert _native_period(quarter_hourly) == timedelta(minutes=15)
+
+
+def test_native_period_median_shrugs_off_a_single_gap():
+    """Median, not mean: one missing stretch mid-series must not inflate
+    every other point's carry-forward budget along with it."""
+    times = [0, 1, 2, 3, 40, 41, 42]
+    series = [(BASE_TIME + timedelta(hours=h), 1.0) for h in times]
+
+    assert _native_period(series) == timedelta(hours=1)
+
+
+def test_native_period_none_without_two_points():
+    assert _native_period([]) is None
+    assert _native_period([(BASE_TIME, 1.0)]) is None
 
 
 # --- _lag24h_forecast (O(n) two-pointer) ----------------------------------------
@@ -574,6 +659,86 @@ def test_commit_splits_across_market_groups_not_raw_leg_entries():
         30.0 * 0.2 * 1.0
     )
     assert first_tick.capacity_reserved_mw == pytest.approx(0.4)
+
+
+# --- series coverage: truncation, staleness, sub-tick resolution -------------
+#
+# All three defects behind the BESS run 77 vs 82 divergence, where two runs
+# over near-identical June windows reported all-in revenues 61% apart.
+
+
+def test_series_are_fetched_uncapped():
+    """`limit=100000` looked generous but combines with `time DESC` to keep
+    only the NEWEST rows: for aFRR_energy (~86k rows/day) that cut a 30-day
+    window down to its last ~1.16 days, silently zeroing 28 days of
+    activation revenue. Every series fetch must be uncapped."""
+    db = _db_with_series(_price_rows([100.0] * 3), afrr=_price_rows([30.0] * 3))
+    config = BessConfig(capacity_markets=(("aFRR_capacity", "up"),))
+
+    run_backtest(db, "DK2", BASE_TIME, BASE_TIME + timedelta(hours=3), config)
+
+    assert db.fetch_series_values.call_args_list, "no series were fetched at all"
+    for call in db.fetch_series_values.call_args_list:
+        assert call.kwargs["limit"] is None, f"capped fetch: {call}"
+
+
+def test_activation_price_is_averaged_over_the_tick_not_point_sampled():
+    """aFRR_energy publishes ~1/second; point-sampling it at a 15-minute
+    tick values the whole quarter-hour at one arbitrary second of a very
+    volatile series. Six 10-minute samples spanning one hour must be valued
+    at their mean, not at whichever one happens to sit at the tick edge."""
+    day_ahead = _price_rows([100.0] * 2)
+    sub_tick_activation = _price_rows(
+        [0.0, 0.0, 0.0, 0.0, 0.0, 600.0], hours=1 / 6
+    )  # mean 100.0, last-before-next-tick 600.0
+    db = _db_with_series(day_ahead, afrr=_price_rows([30.0] * 2), activation=sub_tick_activation)
+    config = BessConfig(
+        capacity_commit_mw=1.0,
+        capacity_markets=(("aFRR_capacity", "up"),),
+        afrr_activation_participation_rate=1.0,
+    )
+
+    result = run_backtest(db, "DK2", BASE_TIME, BASE_TIME + timedelta(hours=2), config)
+
+    # mean(0,0,0,0,0,600) * 1.0 MW * 1.0 rate * 1h
+    assert result.ticks[0].afrr_activation_revenue_eur == pytest.approx(100.0)
+    db.fetch_series_period_means.assert_called()
+
+
+def test_capacity_leg_ending_mid_window_stops_paying_and_is_counted():
+    """A leg whose data runs out partway through the window books no
+    revenue for the uncovered periods -- and says how many they were, so
+    "earned nothing" is distinguishable from "had nothing to earn
+    against"."""
+    day_ahead = _price_rows([100.0] * 6)
+    afrr = _price_rows([30.0] * 2)  # ends 4 hours before the window does
+    db = _db_with_series(day_ahead, afrr=afrr)
+    config = BessConfig(capacity_commit_mw=1.0, capacity_markets=(("aFRR_capacity", "up"),))
+
+    result = run_backtest(db, "DK2", BASE_TIME, BASE_TIME + timedelta(hours=6), config)
+
+    paid = [t for t in result.ticks if t.capacity_revenue_dkk > 0]
+    assert len(paid) == 2, "a stale price kept paying past the end of its series"
+    assert result.uncovered_periods_by_leg["aFRR_capacity:up"] == 4
+    # A real 0 clearing price is a different finding and must not be conflated.
+    assert result.zero_price_periods_by_leg.get("aFRR_capacity:up", 0) == 0
+
+
+def test_uncovered_activation_periods_are_counted():
+    day_ahead = _price_rows([100.0] * 6)
+    db = _db_with_series(
+        day_ahead,
+        afrr=_price_rows([30.0] * 6),
+        activation=_price_rows([20.0] * 2),  # ends early, like the June ingest gap did
+    )
+    config = BessConfig(capacity_commit_mw=1.0, capacity_markets=(("aFRR_capacity", "up"),))
+
+    result = run_backtest(db, "DK2", BASE_TIME, BASE_TIME + timedelta(hours=6), config)
+
+    assert result.activation_uncovered_periods == 4
+    assert sum(t.afrr_activation_revenue_eur for t in result.ticks) == pytest.approx(
+        20.0 * 1.0 * BessConfig().afrr_activation_participation_rate * 2
+    )
 
 
 # --- aFRR energy activation revenue ----------------------------------------

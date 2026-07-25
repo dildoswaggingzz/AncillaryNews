@@ -1,5 +1,5 @@
 import json
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -580,6 +580,57 @@ def test_fetch_series_values_applies_time_range_filters(db, pooled_conn):
     assert params == ["mFRR_capacity", "DK1", "up", time_from, time_to, 500]
 
 
+def test_fetch_series_values_limit_none_emits_no_limit_clause(db, pooled_conn):
+    """A whole-window read must not be paged. With `time DESC` ordering a
+    numeric limit keeps the NEWEST rows and drops the rest of the window --
+    for a ~86k-rows/day series that turns a month into its last day, with no
+    error (BESS runs 77/82)."""
+    conn, _ = pooled_conn
+    cursor = MagicMock()
+    cursor.fetchall.return_value = []
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    time_from = datetime(2026, 6, 1, tzinfo=UTC)
+    time_to = datetime(2026, 7, 1, tzinfo=UTC)
+    db.fetch_series_values(
+        "aFRR_energy", "DK2", "activation_price", limit=None, time_from=time_from, time_to=time_to
+    )
+
+    query, params = cursor.execute.call_args.args
+    assert "LIMIT" not in query
+    assert params == ["aFRR_energy", "DK2", "activation_price", time_from, time_to]
+
+
+def test_fetch_series_period_means_buckets_and_averages(db, pooled_conn):
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [
+        (datetime(2026, 6, 1, 0, 0, tzinfo=UTC), 12.5, 900),
+        (datetime(2026, 6, 1, 0, 15, tzinfo=UTC), 30.0, 898),
+    ]
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    result = db.fetch_series_period_means(
+        "aFRR_energy",
+        "DK2",
+        "activation_price",
+        bucket_seconds=900,
+        time_from=datetime(2026, 6, 1, tzinfo=UTC),
+        time_to=datetime(2026, 7, 1, tzinfo=UTC),
+    )
+
+    assert result == [
+        {"time": datetime(2026, 6, 1, 0, 0, tzinfo=UTC), "value": 12.5, "sample_count": 900},
+        {"time": datetime(2026, 6, 1, 0, 15, tzinfo=UTC), "value": 30.0, "sample_count": 898},
+    ]
+    query, params = cursor.execute.call_args.args
+    # Aggregated in SQL: a month of aFRR_energy is ~5M rows.
+    assert "time_bucket" in query and "avg(value)" in query
+    assert "FROM market_data\n" in query
+    assert params[0] == timedelta(seconds=900)
+    mock_pool.putconn.assert_called_once_with(conn)
+
+
 def test_fetch_event_reports_returns_mapped_rows(db, pooled_conn):
     conn, mock_pool = pooled_conn
     cursor = MagicMock()
@@ -846,6 +897,9 @@ def test_fetch_bess_runs_returns_mapped_rows(db, pooled_conn):
             None,
             25.0,
             10.0,
+            {"FCR:price": 4},
+            7,
+            {"FFR:price": 720},
         )
     ]
     conn.cursor.return_value.__enter__.return_value = cursor
@@ -882,6 +936,9 @@ def test_fetch_bess_runs_decodes_json_string_config(db, pooled_conn):
             "morning_brief",
             0.0,
             0.0,
+            None,
+            None,
+            None,
         )
     ]
     conn.cursor.return_value.__enter__.return_value = cursor
@@ -890,6 +947,10 @@ def test_fetch_bess_runs_decodes_json_string_config(db, pooled_conn):
 
     assert result[0]["config"] == {"power_mw": 1.0}
     assert result[0]["label"] == "morning_brief"
+    # Pre-migration run: coverage unknown, and it must stay distinguishable
+    # from a run that recorded zero uncovered periods.
+    assert result[0]["uncovered_periods_by_leg"] is None
+    assert result[0]["activation_uncovered_periods"] is None
 
 
 def test_fetch_bess_run_returns_none_when_absent(db, pooled_conn):
@@ -1298,9 +1359,43 @@ def test_save_bess_run_persists_label(db, pooled_conn):
 
     assert run_id == 9
     insert_run_call = cursor.execute.call_args_list[0]
-    # label is third-to-last (total_afrr_activation_revenue_eur,
-    # total_capacity_revenue_eur follow it, in that order).
-    assert insert_run_call.args[1][-3] == "morning_brief"
+    query, params = insert_run_call.args
+    # Positional params, so match `label` against its own column's index in
+    # the INSERT's column list rather than counting from either end (which
+    # every new trailing column silently invalidates).
+    columns = [c.strip() for c in query.split("(", 1)[1].split(")", 1)[0].split(",")]
+    assert params[columns.index("label")] == "morning_brief"
+
+
+def test_save_bess_run_persists_coverage_counts(db, pooled_conn):
+    """A stored run's revenue is only interpretable next to how much of its
+    window had prices behind it (init-db/09-bess-coverage-counts.sql)."""
+    from shared.bess_simulator import BacktestResult, BessConfig
+
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (9,)
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    result = BacktestResult(
+        zone="DK2",
+        start_time=datetime(2026, 6, 1, tzinfo=UTC),
+        end_time=datetime(2026, 6, 30, tzinfo=UTC),
+        config=BessConfig(),
+        ticks=[],
+        uncovered_periods_by_leg={"aFRR_capacity:up": 96},
+        activation_uncovered_periods=28,
+        zero_price_periods_by_leg={"FFR:price": 720},
+    )
+
+    with patch("shared.db_manager.execute_values"):
+        db.save_bess_run(result)
+
+    query, params = cursor.execute.call_args_list[0].args
+    columns = [c.strip() for c in query.split("(", 1)[1].split(")", 1)[0].split(",")]
+    assert params[columns.index("uncovered_periods_by_leg")].adapted == {"aFRR_capacity:up": 96}
+    assert params[columns.index("activation_uncovered_periods")] == 28
+    assert params[columns.index("zero_price_periods_by_leg")].adapted == {"FFR:price": 720}
 
 
 # --- Morning Brief (M5) persistence -------------------------------------------

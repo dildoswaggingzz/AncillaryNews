@@ -14,6 +14,8 @@ from shared.bess_simulator import BacktestResult, BessConfig, BessTick, run_back
 from shared.units import DKK_PER_EUR
 
 BASE_TIME = datetime(2026, 7, 16, tzinfo=UTC)
+# Postgres `time_bucket`'s default origin -- see tests/test_bess_simulator.py.
+_BUCKET_EPOCH = datetime(2000, 1, 3, tzinfo=UTC)
 
 
 def _series(values: list[float], start: datetime = BASE_TIME, hours: float = 1.0):
@@ -59,6 +61,29 @@ def _db_with_series(
         raise AssertionError(f"unexpected market/product {market!r}/{product!r} requested")
 
     db.fetch_series_values.side_effect = fetch_series_values
+
+    def fetch_series_period_means(
+        market, zone, product, bucket_seconds, time_from=None, time_to=None
+    ):
+        """Fake of DatabaseManager.fetch_series_period_means -- see the twin
+        in tests/test_bess_simulator.py. `aFRR_energy` is fetched through
+        this path, so a MagicMock without it hands the LP an empty
+        activation series (and MagicMock's default `__iter__` makes that
+        look like real data rather than erroring)."""
+        rows = fetch_series_values(market, zone, product, time_from=time_from, time_to=time_to)
+        buckets: dict[datetime, list[float]] = {}
+        for row in rows:
+            if row["value"] is None:
+                continue
+            offset = (row["time"] - _BUCKET_EPOCH).total_seconds()
+            start = _BUCKET_EPOCH + timedelta(seconds=(offset // bucket_seconds) * bucket_seconds)
+            buckets.setdefault(start, []).append(row["value"])
+        return [
+            {"time": start, "value": sum(vals) / len(vals), "sample_count": len(vals)}
+            for start, vals in sorted(buckets.items())
+        ]
+
+    db.fetch_series_period_means.side_effect = fetch_series_period_means
     return db
 
 
@@ -848,6 +873,38 @@ def test_pre_leq_post_on_multiple_windows():
         gaps.append(perfect.total_revenue_all_dkk - forecast.total_revenue_all_dkk)
 
     assert any(gap > 1e-6 for gap in gaps)
+
+
+def test_stale_activation_price_does_not_steer_the_schedule_past_its_data():
+    """Regression (BESS runs 77/82). A stale price in the LP's objective
+    doesn't merely misvalue a tick -- it *moves the schedule*. When only the
+    first 6 of 30 hours of activation prices had been ingested, unbounded
+    carry-forward made the LP commit aFRR capacity across all 30 hours (and
+    book revenue for them); bounded, it commits only where it has data, and
+    the uncovered periods are reported rather than silently priced.
+
+    Day-ahead is flat and cheap (1 DKK/MWh) so discharging is near-worthless;
+    activation at 1000 EUR makes committing aFRR overwhelmingly attractive
+    wherever the LP believes a price exists."""
+    T = 30
+    day_ahead = _price_rows([1.0] * T)
+    afrr = _price_rows([0.0] * T)  # capacity leg worthless on its own
+    activation = _price_rows([1000.0] * 6)  # ingested for the first 6 hours only
+
+    db = _db_with_series(day_ahead, afrr=afrr, activation=activation)
+    config = BessConfig(
+        strategy="cooptimized",
+        capacity_markets=(("aFRR_capacity", "up"),),
+        power_mw=1.0,
+        capacity_mwh=100.0,
+        max_cycles_per_day=None,
+    )
+
+    result = run_backtest(db, "DK1", BASE_TIME, BASE_TIME + timedelta(hours=T), config)
+
+    earning = [t for t in result.ticks if t.afrr_activation_revenue_eur > 0]
+    assert len(earning) == 6, "activation revenue booked past the end of the price series"
+    assert result.activation_uncovered_periods == T - 6
 
 
 def test_forecast_mode_does_not_chase_activation_price_lookahead():

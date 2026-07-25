@@ -71,6 +71,10 @@ EXPECTED_SCHEMA_COLUMNS: tuple[tuple[str, str], ...] = (
     ("bess_simulation_runs", "total_capacity_revenue_eur"),
     ("bess_simulation_ticks", "capacity_revenue_eur"),
     ("bess_simulation_ticks", "cumulative_capacity_revenue_eur"),
+    # init-db/09-bess-coverage-counts.sql
+    ("bess_simulation_runs", "uncovered_periods_by_leg"),
+    ("bess_simulation_runs", "activation_uncovered_periods"),
+    ("bess_simulation_runs", "zero_price_periods_by_leg"),
 )
 
 
@@ -379,7 +383,7 @@ class DatabaseManager:
         market: str,
         zone: str,
         product: str,
-        limit: int = 500,
+        limit: int | None = 500,
         time_from: datetime | None = None,
         time_to: datetime | None = None,
         history: bool = False,
@@ -394,6 +398,15 @@ class DatabaseManager:
         revision. Pass `history=True` to read `market_data_history` directly
         instead, returning every revision (with its own `fetched_at`) rather
         than only the latest one per `time`.
+
+        `limit=None` returns **every** row in the window, no `LIMIT` clause.
+        Callers that need a whole window rather than a "most recent N" page
+        must pass it: a numeric limit combined with this method's
+        `time DESC` ordering silently keeps the *newest* rows and drops the
+        rest of the window, which for a sub-minute series (`aFRR_energy` is
+        ~86k rows/day) truncates a month down to its last day or so with no
+        error — see `shared/bess_simulator.py:_fetch_series`, where exactly
+        that silently zeroed 28 of 30 days of aFRR activation revenue.
         """
         conditions = ["market = %s", "zone = %s", "product = %s"]
         params: list = [market, zone, product]
@@ -414,14 +427,18 @@ class DatabaseManager:
             select_cols = "time, value, source, is_provisional, ingested_at"
             order_clause = "time DESC"
 
+        limit_clause = ""
+        if limit is not None:
+            limit_clause = "LIMIT %s"
+            params.append(limit)
+
         query = f"""
             SELECT {select_cols}
             FROM {table}
             WHERE {where_clause}
             ORDER BY {order_clause}
-            LIMIT %s;
+            {limit_clause};
         """
-        params.append(limit)
 
         conn = self._pool.getconn()
         try:
@@ -452,6 +469,71 @@ class DatabaseManager:
             }
             for r in rows
         ]
+
+    def fetch_series_period_means(
+        self,
+        market: str,
+        zone: str,
+        product: str,
+        bucket_seconds: float,
+        time_from: datetime,
+        time_to: datetime,
+    ) -> list[dict]:
+        """
+        Returns one row per `bucket_seconds`-wide period in
+        `[time_from, time_to]` — `{"time": bucket_start, "value": mean,
+        "sample_count": n}` — ascending by time, buckets with no data
+        omitted, reading the latest-revision `market_data` view.
+
+        For a series sampled far finer than the consumer's period this is the
+        correct reduction, and point-sampling is not: `aFRR_energy`'s
+        activation price arrives ~1/second, so taking the single last value
+        before a 15-minute tick (`shared/bess_simulator.py`'s
+        `_value_at_or_before`, right for an hourly capacity price carried
+        into its own hour) values the whole quarter-hour at one arbitrary
+        second of a volatile series. The mean over the period is what
+        "revenue earned across this period" actually integrates.
+
+        Sampling is regular enough in practice (Energinet publishes
+        aFRR_energy on a fixed cadence) that a plain `avg` equals the
+        time-weighted mean; `sample_count` is returned so a caller can spot
+        a thinly-covered bucket rather than trusting a mean drawn from two
+        stray samples.
+
+        Aggregating in SQL rather than in Python is not an optimisation
+        detail: a month of aFRR_energy is ~5M rows, which is both slow to
+        ship and large enough that the old row-capped fetch silently
+        truncated it (see `fetch_series_values`' `limit=None` note).
+        """
+        query = """
+            SELECT time_bucket(%s::interval, time) AS bucket,
+                   avg(value) AS mean_value,
+                   count(*) AS sample_count
+            FROM market_data
+            WHERE market = %s AND zone = %s AND product = %s
+              AND time >= %s AND time <= %s
+              AND value IS NOT NULL
+            GROUP BY bucket
+            ORDER BY bucket;
+        """
+        params = (
+            timedelta(seconds=bucket_seconds),
+            market,
+            zone,
+            product,
+            time_from,
+            time_to,
+        )
+
+        conn = self._pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                rows = cur.fetchall()
+        finally:
+            self._pool.putconn(conn)
+
+        return [{"time": r[0], "value": float(r[1]), "sample_count": r[2]} for r in rows]
 
     def fetch_event_reports(
         self,
@@ -679,8 +761,9 @@ class DatabaseManager:
                         (zone, start_time, end_time, config, total_arbitrage_revenue_dkk,
                          total_capacity_revenue_dkk, total_revenue_dkk, full_cycle_equivalents,
                          tick_count, label, total_afrr_activation_revenue_eur,
-                         total_capacity_revenue_eur)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                         total_capacity_revenue_eur, uncovered_periods_by_leg,
+                         activation_uncovered_periods, zero_price_periods_by_leg)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id;
                     """,
                     (
@@ -696,6 +779,11 @@ class DatabaseManager:
                         label,
                         result.total_afrr_activation_revenue_eur,
                         result.total_capacity_revenue_eur,
+                        # Data-coverage counts (init-db/09-bess-coverage-counts.sql):
+                        # what the run had prices for, alongside what it earned.
+                        Json(result.uncovered_periods_by_leg),
+                        result.activation_uncovered_periods,
+                        Json(result.zero_price_periods_by_leg),
                     ),
                 )
                 run_id = cur.fetchone()[0]
@@ -765,7 +853,8 @@ class DatabaseManager:
             SELECT id, zone, start_time, end_time, config, total_arbitrage_revenue_dkk,
                    total_capacity_revenue_dkk, total_revenue_dkk, full_cycle_equivalents,
                    tick_count, created_at, label, total_afrr_activation_revenue_eur,
-                   total_capacity_revenue_eur
+                   total_capacity_revenue_eur, uncovered_periods_by_leg,
+                   activation_uncovered_periods, zero_price_periods_by_leg
             FROM bess_simulation_runs
             {where_clause}
             ORDER BY created_at DESC
@@ -793,7 +882,8 @@ class DatabaseManager:
                     SELECT id, zone, start_time, end_time, config, total_arbitrage_revenue_dkk,
                            total_capacity_revenue_dkk, total_revenue_dkk, full_cycle_equivalents,
                            tick_count, created_at, label, total_afrr_activation_revenue_eur,
-                           total_capacity_revenue_eur
+                           total_capacity_revenue_eur, uncovered_periods_by_leg,
+                           activation_uncovered_periods, zero_price_periods_by_leg
                     FROM bess_simulation_runs
                     WHERE id = %s;
                     """,
@@ -874,6 +964,13 @@ class DatabaseManager:
             "label": row[11],
             "total_afrr_activation_revenue_eur": row[12],
             "total_capacity_revenue_eur": row[13],
+            # Data coverage (init-db/09-bess-coverage-counts.sql). `None` on
+            # any run persisted before that migration -- "not recorded",
+            # which is NOT the same claim as "fully covered"; every caller
+            # must keep the two apart rather than defaulting these to 0.
+            "uncovered_periods_by_leg": row[14],
+            "activation_uncovered_periods": row[15],
+            "zero_price_periods_by_leg": row[16],
         }
 
     # --- Morning Brief (M5) persistence: forecasts, briefs, aggregates -----
