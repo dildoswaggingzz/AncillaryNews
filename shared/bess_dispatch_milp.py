@@ -483,6 +483,8 @@ def solve_cooptimized_dispatch(
     schedule_energy_series_by_market: dict[str, list[tuple[datetime, float]]] | None = None,
     schedule_capacity_series_by_leg: dict[str, list[tuple[datetime, float]]] | None = None,
     schedule_activation_price_series: list[tuple[datetime, float]] | None = None,
+    capacity_staleness_by_leg: dict[str, timedelta | None] | None = None,
+    activation_staleness: timedelta | None = None,
 ) -> BacktestResult:
     """
     Solves the single-joint-LP co-optimized dispatch (module docstring) over
@@ -523,6 +525,16 @@ def solve_cooptimized_dispatch(
     docstring's decomposition section) -- always `False` here, since the LP
     decides each leg's commitment level directly, never via a group/even
     split.
+
+    `capacity_staleness_by_leg`/`activation_staleness`: how long each series'
+    last known price stays valid (`_value_at_or_before`'s `max_staleness`,
+    normally the series' own `_native_period`). `None` -- for a leg, or for
+    the whole argument -- keeps the unbounded carry-forward every P1-P4 call
+    site had. Passing them matters most HERE, more than in the threshold
+    engine: these series feed the LP's objective, so a stale price doesn't
+    just misvalue a tick, it *steers the schedule* -- one partial day of
+    ingested activation prices, carried forward, was enough to make the LP
+    park all capacity in aFRR for the following 6.5 days.
     """
     if not price_series:
         # No day-ahead data in the window at all -- same "no data" signal
@@ -607,30 +619,53 @@ def solve_cooptimized_dispatch(
     # reported revenue, and `zero_price_periods_by_leg`, is computed from)
     # and SCHEDULE (what the LP's objective is built from, i.e. what
     # decides `cap`) are kept separate; perfect mode makes them identical.
+    # Carry-forward budget per leg -- see this function's docstring. Absent
+    # (`None`), a leg keeps the historical unbounded carry-forward.
+    staleness_by_leg: dict[str, timedelta | None] = capacity_staleness_by_leg or {}
+
     leg_settlement_price_at_t: dict[str, list[float | None]] = {
-        key: [_value_at_or_before(capacity_series_by_leg[key], t) for t in times]
+        key: [
+            _value_at_or_before(
+                capacity_series_by_leg[key], t, max_staleness=staleness_by_leg.get(key)
+            )
+            for t in times
+        ]
         for key in leg_keys
     }
     leg_schedule_price_at_t: dict[str, list[float | None]] = {
-        key: [_value_at_or_before(schedule_capacity_series_by_leg[key], t) for t in times]
+        key: [
+            _value_at_or_before(
+                schedule_capacity_series_by_leg[key], t, max_staleness=staleness_by_leg.get(key)
+            )
+            for t in times
+        ]
         for key in leg_keys
     }
 
     zero_price_periods_by_leg: dict[str, int] = defaultdict(int)
+    # "No usable price for this period" -- distinct from a real 0 clearing
+    # price above (see BacktestResult.uncovered_periods_by_leg). Counted off
+    # the SETTLEMENT prices, same as the zero count, since that's what the
+    # reported revenue is valued at.
+    uncovered_periods_by_leg: dict[str, int] = defaultdict(int)
     for key in leg_keys:
         for price in leg_settlement_price_at_t[key]:
             if price == 0.0:
                 zero_price_periods_by_leg[key] += 1
+            elif price is None:
+                uncovered_periods_by_leg[key] += 1
 
     up_legs = [k for k in leg_keys if leg_direction[k] in ("up", "symmetric")]
     down_legs = [k for k in leg_keys if leg_direction[k] in ("down", "symmetric")]
     aFRR_capacity_legs = [k for k in leg_keys if k.split(":", 1)[0] == "aFRR_capacity"]
 
     activation_settlement_price_at_t = [
-        _value_at_or_before(activation_price_series, t) for t in times
+        _value_at_or_before(activation_price_series, t, max_staleness=activation_staleness)
+        for t in times
     ]
     activation_schedule_price_at_t = [
-        _value_at_or_before(schedule_activation_price_series, t) for t in times
+        _value_at_or_before(schedule_activation_price_series, t, max_staleness=activation_staleness)
+        for t in times
     ]
 
     # ---------------------------------------------------------------
@@ -797,6 +832,15 @@ def solve_cooptimized_dispatch(
     cumulative_capacity_dkk = 0.0
     cumulative_capacity_eur = 0.0
     cumulative_afrr_activation = 0.0
+    # Data coverage, not a commitment tally -- see the twin comment in
+    # shared/bess_simulator.py: gated on commitment this would read zero for
+    # exactly the windows with no activation data, since the LP correctly
+    # declines to commit where it sees no price.
+    activation_uncovered_periods = (
+        sum(1 for price in activation_settlement_price_at_t if price is None)
+        if aFRR_capacity_legs
+        else 0
+    )
 
     for i in range(T):
         ch_i = sum(ch_star[m][i] for m in energy_markets)
@@ -887,5 +931,7 @@ def solve_cooptimized_dispatch(
         config=config,
         ticks=ticks,
         zero_price_periods_by_leg=dict(zero_price_periods_by_leg),
+        uncovered_periods_by_leg=dict(uncovered_periods_by_leg),
+        activation_uncovered_periods=activation_uncovered_periods,
         capacity_allocation_fell_back_to_even=False,
     )

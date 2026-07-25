@@ -455,6 +455,24 @@ class BacktestResult:
     # with no context on whether that's typical or an anomaly. Keyed the
     # same way as capacity_revenue_by_market ("{market}:{product}").
     zero_price_periods_by_leg: dict[str, int] = field(default_factory=dict)
+    # How many periods each capacity leg had NO usable price for -- either
+    # no data at all, or data too stale to still cover the period
+    # (`_value_at_or_before`'s `max_staleness`). The strict counterpart to
+    # `zero_price_periods_by_leg` above: that one is "the market really
+    # cleared at 0", this one is "we don't know what it cleared at, and
+    # booked 0 revenue because of it". A backtest whose window outruns its
+    # data used to be indistinguishable from one that genuinely earned
+    # nothing -- worse, before the staleness bound it silently kept
+    # *earning* at the last known price. Keyed like
+    # capacity_revenue_by_market ("{market}:{product}").
+    uncovered_periods_by_leg: dict[str, int] = field(default_factory=dict)
+    # Same, for the aFRR energy activation price series: periods with no
+    # in-date activation price, whenever `aFRR_capacity` is configured at
+    # all. Counted separately because activation is not a capacity leg --
+    # it's the energy called off one (module docstring §3) -- and counted
+    # over every period rather than only committed ones, so it stays a
+    # statement about the DATA (see where it's incremented).
+    activation_uncovered_periods: int = 0
     # True if "price_ranked" capacity_allocation (BessConfig) ever had to
     # fall back to an even split because every configured group's trailing
     # price was 0 at some tick -- most commonly the backtest's very first
@@ -584,7 +602,30 @@ def _causal_zscore(history: list[float], current: float) -> float | None:
     return (current - mean) / stdev
 
 
-def _value_at_or_before(sorted_series: list[tuple[datetime, float]], t: datetime) -> float | None:
+def _native_period(sorted_series: list[tuple[datetime, float]]) -> timedelta | None:
+    """
+    The series' own sampling period: the median gap between consecutive
+    points (median, not mean, so a single DST jump or ingest gap doesn't
+    stretch it). `None` for a series with fewer than two points, which has
+    no observable cadence.
+
+    Used as the carry-forward budget for `_value_at_or_before` — an hourly
+    price legitimately covers its own hour, and nothing beyond it.
+    """
+    if len(sorted_series) < 2:
+        return None
+    gaps = [
+        (sorted_series[i + 1][0] - sorted_series[i][0]).total_seconds()
+        for i in range(len(sorted_series) - 1)
+    ]
+    return timedelta(seconds=statistics.median(gaps))
+
+
+def _value_at_or_before(
+    sorted_series: list[tuple[datetime, float]],
+    t: datetime,
+    max_staleness: timedelta | None = None,
+) -> float | None:
     """
     Returns the value of the last entry in `sorted_series` (ascending by
     time) whose time is <= t, or None if no such entry exists. `FCR`/
@@ -592,12 +633,30 @@ def _value_at_or_before(sorted_series: list[tuple[datetime, float]], t: datetime
     finer (e.g. 15-minute day-ahead MTUs), so a capacity price is carried
     forward to every arbitrage tick within its period rather than requiring
     an exact timestamp match.
+
+    `max_staleness` bounds that carry-forward: a match older than
+    `t - max_staleness` is treated as no data (`None`) rather than a price.
+    Callers pass the series' own `_native_period`, so a price covers its own
+    period and stops there. **Unbounded carry-forward is what this
+    parameter exists to prevent**: a series that ends mid-window otherwise
+    keeps paying at its last known price forever — one partial day of
+    ingested aFRR activation prices was carried across the following 6.5
+    days of a June backtest, inventing ~244k DKK of activation revenue and
+    pulling the co-optimizer's capacity commitment along with it. Left
+    `None` (the default) the old unbounded behaviour is preserved, for
+    callers with a series they know spans the window.
     """
     result = None
+    # Strict: a point covers `[time, time + max_staleness)`, so a price
+    # exactly one period old has already been superseded -- by the next
+    # point if there is one, by nothing if the series has ended. An
+    # inclusive bound would let each point cover its successor's first
+    # instant too.
+    cutoff = t - max_staleness if max_staleness is not None else None
     for time, value in sorted_series:
         if time > t:
             break
-        result = value
+        result = None if (cutoff is not None and time <= cutoff) else value
     return result
 
 
@@ -766,15 +825,60 @@ def _fetch_series(
     within [start_time, end_time], ascending by time, nulls dropped. Real
     Energinet data has plenty of per-record nulls (shared/datasets.py) so
     every caller of this helper must tolerate a short or empty result.
+
+    Fetched with `limit=None` — the whole window, never a page of it. The
+    previous `limit=100000` looked generous but combines with
+    `fetch_series_values`' `time DESC` ordering to keep only the *newest*
+    rows: for `aFRR_energy` (~86k rows/day) that quietly reduced a 30-day
+    window to its last ~1.16 days, and a backtest cannot tell a truncated
+    series from a genuinely short one.
     """
     if market in EXCLUDED_MARKETS:
         raise ValueError(f"market {market!r} is not eligible for BESS participation")
     rows = db.fetch_series_values(
-        market, zone, product, limit=100000, time_from=start_time, time_to=end_time, history=False
+        market, zone, product, limit=None, time_from=start_time, time_to=end_time, history=False
     )
     series = [(r["time"], r["value"]) for r in rows if r["value"] is not None]
     series.sort(key=lambda r: r[0])
     return series
+
+
+def _fetch_period_mean_series(
+    db: DatabaseManager,
+    market: str,
+    zone: str,
+    product: str,
+    period: timedelta,
+    start_time: datetime,
+    end_time: datetime,
+) -> list[tuple[datetime, float]]:
+    """
+    Same contract as `_fetch_series` — ascending `(time, value)` pairs — but
+    each point is the **mean over one `period`-wide bucket** rather than a
+    raw sample, via `DatabaseManager.fetch_series_period_means`.
+
+    For a series published far finer than the tick cadence, this is the
+    honest reduction. `aFRR_energy`'s activation price arrives ~1/second; a
+    15-minute tick point-sampled off it (`_value_at_or_before`) is valued at
+    one arbitrary second out of 900, on one of the most volatile series in
+    the set. Revenue over the tick integrates the price across the tick, so
+    the bucket mean is what belongs there.
+
+    Capacity prices (`FCR`, `aFRR_capacity`) stay on `_fetch_series`: they
+    are *coarser* than the tick, and carrying an hourly clearing price into
+    its own quarter-hours is correct, not an approximation.
+    """
+    if market in EXCLUDED_MARKETS:
+        raise ValueError(f"market {market!r} is not eligible for BESS participation")
+    rows = db.fetch_series_period_means(
+        market,
+        zone,
+        product,
+        bucket_seconds=period.total_seconds(),
+        time_from=start_time,
+        time_to=end_time,
+    )
+    return [(r["time"], r["value"]) for r in rows]
 
 
 def run_backtest(
@@ -817,6 +921,13 @@ def run_backtest(
     price_series = _fetch_series(
         db, config.price_market, zone, config.price_product, start_time, end_time
     )
+    # The driving price series sets the tick cadence, so its own sampling
+    # period is the bucket width any finer-grained series gets reduced to
+    # (`_fetch_period_mean_series`) -- 15 minutes for day-ahead MTUs, an
+    # hour for an hourly window. Falls back to one hour when the window is
+    # too short to observe a cadence (<2 price points), which is also the
+    # only case where the tick loop's own `dt_hours` falls back to 1.0.
+    tick_period = _native_period(price_series) or timedelta(hours=1)
 
     # Two-level split: distinct market groups (the `market` half of each
     # `capacity_markets` tuple) first, then each group's legs (products) --
@@ -849,11 +960,29 @@ def run_backtest(
     # if "aFRR_capacity" is actually a configured group (module docstring
     # §3); otherwise activation revenue is always 0 and there's no reason to
     # query it.
+    #
+    # Reduced to per-tick MEANS in SQL, unlike every other series here: it
+    # is published ~1/second, orders of magnitude finer than the tick, so
+    # point-sampling it would value a whole quarter-hour at one second of a
+    # volatile price, and pulling ~5M raw rows per month into Python to do
+    # so would be the expensive way to get that wrong. See
+    # `_fetch_period_mean_series`.
     activation_price_series: list[tuple[datetime, float]] = (
-        _fetch_series(db, "aFRR_energy", zone, "activation_price", start_time, end_time)
+        _fetch_period_mean_series(
+            db, "aFRR_energy", zone, "activation_price", tick_period, start_time, end_time
+        )
         if "aFRR_capacity" in legs_by_group
         else []
     )
+    # Carry-forward budgets, one per series (`_value_at_or_before`'s
+    # `max_staleness`): a price covers its own native period and no longer,
+    # so a leg whose data stops mid-window stops paying instead of coasting
+    # on a stale figure. Bucketed to the tick, the activation series' budget
+    # is one tick.
+    capacity_staleness_by_leg = {
+        key: _native_period(series) for key, series in capacity_series_by_leg.items()
+    }
+    activation_staleness = _native_period(activation_price_series)
 
     if config.strategy == "cooptimized":
         # Energy markets (P3 multi-market, P4 single joint LP -- docs/
@@ -953,6 +1082,8 @@ def run_backtest(
             schedule_energy_series_by_market=schedule_energy_series_by_market,
             schedule_capacity_series_by_leg=schedule_capacity_series_by_leg,
             schedule_activation_price_series=schedule_activation_price_series,
+            capacity_staleness_by_leg=capacity_staleness_by_leg,
+            activation_staleness=activation_staleness,
         )
 
     soc_min = config.soc_min_fraction * config.capacity_mwh
@@ -998,6 +1129,8 @@ def run_backtest(
     ticks: list[BessTick] = []
     history: list[float] = []
     zero_price_periods_by_leg: dict[str, int] = defaultdict(int)
+    uncovered_periods_by_leg: dict[str, int] = defaultdict(int)
+    activation_uncovered_periods = 0
     capacity_allocation_fell_back_to_even = False
 
     # Rolling 24-hour discharge window for the cycle cap (see BessConfig's
@@ -1065,9 +1198,12 @@ def run_backtest(
                 for m, product in legs:
                     key = f"{m}:{product}"
                     series = capacity_series_by_leg[key]
-                    clearing_price = _value_at_or_before(series, t)
+                    clearing_price = _value_at_or_before(
+                        series, t, max_staleness=capacity_staleness_by_leg.get(key)
+                    )
                     if clearing_price is None:
                         capacity_revenue_by_market[key] = 0.0
+                        uncovered_periods_by_leg[key] += 1
                         continue
                     if clearing_price == 0.0:
                         zero_price_periods_by_leg[key] += 1
@@ -1092,9 +1228,21 @@ def run_backtest(
         # --- aFRR energy activation revenue (module docstring §3, always EUR,
         # never mixed into the DKK/EUR capacity buckets above) ---
         afrr_committed_mw = commit_per_group_this_tick.get("aFRR_capacity", 0.0)
-        activation_price = (
-            _value_at_or_before(activation_price_series, t) if afrr_committed_mw else None
+        # Resolved for every tick, not just committed ones: the count below
+        # is a statement about DATA COVERAGE, not about this run's
+        # commitment decisions. Gating it on `afrr_committed_mw` would make
+        # it vanish in exactly the case it exists to expose -- once the
+        # staleness bound stops a dead series from pricing, the LP stops
+        # committing, and a commitment-gated counter would then report zero
+        # uncovered periods for a window with no activation data at all.
+        activation_price_available = (
+            _value_at_or_before(activation_price_series, t, max_staleness=activation_staleness)
+            if legs_by_group.get("aFRR_capacity")
+            else None
         )
+        if legs_by_group.get("aFRR_capacity") and activation_price_available is None:
+            activation_uncovered_periods += 1
+        activation_price = activation_price_available if afrr_committed_mw else None
         afrr_activation_revenue = (
             activation_price
             * afrr_committed_mw
@@ -1187,5 +1335,7 @@ def run_backtest(
         config=config,
         ticks=ticks,
         zero_price_periods_by_leg=dict(zero_price_periods_by_leg),
+        uncovered_periods_by_leg=dict(uncovered_periods_by_leg),
+        activation_uncovered_periods=activation_uncovered_periods,
         capacity_allocation_fell_back_to_even=capacity_allocation_fell_back_to_even,
     )

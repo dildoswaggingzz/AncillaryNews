@@ -7,6 +7,12 @@
   (<code>shared/bess_simulator.py</code>). Both revenue streams shown are <strong>estimates</strong>,
   not a real co-optimized dispatch — see the run detail page for exactly what's simplified.
 </p>
+<p class="muted">
+  <strong>All-in revenue</strong> is every stream at the fixed peg ({{ "%.2f"|format(dkk_per_eur) }}
+  DKK/EUR) — the only column two runs can be compared on. The <strong>DKK-leg subtotal</strong>
+  next to it is arbitrage + capacity <em>DKK legs only</em>; for a DK2 run that leaves out FCR and
+  aFRR activation, which are EUR-denominated and usually the larger half of the revenue.
+</p>
 <p><a href="/dashboard/bess/new">Run a new backtest &rarr;</a></p>
 
 {% if not runs %}
@@ -17,8 +23,9 @@
 <table>
   <tr>
     <th>Run</th><th>Zone</th><th>Strategy</th><th>Foresight</th><th>Period</th>
+    <th>All-in revenue (DKK-equiv.)</th>
     <th>Arbitrage revenue (DKK)</th>
-    <th>Capacity revenue (DKK)</th><th>Total revenue (DKK)</th><th>Full cycle equivalents</th>
+    <th>Capacity revenue (DKK)</th><th>DKK-leg subtotal</th><th>Full cycle equivalents</th>
     <th>Capacity revenue (EUR)</th>
     <th>aFRR activation revenue (EUR)</th>
     <th>Created</th>
@@ -30,6 +37,7 @@
     <td>{{ run.config.get('strategy', 'threshold') }}</td>
     <td>{{ run.config.get('foresight', 'perfect') }}</td>
     <td>{{ run.start_time }} &rarr; {{ run.end_time }}</td>
+    <td><strong>{{ "%.2f"|format(all_in_dkk[run.id]) }}</strong></td>
     <td>{{ "%.2f"|format(run.total_arbitrage_revenue_dkk) }}</td>
     <td>{{ "%.2f"|format(run.total_capacity_revenue_dkk) }}</td>
     <td>{{ "%.2f"|format(run.total_revenue_dkk) }}</td>

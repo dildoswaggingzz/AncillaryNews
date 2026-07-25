@@ -703,6 +703,22 @@ def test_dashboard_bess_list_shows_strategy_and_foresight_columns(client, db):
     assert "forecast" in resp.text
 
 
+def test_dashboard_bess_list_shows_an_all_in_total_including_the_eur_legs(client, db):
+    """`total_revenue_dkk` is the DKK legs only -- for a DK2 run that
+    excludes FCR and aFRR activation, both EUR-denominated and usually the
+    larger half. Two runs are only comparable on an all-in figure (BESS runs
+    77/82 looked 2% apart on the DKK column and 61% apart all-in)."""
+    db.fetch_bess_runs.return_value = [BESS_RUN_ROW]
+
+    resp = client.get("/dashboard/bess")
+
+    expected = 120.5 + 60.0 + (8.0 + 25.0) * DKK_PER_EUR
+    assert resp.status_code == 200
+    assert f"{expected:.2f}" in resp.text
+    # ...and the DKK-only subtotal is no longer labelled as the total.
+    assert "DKK-leg subtotal" in resp.text
+
+
 def test_dashboard_bess_list_falls_back_to_threshold_perfect_for_old_runs(client, db):
     # BESS_RUN_ROW's config predates strategy/foresight fields entirely.
     db.fetch_bess_runs.return_value = [BESS_RUN_ROW]

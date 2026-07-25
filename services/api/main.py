@@ -408,6 +408,17 @@ def _run_and_save_bess_backtest(
         # so only available here, on the freshly-computed result, not on a
         # later re-fetch of this run_id.
         "zero_price_periods_by_leg": result.zero_price_periods_by_leg,
+        # Periods with NO usable price (missing, or too stale to still cover
+        # the period) rather than a real 0 -- see
+        # BacktestResult.uncovered_periods_by_leg. A run reporting a low
+        # capacity or activation number is only interpretable alongside
+        # these: "earned little" and "had no data to earn against" are
+        # different findings, and before the staleness bound existed the
+        # second one silently masqueraded as the first (or, worse, kept
+        # earning at a stale price). Same non-persistence caveat as
+        # `zero_price_periods_by_leg` above.
+        "uncovered_periods_by_leg": result.uncovered_periods_by_leg,
+        "activation_uncovered_periods": result.activation_uncovered_periods,
         "capacity_allocation_fell_back_to_even": result.capacity_allocation_fell_back_to_even,
     }
 
@@ -985,11 +996,44 @@ async def dashboard_recent_manual_claims(
 # --- BESS backtest dashboard ------------------------------------------------
 
 
+def _run_all_in_dkk(run: dict) -> float:
+    """
+    One comparable number per run: every revenue stream in the persisted
+    header, EUR legs converted at the fixed peg (`shared/units.py`).
+
+    The list page can't reuse the detail page's `_revenue_streams_for_run`
+    (that walks a run's ticks; this renders 25 run headers), so it sums the
+    stored totals instead -- the same four streams, same peg, just from the
+    header columns.
+
+    Exists because `total_revenue_dkk` is arbitrage + capacity **DKK legs
+    only**, which for a DK2 run silently excludes FCR and aFRR activation --
+    both EUR-denominated, and in practice the two largest streams. Scanning
+    the list on that column ranks runs by a minority of their revenue and
+    makes two runs look far apart when their all-in totals are close (or
+    vice versa).
+    """
+    return (
+        run["total_arbitrage_revenue_dkk"]
+        + run["total_capacity_revenue_dkk"]
+        + (
+            run.get("total_capacity_revenue_eur", 0.0)
+            + run.get("total_afrr_activation_revenue_eur", 0.0)
+        )
+        * DKK_PER_EUR
+    )
+
+
 @app.get("/dashboard/bess", response_class=HTMLResponse)
 def dashboard_bess_list(request: Request, db: DatabaseManager = Depends(get_db)):
     """Lists recent BESS backtest runs, linking to each one's detail page."""
     runs = db.fetch_bess_runs(limit=25)
-    return templates.TemplateResponse(request, "bess_list.html", {"runs": runs})
+    all_in_dkk = {run["id"]: _run_all_in_dkk(run) for run in runs}
+    return templates.TemplateResponse(
+        request,
+        "bess_list.html",
+        {"runs": runs, "all_in_dkk": all_in_dkk, "dkk_per_eur": DKK_PER_EUR},
+    )
 
 
 # P5: the dashboard form's own pre-filled defaults default to the
