@@ -1,4 +1,6 @@
 import importlib.util
+import threading
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -1442,23 +1444,46 @@ def test_trigger_crawler_run_now_gated_by_api_key(client, monkeypatch, crawler_m
     crawler_main_mock.run_crawl_cycle.assert_not_awaited()
 
 
-def test_dashboard_trigger_orchestrator_run_now_renders_summary(
+def _wait_for_background_job(name, timeout=5.0):
+    """Polls until the named background job leaves the 'running' state (it runs
+    in a worker thread, so it may not be done the instant the POST returns)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        job = api_main.get_background_job(name)
+        if job and job["status"] != "running":
+            return job
+        time.sleep(0.02)
+    raise AssertionError(f"background job {name!r} did not finish within {timeout}s")
+
+
+def test_dashboard_trigger_orchestrator_run_now_runs_in_background_and_shows_summary(
     client, db, monkeypatch, orchestrator_main_mock
 ):
     monkeypatch.delenv("API_KEY", raising=False)
     db.fetch_event_reports.return_value = []
+    api_main._background_jobs.clear()
     api_main.app.dependency_overrides[api_main.get_orchestrator_main] = lambda: (
         orchestrator_main_mock
     )
     try:
-        resp = client.post("/dashboard/orchestrator/run-now")
+        # The button fires the cycle as a background job and redirects home
+        # instead of blocking the response until the cycle finishes.
+        resp = client.post("/dashboard/orchestrator/run-now", follow_redirects=False)
+        assert resp.status_code == 303
+        assert resp.headers["location"] == "/"
+
+        job = _wait_for_background_job("orchestrator")
+        assert job["status"] == "done"
+        orchestrator_main_mock.run_synthesis_cycle.assert_awaited_once()
+
+        # Once the job is done, the home page shows its summary.
+        home = client.get("/")
     finally:
         del api_main.app.dependency_overrides[api_main.get_orchestrator_main]
 
-    assert resp.status_code == 200
-    assert "3 trigger(s) fired" in resp.text
-    assert "1 Event Report(s) published" in resp.text
-    orchestrator_main_mock.run_synthesis_cycle.assert_awaited_once()
+    assert home.status_code == 200
+    assert "3 trigger(s) fired" in home.text
+    assert "1 Event Report(s) published" in home.text
 
 
 def test_dashboard_trigger_orchestrator_run_now_stays_open_regardless_of_api_key(
@@ -1466,33 +1491,74 @@ def test_dashboard_trigger_orchestrator_run_now_stays_open_regardless_of_api_key
 ):
     monkeypatch.setenv("API_KEY", "s3cret")
     db.fetch_event_reports.return_value = []
+    api_main._background_jobs.clear()
     api_main.app.dependency_overrides[api_main.get_orchestrator_main] = lambda: (
         orchestrator_main_mock
     )
     try:
-        resp = client.post("/dashboard/orchestrator/run-now")
+        resp = client.post("/dashboard/orchestrator/run-now", follow_redirects=False)
+        assert resp.status_code == 303
+        _wait_for_background_job("orchestrator")
     finally:
         del api_main.app.dependency_overrides[api_main.get_orchestrator_main]
 
-    assert resp.status_code == 200
     orchestrator_main_mock.run_synthesis_cycle.assert_awaited_once()
 
 
-def test_dashboard_trigger_crawler_run_now_renders_summary(
+def test_dashboard_trigger_orchestrator_run_now_ignores_double_click(
+    client, db, monkeypatch, orchestrator_main_mock
+):
+    monkeypatch.delenv("API_KEY", raising=False)
+    db.fetch_event_reports.return_value = []
+    api_main._background_jobs.clear()
+
+    # A cycle already running: a second click must not launch a competing run.
+    gate = threading.Event()
+
+    async def _blocking_cycle():
+        gate.wait(timeout=5.0)
+        return {"triggers_fired": 0, "reports_published": 0}
+
+    orchestrator_main_mock.run_synthesis_cycle = AsyncMock(side_effect=_blocking_cycle)
+    api_main.app.dependency_overrides[api_main.get_orchestrator_main] = lambda: (
+        orchestrator_main_mock
+    )
+    try:
+        first = client.post("/dashboard/orchestrator/run-now", follow_redirects=False)
+        second = client.post("/dashboard/orchestrator/run-now", follow_redirects=False)
+        assert first.status_code == 303
+        assert second.status_code == 303
+        gate.set()
+        _wait_for_background_job("orchestrator")
+    finally:
+        del api_main.app.dependency_overrides[api_main.get_orchestrator_main]
+
+    assert orchestrator_main_mock.run_synthesis_cycle.await_count == 1
+
+
+def test_dashboard_trigger_crawler_run_now_runs_in_background_and_shows_summary(
     client, db, monkeypatch, crawler_main_mock
 ):
     monkeypatch.delenv("API_KEY", raising=False)
     db.fetch_event_reports.return_value = []
+    api_main._background_jobs.clear()
     api_main.app.dependency_overrides[api_main.get_crawler_main] = lambda: crawler_main_mock
     try:
-        resp = client.post("/dashboard/crawler/run-now")
+        resp = client.post("/dashboard/crawler/run-now", follow_redirects=False)
+        assert resp.status_code == 303
+        assert resp.headers["location"] == "/"
+
+        job = _wait_for_background_job("crawler")
+        assert job["status"] == "done"
+        crawler_main_mock.run_crawl_cycle.assert_awaited_once()
+
+        home = client.get("/")
     finally:
         del api_main.app.dependency_overrides[api_main.get_crawler_main]
 
-    assert resp.status_code == 200
-    assert "5 article(s) processed" in resp.text
-    assert "12 claim(s) extracted" in resp.text
-    crawler_main_mock.run_crawl_cycle.assert_awaited_once()
+    assert home.status_code == 200
+    assert "5 article(s) processed" in home.text
+    assert "12 claim(s) extracted" in home.text
 
 
 def test_dashboard_home_run_now_buttons_present(client, db):
@@ -2254,21 +2320,32 @@ def test_dashboard_morning_brief_detail_not_found(client, db):
     assert resp.status_code == 404
 
 
-def test_dashboard_trigger_morning_brief_run_now_redirects_to_detail(
+def test_dashboard_trigger_morning_brief_run_now_runs_in_background_and_links_to_brief(
     client, db, monkeypatch, morning_brief_orchestrator_mock
 ):
     monkeypatch.delenv("API_KEY", raising=False)
+    db.fetch_event_reports.return_value = []
+    api_main._background_jobs.clear()
     api_main.app.dependency_overrides[api_main.get_orchestrator_main] = lambda: (
         morning_brief_orchestrator_mock
     )
     try:
         resp = client.post("/dashboard/morning-briefs/run-now", follow_redirects=False)
+        assert resp.status_code == 303
+        assert resp.headers["location"] == "/"
+
+        job = _wait_for_background_job("morning_brief")
+        assert job["status"] == "done"
+        morning_brief_orchestrator_mock.run_morning_brief.assert_awaited_once()
+
+        # Once done, the home page's panel links through to the new brief.
+        home = client.get("/")
     finally:
         del api_main.app.dependency_overrides[api_main.get_orchestrator_main]
 
-    assert resp.status_code == 303
-    assert resp.headers["location"] == "/dashboard/morning-briefs/1"
-    morning_brief_orchestrator_mock.run_morning_brief.assert_awaited_once()
+    assert home.status_code == 200
+    assert "/dashboard/morning-briefs/1" in home.text
+    assert "4 BESS estimate(s)" in home.text
 
 
 def test_dashboard_home_shows_morning_brief_run_now_button(client, db):
