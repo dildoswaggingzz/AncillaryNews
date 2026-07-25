@@ -996,6 +996,42 @@ async def dashboard_recent_manual_claims(
 # --- BESS backtest dashboard ------------------------------------------------
 
 
+def _coverage_for_run(run: dict) -> dict:
+    """
+    The run's data-coverage counts, shaped for the detail template:
+    `{"recorded": bool, "uncovered": [(leg, n)], "zero_priced": [(leg, n)]}`,
+    each list sorted worst-first and carrying only non-zero entries.
+
+    `recorded` is False for runs persisted before
+    init-db/09-bess-coverage-counts.sql, whose columns are NULL. That is
+    "unknown", not "fully covered" -- and those are exactly the runs whose
+    coverage is in question, since they also predate the staleness bound
+    that stopped a dead series from paying at its last known price. Folding
+    NULL into 0 here would quietly assert the opposite of what's known about
+    them.
+    """
+    uncovered = run.get("uncovered_periods_by_leg")
+    zero_priced = run.get("zero_price_periods_by_leg")
+    activation_uncovered = run.get("activation_uncovered_periods")
+    if uncovered is None and zero_priced is None and activation_uncovered is None:
+        return {"recorded": False, "uncovered": [], "zero_priced": []}
+
+    uncovered_legs = dict(uncovered or {})
+    if activation_uncovered:
+        # Activation isn't a capacity leg (it's the energy called off one),
+        # but for "what had no price behind it" it reads as another row.
+        uncovered_legs["aFRR_energy:activation_price"] = activation_uncovered
+
+    def _ranked(counts: dict) -> list[tuple[str, int]]:
+        return sorted(((leg, n) for leg, n in counts.items() if n), key=lambda kv: -kv[1])
+
+    return {
+        "recorded": True,
+        "uncovered": _ranked(uncovered_legs),
+        "zero_priced": _ranked(zero_priced or {}),
+    }
+
+
 def _run_all_in_dkk(run: dict) -> float:
     """
     One comparable number per run: every revenue stream in the persisted
@@ -1179,6 +1215,7 @@ def dashboard_bess_detail(request: Request, run_id: int, db: DatabaseManager = D
             "ticks": ticks,
             "streams": streams,
             "unpriced_legs": unpriced,
+            "coverage": _coverage_for_run(run),
             "dkk_per_eur": DKK_PER_EUR,
         },
     )

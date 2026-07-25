@@ -71,6 +71,10 @@ EXPECTED_SCHEMA_COLUMNS: tuple[tuple[str, str], ...] = (
     ("bess_simulation_runs", "total_capacity_revenue_eur"),
     ("bess_simulation_ticks", "capacity_revenue_eur"),
     ("bess_simulation_ticks", "cumulative_capacity_revenue_eur"),
+    # init-db/09-bess-coverage-counts.sql
+    ("bess_simulation_runs", "uncovered_periods_by_leg"),
+    ("bess_simulation_runs", "activation_uncovered_periods"),
+    ("bess_simulation_runs", "zero_price_periods_by_leg"),
 )
 
 
@@ -757,8 +761,9 @@ class DatabaseManager:
                         (zone, start_time, end_time, config, total_arbitrage_revenue_dkk,
                          total_capacity_revenue_dkk, total_revenue_dkk, full_cycle_equivalents,
                          tick_count, label, total_afrr_activation_revenue_eur,
-                         total_capacity_revenue_eur)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                         total_capacity_revenue_eur, uncovered_periods_by_leg,
+                         activation_uncovered_periods, zero_price_periods_by_leg)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id;
                     """,
                     (
@@ -774,6 +779,11 @@ class DatabaseManager:
                         label,
                         result.total_afrr_activation_revenue_eur,
                         result.total_capacity_revenue_eur,
+                        # Data-coverage counts (init-db/09-bess-coverage-counts.sql):
+                        # what the run had prices for, alongside what it earned.
+                        Json(result.uncovered_periods_by_leg),
+                        result.activation_uncovered_periods,
+                        Json(result.zero_price_periods_by_leg),
                     ),
                 )
                 run_id = cur.fetchone()[0]
@@ -843,7 +853,8 @@ class DatabaseManager:
             SELECT id, zone, start_time, end_time, config, total_arbitrage_revenue_dkk,
                    total_capacity_revenue_dkk, total_revenue_dkk, full_cycle_equivalents,
                    tick_count, created_at, label, total_afrr_activation_revenue_eur,
-                   total_capacity_revenue_eur
+                   total_capacity_revenue_eur, uncovered_periods_by_leg,
+                   activation_uncovered_periods, zero_price_periods_by_leg
             FROM bess_simulation_runs
             {where_clause}
             ORDER BY created_at DESC
@@ -871,7 +882,8 @@ class DatabaseManager:
                     SELECT id, zone, start_time, end_time, config, total_arbitrage_revenue_dkk,
                            total_capacity_revenue_dkk, total_revenue_dkk, full_cycle_equivalents,
                            tick_count, created_at, label, total_afrr_activation_revenue_eur,
-                           total_capacity_revenue_eur
+                           total_capacity_revenue_eur, uncovered_periods_by_leg,
+                           activation_uncovered_periods, zero_price_periods_by_leg
                     FROM bess_simulation_runs
                     WHERE id = %s;
                     """,
@@ -952,6 +964,13 @@ class DatabaseManager:
             "label": row[11],
             "total_afrr_activation_revenue_eur": row[12],
             "total_capacity_revenue_eur": row[13],
+            # Data coverage (init-db/09-bess-coverage-counts.sql). `None` on
+            # any run persisted before that migration -- "not recorded",
+            # which is NOT the same claim as "fully covered"; every caller
+            # must keep the two apart rather than defaulting these to 0.
+            "uncovered_periods_by_leg": row[14],
+            "activation_uncovered_periods": row[15],
+            "zero_price_periods_by_leg": row[16],
         }
 
     # --- Morning Brief (M5) persistence: forecasts, briefs, aggregates -----

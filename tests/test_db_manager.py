@@ -897,6 +897,9 @@ def test_fetch_bess_runs_returns_mapped_rows(db, pooled_conn):
             None,
             25.0,
             10.0,
+            {"FCR:price": 4},
+            7,
+            {"FFR:price": 720},
         )
     ]
     conn.cursor.return_value.__enter__.return_value = cursor
@@ -933,6 +936,9 @@ def test_fetch_bess_runs_decodes_json_string_config(db, pooled_conn):
             "morning_brief",
             0.0,
             0.0,
+            None,
+            None,
+            None,
         )
     ]
     conn.cursor.return_value.__enter__.return_value = cursor
@@ -941,6 +947,10 @@ def test_fetch_bess_runs_decodes_json_string_config(db, pooled_conn):
 
     assert result[0]["config"] == {"power_mw": 1.0}
     assert result[0]["label"] == "morning_brief"
+    # Pre-migration run: coverage unknown, and it must stay distinguishable
+    # from a run that recorded zero uncovered periods.
+    assert result[0]["uncovered_periods_by_leg"] is None
+    assert result[0]["activation_uncovered_periods"] is None
 
 
 def test_fetch_bess_run_returns_none_when_absent(db, pooled_conn):
@@ -1349,9 +1359,43 @@ def test_save_bess_run_persists_label(db, pooled_conn):
 
     assert run_id == 9
     insert_run_call = cursor.execute.call_args_list[0]
-    # label is third-to-last (total_afrr_activation_revenue_eur,
-    # total_capacity_revenue_eur follow it, in that order).
-    assert insert_run_call.args[1][-3] == "morning_brief"
+    query, params = insert_run_call.args
+    # Positional params, so match `label` against its own column's index in
+    # the INSERT's column list rather than counting from either end (which
+    # every new trailing column silently invalidates).
+    columns = [c.strip() for c in query.split("(", 1)[1].split(")", 1)[0].split(",")]
+    assert params[columns.index("label")] == "morning_brief"
+
+
+def test_save_bess_run_persists_coverage_counts(db, pooled_conn):
+    """A stored run's revenue is only interpretable next to how much of its
+    window had prices behind it (init-db/09-bess-coverage-counts.sql)."""
+    from shared.bess_simulator import BacktestResult, BessConfig
+
+    conn, mock_pool = pooled_conn
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (9,)
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    result = BacktestResult(
+        zone="DK2",
+        start_time=datetime(2026, 6, 1, tzinfo=UTC),
+        end_time=datetime(2026, 6, 30, tzinfo=UTC),
+        config=BessConfig(),
+        ticks=[],
+        uncovered_periods_by_leg={"aFRR_capacity:up": 96},
+        activation_uncovered_periods=28,
+        zero_price_periods_by_leg={"FFR:price": 720},
+    )
+
+    with patch("shared.db_manager.execute_values"):
+        db.save_bess_run(result)
+
+    query, params = cursor.execute.call_args_list[0].args
+    columns = [c.strip() for c in query.split("(", 1)[1].split(")", 1)[0].split(",")]
+    assert params[columns.index("uncovered_periods_by_leg")].adapted == {"aFRR_capacity:up": 96}
+    assert params[columns.index("activation_uncovered_periods")] == 28
+    assert params[columns.index("zero_price_periods_by_leg")].adapted == {"FFR:price": 720}
 
 
 # --- Morning Brief (M5) persistence -------------------------------------------
