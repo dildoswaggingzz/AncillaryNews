@@ -30,3 +30,7 @@ htmlcov/
 
 # Claude Code (local-only settings; agent definitions in .claude/agents are tracked)
 .claude/settings.local.json
+
+# Local scratch space for one-off analysis output (generated reports, plots).
+# Real results belong in docs/*-results.md, not here.
+scratchpad/
