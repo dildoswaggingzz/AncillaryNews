@@ -41,7 +41,11 @@ rather than silently mislabeled — a shipped series left at `"unknown"` is a
 bug, caught by `tests/test_units.py`.
 """
 
+import logging
+import re
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -165,6 +169,48 @@ class DatasetConfig:
     # value only means slightly more/fewer chunks, never data loss (backfill
     # fetches with `limit=0` = all records, so it cannot truncate).
     records_per_day: int | None = None
+    # Energinet's own declared publication cadence for this dataset, copied
+    # verbatim from `meta/dataset/{dataset_id}`'s `updateFrequency` (e.g.
+    # "P1D", "P0.5D", "PT6H", "PT15M"). Read by
+    # `services/ingestor/main.py` to decide how often to actually poll this
+    # dataset -- see `parse_update_frequency_seconds` below and that
+    # module's `poll_interval_seconds`.
+    #
+    # **Why this field exists (a second live 429 bug, 2026-07-28).** The
+    # Energi Data Service API guide states the rate limit is per-dataset and
+    # keyed to each dataset's own update frequency ("1 request per Update
+    # Frequency") -- the same per-dataset accounting `records_per_day` above
+    # exists to work around on the backfill side. The live poller had no
+    # equivalent: it polled every dataset at one flat 15-minute cycle, i.e.
+    # 96 requests/day against `fcr_dk1`, whose `updateFrequency` is `P1D`
+    # and whose own `meta/dataset` comment says "making a request every five
+    # minutes or so between 9:00 and 10:30 CET is sufficient". That ran
+    # fine until the rolling window caught up with it, at which point
+    # `FcrDK1` started returning HTTP 429 on essentially every cycle
+    # (observed live: 15 requests across 7 cycles, the 8 extra ones being
+    # `BaseIngestor.fetch_data`'s retries burning the same per-dataset
+    # budget and cascading to attempt 3). `day_ahead_prices` -- also `P1D`
+    # -- had begun 429ing too.
+    #
+    # **What a reader most needs to know:** the flat cycle was only ever
+    # adequate for the 5 of 18 datasets whose cadence is `PT15M` or faster.
+    # Twelve are `PT6H` or slower and six are `P1D`; every one of those was
+    # being over-polled by between 4x and 96x, and which of them tips into
+    # sustained 429 first is a function of Energinet's rolling window, not
+    # of anything about the dataset -- so `fcr_dk1` being the loudest case
+    # is incidental. Declaring the cadence per-dataset is what lets the
+    # poller scale its own request rate to what each dataset actually
+    # publishes, rather than picking one interval that is necessarily either
+    # too slow for `power_system_right_now` (`PT1M`) or far too fast for
+    # `fcr_dk1` (`P1D`).
+    #
+    # Every value below was read from the live `meta/dataset` endpoint on
+    # 2026-07-28, not guessed. `None` means "not looked up" -- the poller
+    # falls back to polling such a dataset every cycle (the pre-existing
+    # behavior), so an unannotated dataset degrades to the old bug rather
+    # than to silently-no-polling. `tests/test_datasets.py` requires every
+    # shipped entry to declare one.
+    update_frequency: str | None = None
 
 
 # Relative-time margin used as `start` for every forward-publishing
@@ -186,6 +232,65 @@ class DatasetConfig:
 # `shared/backfill.py`'s manual/on-demand backfill exists to repair, not
 # something the live poller's steady-state margin should be sized around.
 FORWARD_PUBLISH_START = "now-P2D"
+
+
+# Matches the `updateFrequency` values Energinet's `meta/dataset` endpoint
+# actually emits for the datasets in this registry (all 18 checked live
+# 2026-07-28): "P1D", "P0.5D", "PT6H", "PT15M", "PT5M", "PT1M". This is a
+# deliberately narrow subset of ISO-8601 durations -- days/hours/minutes/
+# seconds only, no years/months/weeks, since a "P1M"-cadence dataset would
+# be ambiguous (month length) and none exists here. Fractional values are
+# accepted on ANY component, not just the smallest as strict ISO-8601
+# requires, because Energinet itself emits the non-conforming "P0.5D".
+_UPDATE_FREQUENCY_RE = re.compile(
+    r"^P(?:(?P<days>\d+(?:\.\d+)?)D)?"
+    r"(?:T(?:(?P<hours>\d+(?:\.\d+)?)H)?"
+    r"(?:(?P<minutes>\d+(?:\.\d+)?)M)?"
+    r"(?:(?P<seconds>\d+(?:\.\d+)?)S)?)?$"
+)
+
+_UPDATE_FREQUENCY_UNIT_SECONDS = {
+    "days": 86400.0,
+    "hours": 3600.0,
+    "minutes": 60.0,
+    "seconds": 1.0,
+}
+
+
+def parse_update_frequency_seconds(value: str | None) -> float | None:
+    """
+    Converts a `DatasetConfig.update_frequency` string (Energinet's own
+    `meta/dataset` `updateFrequency`, e.g. "P1D"/"P0.5D"/"PT6H"/"PT15M")
+    to seconds. Returns `None` for `None`, for an unparseable value, and
+    for a syntactically valid but empty duration ("P"/"PT", which carry no
+    cadence information).
+
+    Returning `None` rather than raising is deliberate: the sole consumer is
+    `services/ingestor/main.py`'s poll-interval sizing, whose `None` branch
+    means "poll this dataset every cycle" -- the pre-existing behavior. A
+    registry entry with a typo'd or newly-invented frequency string should
+    therefore degrade to over-polling one dataset (visible, self-healing,
+    exactly what happened before this field existed) rather than take down
+    the whole poll cycle with a parse error at import time.
+    """
+    if value is None:
+        return None
+
+    match = _UPDATE_FREQUENCY_RE.match(value.strip())
+    if match is None:
+        logger.warning(
+            "Unparseable dataset update_frequency %r -- this dataset will be polled every "
+            "cycle (see shared/datasets.py:DatasetConfig.update_frequency)",
+            value,
+        )
+        return None
+
+    total = sum(
+        float(raw) * _UPDATE_FREQUENCY_UNIT_SECONDS[unit]
+        for unit, raw in match.groupdict().items()
+        if raw is not None
+    )
+    return total or None
 
 
 def _forward_publish_params(sort_field: str, limit: int) -> dict:
@@ -229,6 +334,7 @@ DATASETS: list[DatasetConfig] = [
     DatasetConfig(
         name="mfrr_capacity",
         dataset_id="mFRRCapacityMarket",
+        update_frequency="P0.5D",  # live meta/dataset 2026-07-28
         market="mFRR_capacity",
         time_field="TimeUTC",
         zone_field="PriceArea",
@@ -273,6 +379,7 @@ DATASETS: list[DatasetConfig] = [
     DatasetConfig(
         name="mfrr_capacity_extra",
         dataset_id="MfrrCapacityMarketExtra",
+        update_frequency="P0.5D",  # live meta/dataset 2026-07-28
         market="mFRR_capacity_extra",
         time_field="TimeUTC",
         zone_field="PriceArea",
@@ -293,6 +400,7 @@ DATASETS: list[DatasetConfig] = [
     DatasetConfig(
         name="afrr_energy_activation",
         dataset_id="aFRREnergyActivation",
+        update_frequency="PT6H",  # live meta/dataset 2026-07-28
         market="aFRR_energy",
         time_field="TimeMsUTC",
         zone_field="PriceArea",
@@ -340,6 +448,7 @@ DATASETS: list[DatasetConfig] = [
     DatasetConfig(
         name="mfrr_eam",
         dataset_id="MfrrEnergyActivationMarket",
+        update_frequency="PT15M",  # live meta/dataset 2026-07-28
         market="mFRR_EAM",
         time_field="TimeUTC",
         zone_field="PriceArea",
@@ -378,6 +487,7 @@ DATASETS: list[DatasetConfig] = [
     DatasetConfig(
         name="afrr_picasso_corrections",
         dataset_id="AfrrPicassoCorrections",
+        update_frequency="PT6H",  # live meta/dataset 2026-07-28
         market="aFRR_correction",
         time_field="TimeMsUTC",
         zone_field="PriceArea",
@@ -394,6 +504,7 @@ DATASETS: list[DatasetConfig] = [
     DatasetConfig(
         name="imbalance_price",
         dataset_id="ImbalancePrice",
+        update_frequency="PT15M",  # live meta/dataset 2026-07-28
         market="imbalance",
         time_field="TimeUTC",
         zone_field="PriceArea",
@@ -437,6 +548,7 @@ DATASETS: list[DatasetConfig] = [
     DatasetConfig(
         name="day_ahead_prices",
         dataset_id="DayAheadPrices",
+        update_frequency="P1D",  # live meta/dataset 2026-07-28
         market="day_ahead",
         time_field="TimeUTC",
         zone_field="PriceArea",
@@ -492,6 +604,7 @@ DATASETS: list[DatasetConfig] = [
     DatasetConfig(
         name="fcr_dk1",
         dataset_id="FcrDK1",
+        update_frequency="P1D",  # live meta/dataset 2026-07-28
         market="FCR",
         time_field="HourUTC",
         zone_field=None,
@@ -592,6 +705,7 @@ DATASETS: list[DatasetConfig] = [
     DatasetConfig(
         name="fcr_dk2",
         dataset_id="FcrNdDK2",
+        update_frequency="P0.5D",  # live meta/dataset 2026-07-28
         market="FCR",
         time_field="HourUTC",
         zone_field="PriceArea",
@@ -743,6 +857,7 @@ DATASETS: list[DatasetConfig] = [
     DatasetConfig(
         name="ffr_dk2",
         dataset_id="FFRDK2",
+        update_frequency="P1D",  # live meta/dataset 2026-07-28
         market="FFR",
         time_field="HourUTC",
         zone_field=None,
@@ -788,6 +903,7 @@ DATASETS: list[DatasetConfig] = [
     DatasetConfig(
         name="ffr_demand_dk2",
         dataset_id="FFRdemandDK2",
+        update_frequency="P1D",  # live meta/dataset 2026-07-28
         market="FFR",
         time_field="HourUTC",
         zone_field=None,
@@ -838,6 +954,7 @@ DATASETS: list[DatasetConfig] = [
     DatasetConfig(
         name="afrr_reserves_nordic",
         dataset_id="AfrrReservesNordic",
+        update_frequency="P1D",  # live meta/dataset 2026-07-28
         market="aFRR_capacity",
         time_field="TimeUTC",
         zone_field="PriceArea",
@@ -865,6 +982,7 @@ DATASETS: list[DatasetConfig] = [
     DatasetConfig(
         name="power_system_right_now",
         dataset_id="PowerSystemRightNow",
+        update_frequency="PT1M",  # live meta/dataset 2026-07-28
         market="system_state",
         time_field="Minutes1UTC",
         zone_field=None,
@@ -899,6 +1017,7 @@ DATASETS: list[DatasetConfig] = [
     DatasetConfig(
         name="inertia_nordic",
         dataset_id="InertiaNordicSyncharea",
+        update_frequency="P1D",  # live meta/dataset 2026-07-28
         market="inertia",
         time_field="HourUTC",
         zone_field=None,
@@ -964,6 +1083,7 @@ DATASETS: list[DatasetConfig] = [
     DatasetConfig(
         name="forecasts_hour",
         dataset_id="Forecasts_Hour",
+        update_frequency="PT5M",  # live meta/dataset 2026-07-28
         market="wind_solar_forecast",
         time_field="HourUTC",
         zone_field="PriceArea",
@@ -1037,6 +1157,7 @@ DATASETS: list[DatasetConfig] = [
     DatasetConfig(
         name="prodex_5min_realtime",
         dataset_id="ElectricityProdex5MinRealtime",
+        update_frequency="PT5M",  # live meta/dataset 2026-07-28
         market="realtime_production_exchange",
         time_field="Minutes5UTC",
         zone_field="PriceArea",
@@ -1139,6 +1260,7 @@ DATASETS: list[DatasetConfig] = [
     DatasetConfig(
         name="afrr_border_atc",
         dataset_id="AfrrBorderAvailableTransferCapacity",
+        update_frequency="PT6H",  # live meta/dataset 2026-07-28
         market="aFRR_border_atc",
         time_field="TimeMsUTC",
         zone_field="BorderName",
@@ -1201,6 +1323,7 @@ DATASETS: list[DatasetConfig] = [
     DatasetConfig(
         name="afrr_lfc_limits",
         dataset_id="AfrrLfcActivationLimits",
+        update_frequency="PT6H",  # live meta/dataset 2026-07-28
         market="aFRR_lfc_limits",
         time_field="TimeMsUTC",
         zone_field="PriceArea",

@@ -248,3 +248,45 @@ def test_non_forward_publishing_datasets_have_no_start_param():
         if dataset.forward_publish_horizon is None and "start" in dataset.params
     ]
     assert unexplained_start == []
+
+
+def test_every_dataset_declares_a_parseable_update_frequency():
+    """
+    `services/ingestor/main.py` sizes each dataset's poll interval from
+    `update_frequency` (Energinet's own `meta/dataset` `updateFrequency`).
+    An entry that omits it -- or carries a typo'd/newly-invented duration
+    string -- silently falls back to polling every cycle, which is precisely
+    the flat-cadence behavior that put `fcr_dk1` (P1D, polled 96x/day) into
+    sustained HTTP 429 on 2026-07-28. That fallback is the right runtime
+    behavior (over-poll one dataset, don't take down the cycle), but it must
+    never be reached by a shipped registry entry.
+    """
+    from shared.datasets import parse_update_frequency_seconds
+
+    unusable = [
+        dataset.name
+        for dataset in DATASETS
+        if parse_update_frequency_seconds(dataset.update_frequency) is None
+    ]
+    assert unusable == []
+
+
+def test_parse_update_frequency_seconds_handles_the_live_value_shapes():
+    """The exact `updateFrequency` shapes Energinet emits for this registry, including the
+    non-ISO-conforming fractional-day "P0.5D" it uses for half-daily datasets."""
+    from shared.datasets import parse_update_frequency_seconds as parse
+
+    assert parse("P1D") == 86400
+    assert parse("P0.5D") == 43200
+    assert parse("PT6H") == 21600
+    assert parse("PT15M") == 900
+    assert parse("PT1M") == 60
+    # Composite and second-resolution forms aren't emitted today but are
+    # valid under the same syntax and must not silently parse as None.
+    assert parse("PT1H30M") == 5400
+    assert parse("PT30S") == 30
+    # Degrades to None (-> "poll every cycle") rather than raising.
+    assert parse(None) is None
+    assert parse("bogus") is None
+    assert parse("P1M") is None  # months are ambiguous and deliberately unsupported
+    assert parse("PT") is None  # syntactically valid but carries no cadence
