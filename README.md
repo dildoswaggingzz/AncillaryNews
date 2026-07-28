@@ -70,7 +70,7 @@ Rules baked into the contract:
 
 ## 3. Architecture — three-layer pipeline
 
-Three Docker microservices plus storage, composable via `docker-compose up --build`.
+Three reasoning layers (ingestion → crawler → orchestrator) plus a **FastAPI dashboard/API** service (`api`) and storage — four Docker services in all, composable via `docker-compose up --build`.
 
 ### A. Ingestion Engine (hard data)
 
@@ -85,10 +85,10 @@ Three Docker microservices plus storage, composable via `docker-compose up --bui
 ### B. Insight Crawler (soft data)
 
 - **Sources:** RSS feeds from sector media (EnergiWatch, Montel, Energy Supply DK), Energinet press releases and market messages, Nordic Balancing Model news, selected analyst posts.
-- **Logic:** scraper container (**Playwright** for JS-heavy sites, plain HTTP+feedparser for RSS) + a reader step that converts pages to LLM-ready Markdown (Firecrawl or trafilatura).
+- **Logic:** crawler container (HTTP + **feedparser** for RSS) + a reader step that converts pages to LLM-ready Markdown (**trafilatura**).
 - **Function:** summarise each article and extract **market theses** — e.g. *"Analyst X expects wind shortfall to lift DK1 balancing prices tonight"* — each stored with source, author, timestamp, and claim type (`fact | theory | forecast`).
 - **KPI:** unstructured source → structured, attributed Markdown within one crawl cycle.
-- **Storage:** **Qdrant** (vector DB, self-hostable in compose — chosen over managed Pinecone to keep the whole stack reproducible locally) with timestamp + source metadata on every embedding.
+- **Storage:** **Qdrant** (vector DB, self-hostable in compose — chosen over managed Pinecone to keep the whole stack reproducible locally) with timestamp + source metadata on every embedding; embeddings computed locally via **fastembed** (no external embedding API).
 
 ### C. Intelligence Orchestrator (reasoning layer)
 
@@ -100,7 +100,7 @@ Decision flow on every evaluation tick:
 4. **LLM synthesis** with a prompt that enforces the output contract: *"Use only factual numbers from Energinet/ENTSO-E; clearly mark any market-actor theories as attributed claims."*
 5. Emit the Event Report as JSON → Slack webhook / dashboard.
 
-- **Orchestration:** LangChain or LlamaIndex — or a thin hand-rolled pipeline; the retrieval/synthesis flow above is simple enough that a framework is optional, not required.
+- **Orchestration:** a thin hand-rolled pipeline on the **Anthropic SDK** directly (`shared/llm_json.py` for structured output) — the retrieval/synthesis flow above is simple enough that no agent framework is needed.
 - **LLM:** Claude Opus 4.8 (`claude-opus-4-8`) for synthesis — strong at correlating time series with textual context; Claude Haiku 4.5 (`claude-haiku-4-5`) for cheap bulk summarisation/extraction in layer B.
 
 ---
@@ -143,17 +143,20 @@ Energinet's data has varying maturity: real-time figures are provisional and rev
 
 | Component | Tool |
 |---|---|
-| Language | Python 3.12+ (Pandas/Polars for data manipulation) |
+| Language | Python 3.12+ (NumPy for numerics) |
 | API integration | HTTPX (async) + tenacity (retry/circuit-breaking) |
 | Scheduling | APScheduler (Airflow later if job graph grows) |
 | Time-series DB | PostgreSQL + TimescaleDB |
-| Vector DB | Qdrant (self-hosted, in compose) |
-| Scraping | Playwright + feedparser; Firecrawl/trafilatura for Markdown conversion |
-| Agent logic | LangChain / LlamaIndex (or thin custom pipeline) |
+| Vector DB | Qdrant (self-hosted, in compose); local embeddings via fastembed |
+| Crawling | feedparser (RSS) + trafilatura (Markdown conversion) |
+| Forecasting | LightGBM (day-ahead price quantile models) |
+| Optimization | PuLP + HiGHS (`highspy`) for the BESS co-optimizer LP |
+| Web / dashboard | FastAPI + Uvicorn + Jinja2 (`api` service) |
+| Agent logic | Thin custom pipeline on the Anthropic SDK (no framework) |
 | LLM | Claude Opus 4.8 (synthesis), Claude Haiku 4.5 (bulk extraction) |
-| Alerting | JSON → Slack webhook; dashboard later |
+| Alerting | JSON → Slack webhook; email notifier; web dashboard |
 | Monitoring | Prometheus + Grafana (poller health, trigger rates, LLM latency/cost) |
-| Packaging | Poetry monorepo; docker-compose with `ingestor`, `crawler`, `orchestrator` + DBs |
+| Packaging | Poetry monorepo; docker-compose with `ingestor`, `crawler`, `orchestrator`, `api` + DBs |
 
 ---
 
@@ -168,11 +171,13 @@ Energinet's data has varying maturity: real-time figures are provisional and rev
 
 ## 9. Roadmap
 
-- **M0 — Data audit (1 sprint):** catalogue the exact Energi Data Service dataset IDs for every market in §1 (via `api.energidataservice.dk/meta/datasets`), ENTSO-E endpoints, and RSS feeds; document schemas and revision behaviour. *This gates everything else — dataset names change as markets evolve (e.g. the 2025 mFRR EAM go-live).*
-- **M1 — Ingestion:** monorepo + compose skeleton; TimescaleDB schema (hypertables, bitemporal columns); `BaseIngestor` with tenacity; pollers for EAM prices, capacity auctions, imbalance, day-ahead.
-- **M2 — Rule engine:** trigger classes from §4 with backtested thresholds; Slack alerting of raw triggers (no LLM yet — validates signal quality early).
-- **M3 — Soft data:** crawler + Markdown reader + Qdrant embedding pipeline with claim-type extraction.
-- **M4 — Reasoning:** RAG retrieval + LLM synthesis + output-contract validation; end-to-end Event Reports; Grafana dashboards.
+- **M0 — Data audit** ✅ — Energi Data Service dataset IDs catalogued (`shared/datasets.py`, `docs/dataset-catalogue.md`), ENTSO-E endpoints and RSS feeds documented with schemas/revision behaviour.
+- **M1 — Ingestion** ✅ — monorepo + compose skeleton; TimescaleDB schema (hypertables, bitemporal columns); `BaseIngestor` with tenacity; pollers for EAM prices, capacity auctions, imbalance, day-ahead.
+- **M2 — Rule engine** ✅ — trigger classes from §4 with backtested thresholds; Slack alerting of raw triggers.
+- **M3 — Soft data** ✅ — crawler + Markdown reader + Qdrant embedding pipeline with claim-type extraction.
+- **M4 — Reasoning** ✅ — RAG retrieval + LLM synthesis + output-contract validation; end-to-end Event Reports; Grafana dashboards; Morning Brief.
+- **M5 — Day-ahead forecasting** ✅ — LightGBM quantile models + leak-safe walk-forward evaluation and economic eval (`docs/forecast-*-design.md` / `-results.md`).
+- **M6 — BESS revenue & co-optimization** ✅ (ongoing) — multi-market revenue backtests and a single-joint-LP co-optimizer for the Morning Brief (`docs/bess-cooptimizer-design.md`); a retailer cost/P&L layer is in progress. Intraday (IDA) ingestion is parked pending a free DK auction-price source.
 
 ---
 
